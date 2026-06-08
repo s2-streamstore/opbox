@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 
-pub async fn run_s2_lite_server() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_s2_lite_server(seed: u64) -> Result<(), Box<dyn std::error::Error>> {
     let object_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
 
     let db = slatedb::Db::builder("", object_store)
+        .with_seed(seed)
         .with_settings(slatedb::Settings {
             flush_interval: Some(Duration::from_millis(5)),
             ..Default::default()

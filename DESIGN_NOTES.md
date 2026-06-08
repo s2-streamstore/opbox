@@ -17,7 +17,7 @@
 - `pull`: one-shot checkout of an existing workspace into an empty local dir. Builds stable from shared log, projects to disk, records prior, then exits.
 - `sync`: long-running mode for an already bootstrapped checkout. Loads DB, starts actors, runs startup scan, then processes scans/log/projection.
 - Engine sequences work and may drop invalid projection plans. Semantic actor owns semantic decisions and follow-up import/projection requests.
-- Binary/LWW support, watcher suppression, expected writes, and provenance/event tables are deferred.
+- Binary/LWW support, watcher suppression, expected writes, and provenance/event tables are deferred. See `BINARY_LWW_DESIGN.md` for the current binary design sketch.
 
 ## Stable/Prior Tree
 

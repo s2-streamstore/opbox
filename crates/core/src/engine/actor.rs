@@ -1,0 +1,785 @@
+use crate::fs::client::{FsClient, FsClientResponse};
+use crate::fs::types::{GuardedWriteResult, RelativePath, ScanScope};
+use crate::log::types::{
+    LogReaderEvent, LogReaderRequest, LogWriterRequest, LogWriterResponse, SharedMessageEnvelope,
+};
+use crate::semantic::client::{SemanticClient, SemanticClientResponse};
+use crate::semantic::types::{
+    ImportAction, ImportActionId, ImportEpoch, NextWork, ProjectionAction, ProjectionActionId,
+    ProjectionActionResult, ProjectionEpoch, ProjectionEpochEndReason, ProjectionGeneration,
+    SemanticEvent,
+};
+use crate::spy::SpyEvent;
+use crate::types::SharedMessageBatch;
+use enum_ordinalize::Ordinalize;
+use eyre::eyre;
+use std::collections::{BTreeSet, VecDeque};
+use std::pin::Pin;
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc};
+use tokio::time::Instant;
+use tokio_muxt::{CoalesceMode, MuxTimer};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, trace, warn};
+
+const MAX_SHARED_MESSAGE_BUFFER_MS: Duration = Duration::from_millis(10);
+const FULL_SCAN_INTERVAL: Duration = Duration::from_millis(120000);
+
+// Can overshoot.
+const MAX_SHARED_MESSAGE_BUFFER_SIZE_BYTES: usize = 1024 * 1024 * 10;
+const READ_OUTBOX_BATCH_SIZE: u64 = 1024;
+
+#[derive(Ordinalize, Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerEvent {
+    SharedMessageBufferDrain,
+    FullScan,
+}
+
+#[derive(Default)]
+struct SharedMessageBuffer {
+    size_bytes: usize,
+    earliest_timestamp: Option<Instant>,
+    envelopes: Vec<SharedMessageEnvelope>,
+}
+
+impl SharedMessageBuffer {
+    fn insert(&mut self, envelope: SharedMessageEnvelope) {
+        if self.earliest_timestamp.is_none() {
+            self.earliest_timestamp = Some(Instant::now())
+        }
+        self.size_bytes += envelope.shared_message.approximate_size_bytes();
+        self.envelopes.push(envelope);
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.size_bytes < MAX_SHARED_MESSAGE_BUFFER_SIZE_BYTES
+    }
+
+    fn next_fire_at(&self) -> Option<Instant> {
+        if self.has_capacity() {
+            self.earliest_timestamp
+                .map(|earliest| earliest + MAX_SHARED_MESSAGE_BUFFER_MS)
+        } else {
+            Some(Instant::now())
+        }
+    }
+}
+
+fn coalesce_scan_scopes(left: ScanScope, right: ScanScope) -> ScanScope {
+    match (&left, &right) {
+        (ScanScope::Full, _) | (_, ScanScope::Full) => ScanScope::Full,
+        (ScanScope::SingleFile(left_path), ScanScope::SingleFile(right_path))
+            if left_path == right_path =>
+        {
+            left
+        }
+        (ScanScope::Subtree(left_path), scope) if subtree_contains_scope(left_path, scope) => left,
+        (scope, ScanScope::Subtree(right_path)) if subtree_contains_scope(right_path, scope) => {
+            right
+        }
+        _ => ScanScope::Full,
+    }
+}
+
+fn subtree_contains_scope(subtree: &RelativePath, scope: &ScanScope) -> bool {
+    match scope {
+        ScanScope::Full => false,
+        ScanScope::SingleFile(path) | ScanScope::Subtree(path) => {
+            path == subtree || path.as_components().starts_with(subtree.as_components())
+        }
+    }
+}
+
+/// Monotone id stamped on each `get_next_work` request so its response can be
+/// bound to the boundary that issued it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundarySeq(u64);
+
+/// Engine phase machine. Every phase waits for exactly one kind of response,
+/// every phase ends by entering a boundary (`enter_boundary`), and each
+/// variant carries only the state that is legal to act on in that phase —
+/// e.g. `Projecting::Committing` holds no plan, so late dispatch is
+/// unrepresentable rather than guarded against.
+#[derive(Debug)]
+enum EnginePhase {
+    /// No work and nothing pending. Exits via a scan request or a
+    /// projection-changed signal.
+    Idle,
+    /// Exactly one `get_next_work` in flight; the only phase in which a
+    /// next-work response is admissible.
+    AwaitingNextWork {
+        boundary: BoundarySeq,
+        /// Stable changed while waiting; the in-flight response may predate
+        /// the change, so a `None` answer must re-ask instead of going idle.
+        dirty: bool,
+    },
+    /// Fs scan executing.
+    Scanning { scope: ScanScope },
+    /// Semantic is turning the scan result into an import plan.
+    PlanningImport,
+    Importing(ImportPhase),
+    Projecting(ProjectionPhase),
+}
+
+#[derive(Debug)]
+enum ImportPhase {
+    Dispatching {
+        epoch: ImportEpoch,
+        queue: VecDeque<ImportAction>,
+        in_flight: BTreeSet<ImportActionId>,
+    },
+    Committing { epoch: ImportEpoch },
+}
+
+#[derive(Debug)]
+enum ProjectionPhase {
+    Dispatching {
+        epoch: ProjectionEpoch,
+        generation: ProjectionGeneration,
+        plan: VecDeque<ProjectionAction>,
+        in_flight: BTreeSet<ProjectionActionId>,
+    },
+    /// An action invalidated the epoch: the plan was dropped on entry (no
+    /// further dispatch is possible), and in-flight actions drain before the
+    /// commit is requested.
+    Draining {
+        epoch: ProjectionEpoch,
+        generation: ProjectionGeneration,
+        reason: ProjectionEpochEndReason,
+        in_flight: BTreeSet<ProjectionActionId>,
+    },
+    /// Epoch commit in flight. No plan and no in-flight set: an action
+    /// completion in this phase is a bug, not a race.
+    Committing {
+        epoch: ProjectionEpoch,
+        generation: ProjectionGeneration,
+    },
+}
+
+#[derive(Debug)]
+pub enum EngineCommand {
+    Scan(ScanScope),
+}
+
+pub struct Engine {
+    fs_client: FsClient,
+    semantic_client: SemanticClient,
+
+    log_reader_rx: mpsc::Receiver<LogReaderEvent>,
+    log_reader_tx: mpsc::UnboundedSender<LogReaderRequest>,
+    log_writer_rx: mpsc::UnboundedReceiver<LogWriterResponse>,
+    log_writer_tx: mpsc::UnboundedSender<LogWriterRequest>,
+
+    semantic_event_rx: mpsc::UnboundedReceiver<SemanticEvent>,
+    command_rx: mpsc::UnboundedReceiver<EngineCommand>,
+    spy_tx: Option<broadcast::Sender<SpyEvent>>,
+
+    phase: EnginePhase,
+    /// Daemon-owned temp files left by failed guarded writes. These are GC-only:
+    /// Semantic still receives the original projection conflict result.
+    cleanup_queue: VecDeque<RelativePath>,
+
+    /// Buffer shared messages received from log reader before sending
+    /// for semantic actor to apply.
+    shared_message_buffer: SharedMessageBuffer,
+
+    /// `read_outbox` reserves rows in the DB. Keep only one reservation request
+    /// in flight so batches are handed to LogWriter in outbox-id order.
+    outbox_read_in_flight: bool,
+    outbox_read_requested: bool,
+
+    /// Monotone source for `BoundarySeq` stamps. `GetNextWork` reserves
+    /// projection epochs in Semantic, so it is single-flight by construction:
+    /// only `AwaitingNextWork` has one outstanding.
+    next_boundary: u64,
+    pending_scan_scope: Option<ScanScope>,
+}
+
+pub struct EngineClients {
+    pub fs: FsClient,
+    pub semantic: SemanticClient,
+    pub log_reader: mpsc::UnboundedSender<LogReaderRequest>,
+    pub log_writer: mpsc::UnboundedSender<LogWriterRequest>,
+}
+
+pub struct EngineEvents {
+    pub log_reader: mpsc::Receiver<LogReaderEvent>,
+    pub log_writer: mpsc::UnboundedReceiver<LogWriterResponse>,
+    pub semantic: mpsc::UnboundedReceiver<SemanticEvent>,
+    pub commands: mpsc::UnboundedReceiver<EngineCommand>,
+    pub spy: Option<broadcast::Sender<SpyEvent>>,
+}
+
+pub struct EngineConfig {
+    pub clients: EngineClients,
+    pub events: EngineEvents,
+}
+
+impl Engine {
+    pub fn new(config: EngineConfig) -> Self {
+        let EngineConfig { clients, events } = config;
+
+        Self {
+            fs_client: clients.fs,
+            semantic_client: clients.semantic,
+            log_reader_rx: events.log_reader,
+            log_reader_tx: clients.log_reader,
+            log_writer_rx: events.log_writer,
+            log_writer_tx: clients.log_writer,
+            semantic_event_rx: events.semantic,
+            command_rx: events.commands,
+            spy_tx: events.spy,
+            phase: EnginePhase::Idle,
+            cleanup_queue: VecDeque::new(),
+            shared_message_buffer: SharedMessageBuffer::default(),
+            outbox_read_in_flight: false,
+            outbox_read_requested: false,
+            next_boundary: 0,
+            pending_scan_scope: None,
+        }
+    }
+
+    fn coalescing_arm_at(
+        timer: &mut Pin<&mut MuxTimer<{ TimerEvent::VARIANT_COUNT }>>,
+        event: TimerEvent,
+        fire_at: Instant,
+    ) {
+        (*timer)
+            .as_mut()
+            .fire_at(event as usize, fire_at, CoalesceMode::Earliest);
+    }
+
+    fn cancel_timer(
+        timer: &mut Pin<&mut MuxTimer<{ TimerEvent::VARIANT_COUNT }>>,
+        event: TimerEvent,
+    ) {
+        (*timer).as_mut().cancel(event as usize);
+    }
+
+    fn set_phase(&mut self, phase: EnginePhase) {
+        let from = &self.phase;
+        let to = &phase;
+        trace!(?from, ?to, "engine phase changed");
+        self.phase = phase;
+    }
+
+    /// Every phase ends here. Pending scan evidence wins over asking for
+    /// stable-derived work; otherwise issue exactly one boundary-stamped
+    /// `get_next_work`.
+    fn enter_boundary(&mut self) -> eyre::Result<()> {
+        if let Some(scope) = self.pending_scan_scope.take() {
+            self.fs_client.scan(scope.clone())?;
+            self.set_phase(EnginePhase::Scanning { scope });
+        } else {
+            self.next_boundary += 1;
+            let boundary = BoundarySeq(self.next_boundary);
+            self.semantic_client.get_next_work(boundary.0)?;
+            self.set_phase(EnginePhase::AwaitingNextWork {
+                boundary,
+                dirty: false,
+            });
+        }
+        Ok(())
+    }
+
+    fn request_scan(&mut self, scope: ScanScope) -> eyre::Result<()> {
+        self.pending_scan_scope = Some(match self.pending_scan_scope.take() {
+            Some(pending) => coalesce_scan_scopes(pending, scope),
+            None => scope,
+        });
+        if matches!(self.phase, EnginePhase::Idle) {
+            self.enter_boundary()?;
+        }
+        Ok(())
+    }
+
+    /// Dispatch admissible work and request epoch commits. Idempotent; runs
+    /// at the top of every loop iteration. Commit requests transition to the
+    /// `Committing` variants in the same step, so they cannot be re-sent and
+    /// nothing can be dispatched afterwards.
+    fn drive_phase(&mut self) -> eyre::Result<()> {
+        match &mut self.phase {
+            EnginePhase::Idle
+            | EnginePhase::AwaitingNextWork { .. }
+            | EnginePhase::Scanning { .. }
+            | EnginePhase::PlanningImport => {}
+            EnginePhase::Importing(ImportPhase::Dispatching {
+                queue, in_flight, ..
+            }) => {
+                while self.fs_client.can_accept_import() && !queue.is_empty() {
+                    let action = queue.pop_front().expect("non-empty import queue");
+                    let action_id = action.id;
+                    self.fs_client.apply_import_action(action)?;
+                    in_flight.insert(action_id);
+                }
+            }
+            EnginePhase::Importing(ImportPhase::Committing { .. }) => {}
+            EnginePhase::Projecting(ProjectionPhase::Dispatching {
+                plan, in_flight, ..
+            }) => {
+                while self.fs_client.can_accept_projection() && !plan.is_empty() {
+                    let action = plan.pop_front().expect("non-empty projection plan");
+                    let action_id = action.id;
+                    trace!(?action_id, "projection action dispatched");
+                    self.fs_client.apply_projection_action(action)?;
+                    in_flight.insert(action_id);
+                }
+            }
+            EnginePhase::Projecting(
+                ProjectionPhase::Draining { .. } | ProjectionPhase::Committing { .. },
+            ) => {}
+        }
+
+        enum CommitTransition {
+            Import(ImportEpoch),
+            Projection(ProjectionEpoch, ProjectionGeneration, ProjectionEpochEndReason),
+        }
+
+        let commit = match &self.phase {
+            EnginePhase::Importing(ImportPhase::Dispatching {
+                epoch,
+                queue,
+                in_flight,
+            }) if queue.is_empty() && in_flight.is_empty() => {
+                Some(CommitTransition::Import(*epoch))
+            }
+            EnginePhase::Projecting(ProjectionPhase::Dispatching {
+                epoch,
+                generation,
+                plan,
+                in_flight,
+            }) if plan.is_empty() && in_flight.is_empty() => Some(CommitTransition::Projection(
+                *epoch,
+                *generation,
+                ProjectionEpochEndReason::PlanExhausted,
+            )),
+            EnginePhase::Projecting(ProjectionPhase::Draining {
+                epoch,
+                generation,
+                reason,
+                in_flight,
+            }) if in_flight.is_empty() => {
+                Some(CommitTransition::Projection(*epoch, *generation, *reason))
+            }
+            _ => None,
+        };
+
+        match commit {
+            Some(CommitTransition::Import(epoch)) => {
+                self.semantic_client.commit_import_epoch(epoch)?;
+                self.set_phase(EnginePhase::Importing(ImportPhase::Committing { epoch }));
+            }
+            Some(CommitTransition::Projection(epoch, generation, reason)) => {
+                self.semantic_client.commit_projection_epoch(epoch, reason)?;
+                self.set_phase(EnginePhase::Projecting(ProjectionPhase::Committing {
+                    epoch,
+                    generation,
+                }));
+            }
+            None => {}
+        }
+
+        Ok(())
+    }
+
+    fn drive_cleanup(&mut self) -> eyre::Result<()> {
+        while self.fs_client.can_accept_cleanup() && !self.cleanup_queue.is_empty() {
+            let path = self
+                .cleanup_queue
+                .pop_front()
+                .expect("non-empty cleanup queue");
+            self.fs_client.delete_if_exists(path)?;
+        }
+
+        Ok(())
+    }
+
+    fn request_outbox_read(&mut self) -> eyre::Result<()> {
+        self.outbox_read_requested = true;
+        self.maybe_start_outbox_read()
+    }
+
+    fn maybe_start_outbox_read(&mut self) -> eyre::Result<()> {
+        if self.outbox_read_requested && !self.outbox_read_in_flight {
+            self.semantic_client.read_outbox(READ_OUTBOX_BATCH_SIZE)?;
+            self.outbox_read_requested = false;
+            self.outbox_read_in_flight = true;
+        }
+
+        Ok(())
+    }
+
+    fn handle_get_next_work_response(
+        &mut self,
+        response_boundary: u64,
+        result: eyre::Result<NextWork>,
+    ) -> eyre::Result<()> {
+        let EnginePhase::AwaitingNextWork { boundary, dirty } = &self.phase else {
+            eyre::bail!(
+                "get-next-work response (boundary {response_boundary}) while engine was not awaiting next work"
+            );
+        };
+        if response_boundary != boundary.0 {
+            eyre::bail!(
+                "get-next-work response for boundary {response_boundary}, but engine is awaiting boundary {}",
+                boundary.0
+            );
+        }
+        let dirty = *dirty;
+
+        match result? {
+            NextWork::Project(started) => {
+                self.set_phase(EnginePhase::Projecting(ProjectionPhase::Dispatching {
+                    epoch: started.epoch,
+                    generation: started.generation,
+                    plan: started.plan.actions.into(),
+                    in_flight: BTreeSet::new(),
+                }));
+            }
+            NextWork::Import(started) => {
+                eyre::bail!(
+                    "get-next-work returned import epoch {:?}; imports start from scans",
+                    started.epoch
+                );
+            }
+            NextWork::None => {
+                if dirty || self.pending_scan_scope.is_some() {
+                    // Stable changed while the answer was being computed, or
+                    // scan evidence is pending: re-enter the boundary instead
+                    // of going idle on a possibly stale None.
+                    self.enter_boundary()?;
+                } else {
+                    self.set_phase(EnginePhase::Idle);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_projection_changed(&mut self) -> eyre::Result<()> {
+        match &mut self.phase {
+            EnginePhase::Idle => self.enter_boundary(),
+            EnginePhase::AwaitingNextWork { dirty, .. } => {
+                *dirty = true;
+                Ok(())
+            }
+            // Every other phase reaches a boundary that re-queries
+            // authoritative next work; an active projection finishes as an
+            // intermediate snapshot.
+            _ => Ok(()),
+        }
+    }
+
+    fn handle_fs_response(&mut self, response: FsClientResponse) -> eyre::Result<()> {
+        match response {
+            FsClientResponse::Scan { result } => {
+                let EnginePhase::Scanning { .. } = &self.phase else {
+                    eyre::bail!("scan completed while engine was not scanning");
+                };
+                self.semantic_client.apply_scan(result?)?;
+                self.set_phase(EnginePhase::PlanningImport);
+            }
+            FsClientResponse::ApplyImportAction { result } => {
+                let action_id = result.action_id();
+                let import_invalidated = result.invalidates_import();
+                let EnginePhase::Importing(ImportPhase::Dispatching {
+                    epoch, in_flight, ..
+                }) = &mut self.phase
+                else {
+                    eyre::bail!(
+                        "import action {action_id:?} completed while engine was not dispatching imports"
+                    );
+                };
+
+                if action_id.epoch != *epoch {
+                    eyre::bail!(
+                        "import action completed for epoch {:?}, but current epoch is {:?}",
+                        action_id.epoch,
+                        epoch
+                    );
+                }
+                if !in_flight.remove(&action_id) {
+                    eyre::bail!("import action {action_id:?} completed but was not in-flight");
+                }
+                if import_invalidated {
+                    self.request_scan(ScanScope::Full)?;
+                }
+                self.semantic_client.commit_import_action(result)?;
+            }
+            FsClientResponse::ApplyProjectionAction { result } => {
+                let result = result?;
+                let id = result.action_id();
+                if let ProjectionActionResult::WriteFile {
+                    result: GuardedWriteResult::ConflictAfterSwap { observed },
+                    ..
+                } = &result
+                {
+                    warn!(
+                        ?id,
+                        ?observed,
+                        "guarded write conflicted after swap; a local filesystem write may have been clobbered"
+                    );
+                }
+                let cleanup_path = match &result {
+                    ProjectionActionResult::WriteFile {
+                        result: GuardedWriteResult::ConflictBeforeSwap { swap_path, .. },
+                        ..
+                    } => Some(swap_path.clone()),
+                    _ => None,
+                };
+                let projection_invalidated = result.invalidates_projection();
+
+                let invalidation_transition = match &mut self.phase {
+                    EnginePhase::Projecting(ProjectionPhase::Dispatching {
+                        epoch,
+                        generation,
+                        in_flight,
+                        ..
+                    }) => {
+                        if id.epoch != *epoch {
+                            eyre::bail!(
+                                "projection action completed for epoch {:?}, but current epoch is {:?}",
+                                id.epoch,
+                                epoch
+                            );
+                        }
+                        if !in_flight.remove(&id) {
+                            eyre::bail!("projection action {id:?} completed but was not in-flight");
+                        }
+                        projection_invalidated.then(|| {
+                            // Entering Draining drops the remaining plan:
+                            // nothing further dispatches for this epoch.
+                            EnginePhase::Projecting(ProjectionPhase::Draining {
+                                epoch: *epoch,
+                                generation: *generation,
+                                reason: ProjectionEpochEndReason::ActionInvalidatedProjection {
+                                    action_id: id,
+                                },
+                                in_flight: std::mem::take(in_flight),
+                            })
+                        })
+                    }
+                    EnginePhase::Projecting(ProjectionPhase::Draining {
+                        epoch, in_flight, ..
+                    }) => {
+                        if id.epoch != *epoch {
+                            eyre::bail!(
+                                "projection action completed for epoch {:?}, but current epoch is {:?}",
+                                id.epoch,
+                                epoch
+                            );
+                        }
+                        if !in_flight.remove(&id) {
+                            eyre::bail!("projection action {id:?} completed but was not in-flight");
+                        }
+                        None
+                    }
+                    _ => {
+                        eyre::bail!(
+                            "projection action {id:?} completed while engine was not draining or dispatching projections"
+                        );
+                    }
+                };
+                if let Some(phase) = invalidation_transition {
+                    self.set_phase(phase);
+                }
+
+                if let Some(path) = cleanup_path {
+                    self.cleanup_queue.push_back(path);
+                }
+                if projection_invalidated {
+                    self.request_scan(ScanScope::Full)?;
+                }
+                self.semantic_client.commit_projection_action(result)?;
+            }
+            FsClientResponse::DeleteIfExists { path, result } => {
+                if let Err(error) = result {
+                    tracing::warn!(%path, ?error, "cleanup delete-if-exists failed");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn run(mut self, token: CancellationToken) -> eyre::Result<()> {
+        let timer = MuxTimer::<{ TimerEvent::VARIANT_COUNT }>::default();
+        tokio::pin!(timer);
+
+        self.request_scan(ScanScope::Full)?;
+        self.request_outbox_read()?;
+        Self::coalescing_arm_at(
+            &mut timer,
+            TimerEvent::FullScan,
+            Instant::now() + FULL_SCAN_INTERVAL,
+        );
+
+        loop {
+            self.drive_cleanup()?;
+            self.drive_phase()?;
+
+            tokio::select! {
+                _ = token.cancelled() => {
+                    debug!("cancelled");
+
+                    return Ok(());
+                }
+
+                (event_ord, _deadline) = &mut timer, if timer.is_armed() => {
+                    let event = TimerEvent::from_ordinal(event_ord as i8).expect("valid event ordinal");
+                    trace!(?event);
+                    match event {
+                        TimerEvent::SharedMessageBufferDrain => {
+                            if self.semantic_client.can_accept_apply_shared_message_batch() {
+                                let buffer = std::mem::take(&mut self.shared_message_buffer);
+                                assert_ne!(buffer.envelopes.len(), 0);
+                                let batch = SharedMessageBatch::try_from(buffer.envelopes)?;
+                                Self::cancel_timer(&mut timer, TimerEvent::SharedMessageBufferDrain);
+                                self.semantic_client.apply_shared_message_batch(batch)?;
+                            }
+                        }
+                        TimerEvent::FullScan => {
+                            self.request_scan(ScanScope::Full)?;
+                            Self::coalescing_arm_at(
+                                &mut timer,
+                                TimerEvent::FullScan,
+                                Instant::now() + FULL_SCAN_INTERVAL,
+                            );
+                        }
+                    }
+                }
+
+                Some(reader_event) = self.log_reader_rx.recv(), if self.shared_message_buffer.has_capacity() => {
+                    trace!(?reader_event);
+                    match reader_event {
+                        LogReaderEvent::Status{ .. } => {}
+                        LogReaderEvent::Read(envelope) => {
+                            if let Some(spy_tx) = &self.spy_tx {
+                                let _ = spy_tx.send(SpyEvent::shared_message(&envelope));
+                            }
+                            self.shared_message_buffer.insert(envelope);
+                            if self.semantic_client.can_accept_apply_shared_message_batch() {
+                                Self::coalescing_arm_at(
+                                    &mut timer,
+                                    TimerEvent::SharedMessageBufferDrain,
+                                    self.shared_message_buffer.next_fire_at().expect("due fire"),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                Some(writer_event) = self.log_writer_rx.recv() => {
+                    match writer_event {
+                        LogWriterResponse::Ping => {},
+                        LogWriterResponse::Durable{ outbox_range } => {
+                            self.semantic_client.trim_outbox(outbox_range)?;
+                        }
+                    }
+                }
+
+                Some(response) = self.semantic_client.next() => {
+                    match response {
+                        SemanticClientResponse::ApplyInitScan(_) => {
+                            eyre::bail!("sync engine received init-only semantic response");
+                        }
+                        SemanticClientResponse::ApplyScan(result) => {
+                            let EnginePhase::PlanningImport = &self.phase else {
+                                eyre::bail!("apply-scan response while engine was not planning an import");
+                            };
+                            match result? {
+                                NextWork::Import(started) => {
+                                    self.set_phase(EnginePhase::Importing(ImportPhase::Dispatching {
+                                        epoch: started.epoch,
+                                        queue: started.plan.actions.into(),
+                                        in_flight: BTreeSet::new(),
+                                    }));
+                                }
+                                NextWork::None => self.enter_boundary()?,
+                                NextWork::Project(started) => {
+                                    eyre::bail!(
+                                        "apply-scan returned projection epoch {:?}; projections start at boundaries",
+                                        started.epoch
+                                    );
+                                }
+                            }
+                        }
+                        SemanticClientResponse::CommitImportEpoch(result) => {
+                            result?;
+                            let EnginePhase::Importing(ImportPhase::Committing { .. }) = &self.phase else {
+                                eyre::bail!("import epoch commit response while engine was not committing an import epoch");
+                            };
+                            self.enter_boundary()?;
+                        }
+                        SemanticClientResponse::CommitProjectionEpoch(result) => {
+                            result?;
+                            let EnginePhase::Projecting(ProjectionPhase::Committing { .. }) = &self.phase else {
+                                eyre::bail!("projection epoch commit response while engine was not committing a projection epoch");
+                            };
+                            self.enter_boundary()?;
+                        }
+                        SemanticClientResponse::GetNextWork { boundary, result } => {
+                            self.handle_get_next_work_response(boundary, result)?;
+                        }
+                        SemanticClientResponse::ApplySharedMessageBatch(result) => {
+                            result?;
+                            if let Some(next_fire_at) = self.shared_message_buffer.next_fire_at() {
+                                Self::coalescing_arm_at(&mut timer, TimerEvent::SharedMessageBufferDrain, next_fire_at);
+                            }
+                        }
+                        SemanticClientResponse::ReadOutbox(result) => {
+                            assert!(
+                                self.outbox_read_in_flight,
+                                "read-outbox response without an in-flight read"
+                            );
+                            self.outbox_read_in_flight = false;
+                            let messages = result?;
+                            let read_any = !messages.is_empty();
+                            for (outbox_id, shared_message) in messages {
+                                self.log_writer_tx.send(LogWriterRequest::Append {
+                                    outbox_id,
+                                    shared_message,
+                                })?;
+                            }
+                            if read_any {
+                                self.outbox_read_requested = true;
+                            }
+                            self.maybe_start_outbox_read()?;
+                        }
+                    }
+                }
+
+                Some(response) = self.fs_client.next() => {
+                    self.handle_fs_response(response)?;
+                }
+
+                Some(event) = self.semantic_event_rx.recv() => {
+                    match event {
+                        SemanticEvent::OutboxReady{ num_messages } => {
+                            if num_messages > 0 {
+                                self.request_outbox_read()?;
+                            }
+                        }
+                        SemanticEvent::ProjectionChanged{ generation: _ } => {
+                            self.handle_projection_changed()?;
+                        }
+                    }
+                }
+
+                Some(command) = self.command_rx.recv() => {
+                    trace!(?command);
+                    match command {
+                        EngineCommand::Scan(scope) => {
+                            self.request_scan(scope)?;
+                        }
+                    }
+                }
+
+                else => {
+                    return Err(eyre!("unrecoverable error"));
+                }
+            }
+        }
+    }
+}
