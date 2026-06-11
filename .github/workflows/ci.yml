@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   test:
-    name: Check, Test
+    name: Check, Test, Sim
     runs-on: ubuntu-24.04
     env:
       RUST_BACKTRACE: "1"
@@ -41,19 +41,8 @@ jobs:
       - name: Test workspace
         run: cargo test --locked --workspace --all-targets
 
-  dst:
-    name: Deterministic Simulation Tests
-    runs-on: ubuntu-24.04
-    needs: test
-    env:
-      RUST_BACKTRACE: "1"
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Run DST sweep
         run: cargo run --locked -p opbox-sim -- sweep --trials 1 --jobs 1 --child-proc-log-level warn
+
+      - name: Run trace-level meta test
+        run: cargo run --locked -p opbox-sim -- meta same-file-split-edits --seed 1 --max-steps 500 --child-proc-log-level trace

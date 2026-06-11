@@ -1435,32 +1435,45 @@ fn validate_init_staged_rows(
     completed: &CompletedImportEpoch,
     staged: &[import_staged_files::Row],
 ) -> Result<(), SemanticTransactionError> {
-    if staged.len() != completed.actions.len() {
-        return Err(SemanticTransactionError::InvariantViolation(format!(
-            "import epoch {:?} completed {} actions but staged {} rows",
-            completed.epoch,
-            completed.actions.len(),
-            staged.len()
-        )));
-    }
+    // Staged rows are a subset of completed actions: actions whose stage
+    // decision was Ignore (non-UTF-8 files, reads invalidated by concurrent
+    // changes) complete without staging anything.
+    let completed_actions = completed
+        .actions
+        .iter()
+        .map(|action| (action.action_id, action))
+        .collect::<BTreeMap<_, _>>();
 
-    for (action, row) in completed.actions.iter().zip(staged) {
+    for action in &completed.actions {
         if action.action_id.epoch != completed.epoch {
             return Err(SemanticTransactionError::InvariantViolation(format!(
                 "completed import action {:?} is not in epoch {:?}",
                 action.action_id, completed.epoch
             )));
         }
-        if action.action_id.seq != row.action_seq || action.action_id.epoch != row.import_epoch {
+    }
+
+    for row in staged {
+        let action_id = ImportActionId {
+            epoch: row.import_epoch,
+            seq: row.action_seq,
+        };
+        let action = completed_actions.get(&action_id).ok_or_else(|| {
+            SemanticTransactionError::InvariantViolation(format!(
+                "staged init import row epoch={:?} seq={} has no completed action",
+                row.import_epoch, row.action_seq
+            ))
+        })?;
+        if row.import_epoch != completed.epoch {
             return Err(SemanticTransactionError::InvariantViolation(format!(
-                "completed import action {:?} does not match staged row epoch={:?} seq={}",
-                action.action_id, row.import_epoch, row.action_seq
+                "staged init import row {:?} is not in epoch {:?}",
+                action_id, completed.epoch
             )));
         }
         if row.stage_kind != StageKind::New {
             return Err(SemanticTransactionError::InvariantViolation(format!(
                 "init import action {:?} staged non-new row: {:?}",
-                action.action_id, row.stage_kind
+                action_id, row.stage_kind
             )));
         }
 
@@ -1605,18 +1618,21 @@ fn prepare_import_action_stage(
                     eyre::bail!("import read {action_id:?} returned stat-only fingerprint");
                 };
 
+                // v0 syncs text only: binary (non-UTF-8) files are skipped
+                // uniformly. Init must tolerate them too — a single binary
+                // file in the directory must not abort workspace creation.
                 let content = match String::from_utf8(bytes.to_vec()) {
                     Ok(content) => content,
-                    Err(err) if epoch_kind == ImportEpochKind::Sync => {
+                    Err(err) => {
                         debug!(
                             ?action_id,
                             %path,
+                            ?epoch_kind,
                             error = %err,
-                            "ignoring non-UTF-8 file during sync import"
+                            "ignoring non-UTF-8 file during import"
                         );
                         return Ok(ImportActionStageDecision::Ignore { action_id });
                     }
-                    Err(err) => return Err(err.into()),
                 };
 
                 Ok(ImportActionStageDecision::Stage(ImportActionStagePlan {
@@ -1627,41 +1643,33 @@ fn prepare_import_action_stage(
                     content,
                 }))
             }
+            // Files changing underneath the import are skipped for both epoch
+            // kinds: sync defers to the scan the conflict already triggered,
+            // and a file skipped during init is imported by the first sync
+            // daemon's startup full scan.
             ImportReadOutcome::Completed(GuardedReadResult::ChangedBetweenStats {
                 before,
                 after,
             }) => {
-                if epoch_kind == ImportEpochKind::Sync {
-                    debug!(
-                        ?action_id,
-                        %path,
-                        ?before,
-                        ?after,
-                        "sync import read changed between stats; deferring to a fresh scan"
-                    );
-                    return Ok(ImportActionStageDecision::Ignore { action_id });
-                }
-
-                eyre::bail!(
-                    "import read {:?} changed between stats; before={before:?}, after={after:?}",
-                    action_id
+                debug!(
+                    ?action_id,
+                    %path,
+                    ?epoch_kind,
+                    ?before,
+                    ?after,
+                    "import read changed between stats; deferring to a fresh scan"
                 );
+                Ok(ImportActionStageDecision::Ignore { action_id })
             }
             ImportReadOutcome::Completed(GuardedReadResult::ConflictBeforeRead { observed }) => {
-                if epoch_kind == ImportEpochKind::Sync {
-                    debug!(
-                        ?action_id,
-                        %path,
-                        ?observed,
-                        "sync import read conflicted before read; deferring to a fresh scan"
-                    );
-                    return Ok(ImportActionStageDecision::Ignore { action_id });
-                }
-
-                eyre::bail!(
-                    "import read {:?} conflicted before read; observed={observed:?}",
-                    action_id
+                debug!(
+                    ?action_id,
+                    %path,
+                    ?epoch_kind,
+                    ?observed,
+                    "import read conflicted before read; deferring to a fresh scan"
                 );
+                Ok(ImportActionStageDecision::Ignore { action_id })
             }
             ImportReadOutcome::Failed(err) => Err(err),
         },
@@ -1984,5 +1992,107 @@ impl bb8::ManageConnection for TursoConnectionManager {
 
     fn has_broken(&self, _conn: &mut Connection) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::types::{
+        FileContentFingerprint, FileHash, FileKey, FileStatFingerprint, RelativePath,
+    };
+    use crate::semantic::actor::CompletedImportAction;
+
+    fn stat() -> FileStatFingerprint {
+        FileStatFingerprint::new(FileKey::new(1, 1), 5, time::OffsetDateTime::UNIX_EPOCH)
+    }
+
+    fn read_result(action_id: ImportActionId, bytes: &'static [u8]) -> ImportActionResult {
+        ImportActionResult::Read {
+            action_id,
+            outcome: ImportReadOutcome::Completed(GuardedReadResult::Read {
+                bytes: Bytes::from_static(bytes),
+                fingerprint: FileFingerprint::StatAndContent {
+                    stat: stat(),
+                    content: FileContentFingerprint::new(FileHash::new(Bytes::from_static(
+                        b"hash",
+                    ))),
+                },
+            }),
+        }
+    }
+
+    fn read_context(epoch_kind: ImportEpochKind, path: &str) -> ImportActionContext {
+        ImportActionContext {
+            epoch_kind,
+            action_kind: ImportActionKind::Read {
+                path: RelativePath::parse(path).expect("valid path"),
+                expected_fingerprint: FileFingerprint::StatOnly(stat()),
+            },
+        }
+    }
+
+    #[test]
+    fn non_utf8_files_are_ignored_for_both_epoch_kinds() -> eyre::Result<()> {
+        for epoch_kind in [ImportEpochKind::Init, ImportEpochKind::Sync] {
+            let action_id = ImportActionId::new(ImportEpoch::new(0), 0);
+            let decision = prepare_import_action_stage(
+                read_context(epoch_kind, "blob.bin"),
+                read_result(action_id, b"\x00\x01\xff\xfe\x80"),
+            )?;
+            assert!(
+                matches!(decision, ImportActionStageDecision::Ignore { .. }),
+                "{epoch_kind:?} import must ignore non-UTF-8 content"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn init_staged_rows_may_be_a_subset_of_completed_actions() {
+        let epoch = ImportEpoch::new(0);
+        let completed = CompletedImportEpoch {
+            epoch,
+            kind: ImportEpochKind::Init,
+            actions: vec![
+                CompletedImportAction {
+                    action_id: ImportActionId::new(epoch, 0),
+                    action_kind: ImportActionKind::Read {
+                        path: RelativePath::parse("a.txt").expect("valid path"),
+                        expected_fingerprint: FileFingerprint::StatOnly(stat()),
+                    },
+                },
+                // seq 1 (a binary file) completed with an Ignore decision, so
+                // it has no staged row.
+                CompletedImportAction {
+                    action_id: ImportActionId::new(epoch, 1),
+                    action_kind: ImportActionKind::Read {
+                        path: RelativePath::parse("blob.bin").expect("valid path"),
+                        expected_fingerprint: FileFingerprint::StatOnly(stat()),
+                    },
+                },
+            ],
+        };
+        let staged_row = |seq: u64, path: &str| import_staged_files::Row {
+            import_epoch: epoch,
+            action_seq: seq,
+            path: RelativePath::parse(path).expect("valid path"),
+            object_id: ObjectId(Bytes::from_static(b"o")),
+            claim_id: NamespaceClaimId(Bytes::from_static(b"c")),
+            stage_kind: StageKind::New,
+            fingerprint: FileFingerprint::StatAndContent {
+                stat: stat(),
+                content: FileContentFingerprint::new(FileHash::new(Bytes::from_static(b"h"))),
+            },
+            prior_doc_blob: Bytes::new(),
+            text_update: Bytes::new(),
+            staged_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+
+        assert!(validate_init_staged_rows(&completed, &[staged_row(0, "a.txt")]).is_ok());
+        // Unknown seq must still be rejected.
+        assert!(validate_init_staged_rows(&completed, &[staged_row(7, "a.txt")]).is_err());
+        // Path mismatch must still be rejected.
+        assert!(validate_init_staged_rows(&completed, &[staged_row(1, "a.txt")]).is_err());
     }
 }
