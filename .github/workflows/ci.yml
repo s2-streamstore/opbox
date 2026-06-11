@@ -29,9 +29,31 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       - name: Check workspace
         run: cargo check --locked --workspace --all-targets
 
       - name: Test workspace
         run: cargo test --locked --workspace --all-targets
+
+  dst:
+    name: Deterministic Simulation Tests
+    runs-on: ubuntu-24.04
+    needs: test
+    env:
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run DST sweep
+        run: cargo run --locked -p opbox-sim -- sweep --trials 1 --jobs 1 --child-proc-log-level warn
