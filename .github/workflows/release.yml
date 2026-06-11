@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binaries
+        run: cargo build --locked --release -p ob -p opbox-daemon --target "${{ matrix.target }}"
+
+      - name: Package release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          target="${{ matrix.target }}"
+          archive="ob-${target}"
+          staging="dist/${archive}"
+
+          mkdir -p "${staging}"
+          cp "target/${target}/release/ob" "${staging}/ob"
+          cp "target/${target}/release/opbox-daemon" "${staging}/opbox-daemon"
+          chmod +x "${staging}/ob" "${staging}/opbox-daemon"
+
+          cat > "${staging}/README-install.txt" <<'EOF'
+          Install both binaries into the same directory on PATH.
+
+          Example:
+
+              mkdir -p ~/.local/bin
+              cp ob opbox-daemon ~/.local/bin/
+
+          The ob client starts opbox-daemon by first looking for a sibling binary
+          named opbox-daemon, then falling back to PATH.
+
+          On macOS, if the binaries were downloaded through a browser and blocked
+          by Gatekeeper quarantine, remove the quarantine attribute:
+
+              xattr -d com.apple.quarantine ~/.local/bin/ob ~/.local/bin/opbox-daemon
+          EOF
+
+          tar -C dist -czf "${archive}.tar.gz" "${archive}"
+          openssl dgst -sha256 -r "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ob-${{ matrix.target }}
+          path: |
+            ob-${{ matrix.target }}.tar.gz
+            ob-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
