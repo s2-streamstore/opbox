@@ -1,3 +1,4 @@
+use clap::builder::styling;
 use clap::{Parser, Subcommand};
 use opbox_core::app::db::{open_database, semantic_pool};
 use opbox_core::app::ipc;
@@ -21,7 +22,6 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use clap::builder::styling;
 use tokio::process::Command as TokioCommand;
 use tracing::{debug, info};
 
@@ -81,7 +81,6 @@ enum Command {
         sync_root: Option<PathBuf>,
     },
 }
-
 
 struct Bootstrap {
     mode: RunMode,
@@ -734,24 +733,22 @@ async fn main() {
     init_tracing();
 
     let result = match Args::parse().command {
-        Command::Init { sync_root } => with_failure_banner("init", async {
-            run_bootstrap(bootstrap_init(sync_root).await?).await
-        }
-        .await),
+        Command::Init { sync_root } => with_failure_banner(
+            "init",
+            async { run_bootstrap(bootstrap_init(sync_root).await?).await }.await,
+        ),
         Command::Clone {
             workspace,
             sync_root,
-        } => with_failure_banner("clone", async {
-            run_bootstrap(bootstrap_clone(workspace, sync_root).await?).await
-        }
-        .await),
+        } => with_failure_banner(
+            "clone",
+            async { run_bootstrap(bootstrap_clone(workspace, sync_root).await?).await }.await,
+        ),
         Command::Start { sync_root } => run_start(sync_root).await,
         Command::Stop { sync_root } => run_stop(sync_root).await,
         Command::Status { sync_root } => run_status(sync_root).await,
         Command::Spy { sync_root } => run_spy(sync_root).await,
-        Command::Logs {
-             follow, sync_root ,
-        } => run_daemon_logs(follow, sync_root),
+        Command::Logs { follow, sync_root } => run_daemon_logs(follow, sync_root),
     };
 
     if let Err(error) = result {

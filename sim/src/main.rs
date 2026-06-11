@@ -1875,13 +1875,8 @@ fn run_orphaned_projection_write_workload(
             Bytes::from(format!("base f{index:02}\n")),
         );
     }
-    let daemon_a = spawn_daemon_with_initial_files(
-        sim,
-        "daemon-a",
-        0,
-        workspace_id.clone(),
-        initial_files,
-    )?;
+    let daemon_a =
+        spawn_daemon_with_initial_files(sim, "daemon-a", 0, workspace_id.clone(), initial_files)?;
     let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
     configure_daemon_s2_link_latencies(sim);
 

@@ -449,13 +449,18 @@ mod tests {
             .expect("text changed");
 
         let one = apply_text_update(base.as_ref(), capture_a.update_bytes.as_ref())?;
-        let both = apply_text_update(one.full_state_bytes.as_ref(), capture_b.update_bytes.as_ref())?;
+        let both = apply_text_update(
+            one.full_state_bytes.as_ref(),
+            capture_b.update_bytes.as_ref(),
+        )?;
         assert!(both.text.contains("from a"));
         assert!(both.text.contains("from b"));
 
         let other_one = apply_text_update(base.as_ref(), capture_b.update_bytes.as_ref())?;
-        let other_both =
-            apply_text_update(other_one.full_state_bytes.as_ref(), capture_a.update_bytes.as_ref())?;
+        let other_both = apply_text_update(
+            other_one.full_state_bytes.as_ref(),
+            capture_a.update_bytes.as_ref(),
+        )?;
         assert_eq!(both.text, other_both.text);
         Ok(())
     }

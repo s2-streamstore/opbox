@@ -254,9 +254,7 @@ fn parse_env_file(contents: &str) -> eyre::Result<Vec<(String, String)>> {
 
         let value = value.trim();
         let value = match value.as_bytes() {
-            [b'"', .., b'"'] | [b'\'', .., b'\''] if value.len() >= 2 => {
-                &value[1..value.len() - 1]
-            }
+            [b'"', .., b'"'] | [b'\'', .., b'\''] if value.len() >= 2 => &value[1..value.len() - 1],
             _ => value,
         };
         pairs.push((key.to_string(), value.to_string()));

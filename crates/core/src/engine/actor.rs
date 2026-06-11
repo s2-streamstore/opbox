@@ -114,7 +114,9 @@ enum EnginePhase {
         dirty: bool,
     },
     /// Fs scan executing.
-    Scanning { scope: ScanScope },
+    Scanning {
+        scope: ScanScope,
+    },
     /// Semantic is turning the scan result into an import plan.
     PlanningImport,
     Importing(ImportPhase),
@@ -128,7 +130,9 @@ enum ImportPhase {
         queue: VecDeque<ImportAction>,
         in_flight: BTreeSet<ImportActionId>,
     },
-    Committing { epoch: ImportEpoch },
+    Committing {
+        epoch: ImportEpoch,
+    },
 }
 
 #[derive(Debug)]
@@ -332,7 +336,11 @@ impl Engine {
 
         enum CommitTransition {
             Import(ImportEpoch),
-            Projection(ProjectionEpoch, ProjectionGeneration, ProjectionEpochEndReason),
+            Projection(
+                ProjectionEpoch,
+                ProjectionGeneration,
+                ProjectionEpochEndReason,
+            ),
         }
 
         let commit = match &self.phase {
@@ -370,7 +378,8 @@ impl Engine {
                 self.set_phase(EnginePhase::Importing(ImportPhase::Committing { epoch }));
             }
             Some(CommitTransition::Projection(epoch, generation, reason)) => {
-                self.semantic_client.commit_projection_epoch(epoch, reason)?;
+                self.semantic_client
+                    .commit_projection_epoch(epoch, reason)?;
                 self.set_phase(EnginePhase::Projecting(ProjectionPhase::Committing {
                     epoch,
                     generation,

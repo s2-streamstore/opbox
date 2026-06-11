@@ -786,8 +786,7 @@ impl<'a> SemanticTransaction<'a> {
         target_doc_blob: &Bytes,
         created_at: OffsetDateTime,
     ) -> Result<(), SemanticTransactionError> {
-        let created_at_ns =
-            datetime_to_unix_ns("projection_write_intents.created_at", created_at)?;
+        let created_at_ns = datetime_to_unix_ns("projection_write_intents.created_at", created_at)?;
         self.conn
             .execute(
                 "INSERT INTO projection_write_intents (

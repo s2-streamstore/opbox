@@ -308,8 +308,7 @@ impl SemanticActor {
                 SemanticTaskResult::CommitImportEpoch { result, .. },
                 PendingSemanticOpKind::CommitImportEpoch { reply },
             ) => {
-                let result =
-                    result.and_then(|output| output.effects.emit(&self.engine_handle));
+                let result = result.and_then(|output| output.effects.emit(&self.engine_handle));
                 let _ = reply.send(result);
             }
             (

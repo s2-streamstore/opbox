@@ -1,12 +1,15 @@
-use std::num::NonZeroU32;
 use crate::types::WorkspaceId;
 use eyre::eyre;
-use s2_sdk::types::{BasinName, CreateStreamInput, RetryConfig, S2Config, S2Endpoints, S2Error, StreamName};
+use s2_sdk::types::{
+    BasinName, CreateStreamInput, RetryConfig, S2Config, S2Endpoints, S2Error, StreamName,
+};
 use s2_sdk::{S2, S2Basin};
+use std::num::NonZeroU32;
 use std::str::FromStr;
 
 pub fn s2_client_from_env(access_token: &str) -> eyre::Result<S2> {
-    let mut config = S2Config::new(access_token).with_retry(RetryConfig::new().with_max_attempts(NonZeroU32::new(1024).unwrap()));
+    let mut config = S2Config::new(access_token)
+        .with_retry(RetryConfig::new().with_max_attempts(NonZeroU32::new(1024).unwrap()));
     if let Ok(endpoints) = S2Endpoints::from_env() {
         config = config.with_endpoints(endpoints);
     }
