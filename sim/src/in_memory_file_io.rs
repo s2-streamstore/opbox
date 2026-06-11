@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use compact_str::CompactString;
-use opbox::fs::fio::FileIO;
-use opbox::fs::types::{
+use opbox_core::fs::fio::FileIO;
+use opbox_core::fs::types::{
     DeleteIfExistsResult, ExpectedBefore, FileContentFingerprint, FileFingerprint, FileHash,
     FileKey, FileStatFingerprint, GuardedDeleteResult, GuardedReadResult, GuardedWriteResult,
     RelativePath, ScanResult, ScanScope, Tree, TreeEntry, TreeEntryKind,
@@ -24,6 +24,7 @@ struct State {
     files: BTreeMap<RelativePath, Entry>,
     next_inode: u64,
     logical_time_ns: i128,
+    stats: InMemoryFileIOStats,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +53,7 @@ impl InMemoryFileIO {
                 files: BTreeMap::new(),
                 next_inode: 1,
                 logical_time_ns: 0,
+                stats: InMemoryFileIOStats::default(),
             })),
         }
     }
@@ -63,17 +65,61 @@ impl InMemoryFileIO {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn append_file(&self, path: impl AsRef<str>, bytes: impl AsRef<[u8]>) -> eyre::Result<()> {
         let path = RelativePath::parse(path.as_ref())?;
         let mut state = self.state.lock().expect("in-memory file io poisoned");
-        let mut next = state
-            .files
-            .get(&path)
-            .map(|entry| entry.bytes.to_vec())
-            .unwrap_or_default();
-        next.extend_from_slice(bytes.as_ref());
-        Self::insert_file(&mut state, path, Bytes::from(next));
+        state.logical_time_ns += 1;
+        let mtime = OffsetDateTime::from_unix_timestamp_nanos(state.logical_time_ns)
+            .expect("logical sim timestamp is valid");
+        match state.files.get_mut(&path) {
+            Some(entry) => {
+                let mut next = entry.bytes.to_vec();
+                next.extend_from_slice(bytes.as_ref());
+                entry.bytes = Bytes::from(next);
+                entry.mtime = mtime;
+            }
+            None => {
+                let inode = state.next_inode;
+                state.next_inode += 1;
+                state.files.insert(
+                    path,
+                    Entry {
+                        bytes: Bytes::copy_from_slice(bytes.as_ref()),
+                        inode,
+                        mtime,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn prepend_file(&self, path: impl AsRef<str>, bytes: impl AsRef<[u8]>) -> eyre::Result<()> {
+        let path = RelativePath::parse(path.as_ref())?;
+        let mut state = self.state.lock().expect("in-memory file io poisoned");
+        state.logical_time_ns += 1;
+        let mtime = OffsetDateTime::from_unix_timestamp_nanos(state.logical_time_ns)
+            .expect("logical sim timestamp is valid");
+        match state.files.get_mut(&path) {
+            Some(entry) => {
+                let mut next = bytes.as_ref().to_vec();
+                next.extend_from_slice(entry.bytes.as_ref());
+                entry.bytes = Bytes::from(next);
+                entry.mtime = mtime;
+            }
+            None => {
+                let inode = state.next_inode;
+                state.next_inode += 1;
+                state.files.insert(
+                    path,
+                    Entry {
+                        bytes: Bytes::copy_from_slice(bytes.as_ref()),
+                        inode,
+                        mtime,
+                    },
+                );
+            }
+        }
         Ok(())
     }
 
@@ -82,6 +128,18 @@ impl InMemoryFileIO {
         let path = RelativePath::parse(path.as_ref())?;
         let mut state = self.state.lock().expect("in-memory file io poisoned");
         state.files.remove(&path);
+        state.logical_time_ns += 1;
+        Ok(())
+    }
+
+    pub fn rename_file(&self, from: impl AsRef<str>, to: impl AsRef<str>) -> eyre::Result<()> {
+        let from = RelativePath::parse(from.as_ref())?;
+        let to = RelativePath::parse(to.as_ref())?;
+        let mut state = self.state.lock().expect("in-memory file io poisoned");
+        let Some(entry) = state.files.remove(&from) else {
+            eyre::bail!("rename source does not exist: {from}");
+        };
+        state.files.insert(to, entry);
         state.logical_time_ns += 1;
         Ok(())
     }
@@ -96,6 +154,11 @@ impl InMemoryFileIO {
                 Ok((path.to_string(), content))
             })
             .collect()
+    }
+
+    pub fn stats(&self) -> InMemoryFileIOStats {
+        let state = self.state.lock().expect("in-memory file io poisoned");
+        state.stats
     }
 
     fn insert_file(state: &mut State, path: RelativePath, bytes: Bytes) {
@@ -200,14 +263,47 @@ impl InMemoryFileIO {
             path.file_name()
         )))
     }
+}
 
-    fn in_scope(path: &RelativePath, scope: &ScanScope) -> bool {
-        match scope {
-            ScanScope::Full => true,
-            ScanScope::SingleFile(single) => path == single,
-            ScanScope::Subtree(subtree) => {
-                path == subtree || path.as_components().starts_with(subtree.as_components())
-            }
+#[derive(Debug, Default, Clone, Copy)]
+pub struct InMemoryFileIOStats {
+    pub guarded_read_read_count: u64,
+    pub guarded_read_changed_between_stats_count: u64,
+    pub guarded_read_conflict_before_read_count: u64,
+    pub guarded_write_written_count: u64,
+    pub guarded_write_already_applied_count: u64,
+    pub guarded_write_conflict_before_swap_count: u64,
+    pub guarded_write_conflict_after_swap_count: u64,
+    pub guarded_write_conflict_count: u64,
+    pub guarded_delete_deleted_count: u64,
+    pub guarded_delete_already_deleted_count: u64,
+    pub guarded_delete_conflict_count: u64,
+}
+
+impl InMemoryFileIOStats {
+    pub fn combine(self, other: Self) -> Self {
+        Self {
+            guarded_read_read_count: self.guarded_read_read_count + other.guarded_read_read_count,
+            guarded_read_changed_between_stats_count: self.guarded_read_changed_between_stats_count
+                + other.guarded_read_changed_between_stats_count,
+            guarded_read_conflict_before_read_count: self.guarded_read_conflict_before_read_count
+                + other.guarded_read_conflict_before_read_count,
+            guarded_write_written_count: self.guarded_write_written_count
+                + other.guarded_write_written_count,
+            guarded_write_already_applied_count: self.guarded_write_already_applied_count
+                + other.guarded_write_already_applied_count,
+            guarded_write_conflict_before_swap_count: self.guarded_write_conflict_before_swap_count
+                + other.guarded_write_conflict_before_swap_count,
+            guarded_write_conflict_after_swap_count: self.guarded_write_conflict_after_swap_count
+                + other.guarded_write_conflict_after_swap_count,
+            guarded_write_conflict_count: self.guarded_write_conflict_count
+                + other.guarded_write_conflict_count,
+            guarded_delete_deleted_count: self.guarded_delete_deleted_count
+                + other.guarded_delete_deleted_count,
+            guarded_delete_already_deleted_count: self.guarded_delete_already_deleted_count
+                + other.guarded_delete_already_deleted_count,
+            guarded_delete_conflict_count: self.guarded_delete_conflict_count
+                + other.guarded_delete_conflict_count,
         }
     }
 }
@@ -219,7 +315,7 @@ impl FileIO for InMemoryFileIO {
         let entries = state
             .files
             .iter()
-            .filter(|(path, _)| Self::in_scope(path, &scope))
+            .filter(|(path, _)| scope.contains_path(path))
             .map(|(path, entry)| Self::stat_entry(path.clone(), entry))
             .collect();
         let finished_at = OffsetDateTime::from_unix_timestamp_nanos(state.logical_time_ns)
@@ -245,29 +341,31 @@ impl FileIO for InMemoryFileIO {
         path: RelativePath,
         expected: FileFingerprint,
     ) -> eyre::Result<GuardedReadResult> {
-        let state = self.state.lock().expect("in-memory file io poisoned");
+        let mut state = self.state.lock().expect("in-memory file io poisoned");
         let Some(entry) = state.files.get(&path) else {
+            state.stats.guarded_read_conflict_before_read_count += 1;
             return Ok(GuardedReadResult::ConflictBeforeRead { observed: None });
         };
         if Self::stat_fingerprint(entry) != *expected.stat() {
-            return Ok(GuardedReadResult::ConflictBeforeRead {
-                observed: Some(Self::stat_entry(path, entry)),
-            });
+            let observed = Some(Self::stat_entry(path, entry));
+            state.stats.guarded_read_conflict_before_read_count += 1;
+            return Ok(GuardedReadResult::ConflictBeforeRead { observed });
         }
 
         let bytes = entry.bytes.clone();
         let fingerprint = Self::stat_and_content_fingerprint(entry);
         if !Self::fingerprint_matches_observed(&fingerprint, &expected) {
-            return Ok(GuardedReadResult::ConflictBeforeRead {
-                observed: Some(TreeEntry {
-                    path,
-                    kind: TreeEntryKind::File {
-                        fingerprint: fingerprint.clone(),
-                    },
-                }),
+            let observed = Some(TreeEntry {
+                path,
+                kind: TreeEntryKind::File {
+                    fingerprint: fingerprint.clone(),
+                },
             });
+            state.stats.guarded_read_conflict_before_read_count += 1;
+            return Ok(GuardedReadResult::ConflictBeforeRead { observed });
         }
 
+        state.stats.guarded_read_read_count += 1;
         Ok(GuardedReadResult::Read { bytes, fingerprint })
     }
 
@@ -282,6 +380,7 @@ impl FileIO for InMemoryFileIO {
         if let Some(current) = Self::stable_read(&state, &path)
             && current.bytes == bytes
         {
+            state.stats.guarded_write_already_applied_count += 1;
             return Ok(GuardedWriteResult::AlreadyApplied {
                 fingerprint: current.fingerprint,
             });
@@ -289,9 +388,12 @@ impl FileIO for InMemoryFileIO {
 
         let observed = state.files.get(&path);
         if !Self::observed_matches_expected(observed, &expected_before) {
+            let observed = Self::tree_entry_for_observed(path.clone(), observed);
+            let swap_path = Self::temp_path_for(&path)?;
+            state.stats.guarded_write_conflict_before_swap_count += 1;
             return Ok(GuardedWriteResult::ConflictBeforeSwap {
-                swap_path: Self::temp_path_for(&path)?,
-                observed: Self::tree_entry_for_observed(path, observed),
+                swap_path,
+                observed,
             });
         }
 
@@ -300,9 +402,9 @@ impl FileIO for InMemoryFileIO {
             .files
             .get(&path)
             .expect("just inserted requested path");
-        Ok(GuardedWriteResult::Written {
-            fingerprint: Self::stat_and_content_fingerprint(entry),
-        })
+        let fingerprint = Self::stat_and_content_fingerprint(entry);
+        state.stats.guarded_write_written_count += 1;
+        Ok(GuardedWriteResult::Written { fingerprint })
     }
 
     async fn guarded_delete(
@@ -313,16 +415,18 @@ impl FileIO for InMemoryFileIO {
         let mut state = self.state.lock().expect("in-memory file io poisoned");
         let observed = state.files.get(&path);
         if !Self::observed_matches_expected(observed, &expected_before) {
-            return Ok(GuardedDeleteResult::Conflict {
-                observed: Self::tree_entry_for_observed(path, observed),
-            });
+            let observed = Self::tree_entry_for_observed(path, observed);
+            state.stats.guarded_delete_conflict_count += 1;
+            return Ok(GuardedDeleteResult::Conflict { observed });
         }
         if observed.is_none() {
+            state.stats.guarded_delete_already_deleted_count += 1;
             return Ok(GuardedDeleteResult::AlreadyDeleted);
         }
 
         state.files.remove(&path);
         state.logical_time_ns += 1;
+        state.stats.guarded_delete_deleted_count += 1;
         Ok(GuardedDeleteResult::Deleted)
     }
 

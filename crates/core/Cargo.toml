@@ -1,0 +1,42 @@
+[package]
+name = "opbox-core"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+sim = []
+
+[dependencies]
+tokio = { version = "1.52.0", features = ["fs", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-muxt = "0.7"
+eyre = "0.6.12"
+time = "0.3.47"
+bytes = "1.10"
+strum = { features= ["derive"], version = "0.28.0" }
+derivative = "2.2"
+futures = { version = "0.3", features = ["alloc"] }
+http-body-util = "0.1.3"
+hyper = { version = "1.10.1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1.20", features = ["http1", "tokio"] }
+tracing = "0.1.41"
+s2-sdk = { version = "0.31.2", features = ["_hidden"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+bb8 = "0.9"
+enum-ordinalize = "4.3.2"
+enum-ordinalize-derive = "4.3.2"
+turso = { version = "0.6.0-pre.18", default-features = false }
+secrecy = "0.10.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.9.4"
+fast32 = "1.0.3"
+base64 = "0.22.1"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+tokio-util = "0.7.18"
+async-trait = "0.1.89"
+compact_str = "0.9.0"
+clap = { version = "4.6.1", features = ["derive"] }
+similar = "2.7.0"
+yrs = "0.22"
+notify = "8.2.0"
+notify-debouncer-full = "0.7.0"
