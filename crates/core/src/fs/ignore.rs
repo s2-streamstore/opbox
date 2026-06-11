@@ -7,10 +7,27 @@ pub const IGNORE_FILE_NAME: &str = ".opboxignore";
 
 const DEFAULT_IGNORE_FILE: &str = "\
 # opbox always ignores .opbox/ internally.
+# A bare name matches that file or directory at any depth.
+
+# version control
 .git
-.DS_Store
+
+# build artifacts and dependency trees
+target
+node_modules
+__pycache__
+*.pyc
+
+# editors and IDEs
+.idea
 *.swp
 *.swo
+*~
+.#*
+
+# operating system noise
+.DS_Store
+Thumbs.db
 ";
 
 #[derive(Debug, Clone, Default)]
@@ -134,6 +151,43 @@ impl ComponentPattern {
 
     fn matches(&self, value: &str) -> bool {
         wildcard_match(self.raw.as_str(), value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(value: &str) -> RelativePath {
+        RelativePath::parse(value).expect("valid path")
+    }
+
+    #[test]
+    fn default_ignore_file_parses_and_matches_common_junk() -> eyre::Result<()> {
+        let rules = IgnoreRules::parse(default_ignore_file_contents())?;
+
+        for ignored in [
+            "target/debug/build/foo.d",
+            "sub/project/target/release/app",
+            "web/node_modules/lodash/index.js",
+            "lib/__pycache__/mod.cpython-312.pyc",
+            "notes/.#draft.org",
+            "notes/draft.org~",
+            ".idea/workspace.xml",
+            "photos/Thumbs.db",
+        ] {
+            assert!(rules.is_ignored(&path(ignored)), "{ignored} must be ignored");
+        }
+
+        for kept in [
+            "notes/targets.md",
+            "target.txt",
+            "docs/ideas.md",
+            "src/main.rs",
+        ] {
+            assert!(!rules.is_ignored(&path(kept)), "{kept} must not be ignored");
+        }
+        Ok(())
     }
 }
 
