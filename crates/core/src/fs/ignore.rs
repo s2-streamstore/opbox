@@ -176,7 +176,10 @@ mod tests {
             ".idea/workspace.xml",
             "photos/Thumbs.db",
         ] {
-            assert!(rules.is_ignored(&path(ignored)), "{ignored} must be ignored");
+            assert!(
+                rules.is_ignored(&path(ignored)),
+                "{ignored} must be ignored"
+            );
         }
 
         for kept in [
