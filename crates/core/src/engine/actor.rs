@@ -1,8 +1,7 @@
+use super::shared_message_buffer::SharedMessageBuffer;
 use crate::fs::client::{FsClient, FsClientResponse};
 use crate::fs::types::{GuardedWriteResult, RelativePath, ScanScope};
-use crate::log::types::{
-    LogReaderEvent, LogReaderRequest, LogWriterRequest, LogWriterResponse, SharedMessageEnvelope,
-};
+use crate::log::types::{LogReaderEvent, LogReaderRequest, LogWriterRequest, LogWriterResponse};
 use crate::semantic::client::{SemanticClient, SemanticClientResponse};
 use crate::semantic::types::{
     ImportAction, ImportActionId, ImportEpoch, NextWork, ProjectionAction, ProjectionActionId,
@@ -24,45 +23,12 @@ use tracing::{debug, trace, warn};
 
 const MAX_SHARED_MESSAGE_BUFFER_MS: Duration = Duration::from_millis(10);
 const FULL_SCAN_INTERVAL: Duration = Duration::from_millis(120000);
-
-// Can overshoot.
-const MAX_SHARED_MESSAGE_BUFFER_SIZE_BYTES: usize = 1024 * 1024 * 10;
 const READ_OUTBOX_BATCH_SIZE: u64 = 1024;
 
 #[derive(Ordinalize, Debug, Clone, Copy, PartialEq, Eq)]
 enum TimerEvent {
     SharedMessageBufferDrain,
     FullScan,
-}
-
-#[derive(Default)]
-struct SharedMessageBuffer {
-    size_bytes: usize,
-    earliest_timestamp: Option<Instant>,
-    envelopes: Vec<SharedMessageEnvelope>,
-}
-
-impl SharedMessageBuffer {
-    fn insert(&mut self, envelope: SharedMessageEnvelope) {
-        if self.earliest_timestamp.is_none() {
-            self.earliest_timestamp = Some(Instant::now())
-        }
-        self.size_bytes += envelope.shared_message.approximate_size_bytes();
-        self.envelopes.push(envelope);
-    }
-
-    fn has_capacity(&self) -> bool {
-        self.size_bytes < MAX_SHARED_MESSAGE_BUFFER_SIZE_BYTES
-    }
-
-    fn next_fire_at(&self) -> Option<Instant> {
-        if self.has_capacity() {
-            self.earliest_timestamp
-                .map(|earliest| earliest + MAX_SHARED_MESSAGE_BUFFER_MS)
-        } else {
-            Some(Instant::now())
-        }
-    }
 }
 
 fn coalesce_scan_scopes(left: ScanScope, right: ScanScope) -> ScanScope {
@@ -235,7 +201,7 @@ impl Engine {
             spy_tx: events.spy,
             phase: EnginePhase::Idle,
             cleanup_queue: VecDeque::new(),
-            shared_message_buffer: SharedMessageBuffer::default(),
+            shared_message_buffer: SharedMessageBuffer::new(MAX_SHARED_MESSAGE_BUFFER_MS),
             outbox_read_in_flight: false,
             outbox_read_requested: false,
             next_boundary: 0,
@@ -641,9 +607,9 @@ impl Engine {
                     match event {
                         TimerEvent::SharedMessageBufferDrain => {
                             if self.semantic_client.can_accept_apply_shared_message_batch() {
-                                let buffer = std::mem::take(&mut self.shared_message_buffer);
-                                assert_ne!(buffer.envelopes.len(), 0);
-                                let batch = SharedMessageBatch::try_from(buffer.envelopes)?;
+                                let envelopes = self.shared_message_buffer.drain();
+                                assert_ne!(envelopes.len(), 0);
+                                let batch = SharedMessageBatch::try_from(envelopes)?;
                                 Self::cancel_timer(&mut timer, TimerEvent::SharedMessageBufferDrain);
                                 self.semantic_client.apply_shared_message_batch(batch)?;
                             }

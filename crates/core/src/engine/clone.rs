@@ -1,59 +1,18 @@
+use super::shared_message_buffer::SharedMessageBuffer;
 use crate::fs::client::{FsClient, FsClientResponse};
 use crate::fs::types::ScanScope;
-use crate::log::types::{LogReaderEvent, LogReaderRequest, SequenceNumber, SharedMessageEnvelope};
+use crate::log::types::{LogReaderEvent, LogReaderRequest, SequenceNumber};
 use crate::semantic::client::{SemanticClient, SemanticClientResponse};
 use crate::semantic::types::{NextWork, ProjectionActionResult, ProjectionEpochEndReason};
 use crate::types::SharedMessageBatch;
 use eyre::eyre;
 use std::ops::RangeTo;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, Instant};
+use tokio::time::Instant;
 use tracing::{debug, trace};
 
 const MAX_SHARED_MESSAGE_BUFFER_MS: Duration = Duration::from_millis(500);
-
-// Can overshoot.
-const MAX_SHARED_MESSAGE_BUFFER_SIZE_BYTES: usize = 1024 * 1024 * 10;
-
-#[derive(Default)]
-struct SharedMessageBuffer {
-    size_bytes: usize,
-    earliest_timestamp: Option<Instant>,
-    envelopes: Vec<SharedMessageEnvelope>,
-}
-
-impl SharedMessageBuffer {
-    fn insert(&mut self, envelope: SharedMessageEnvelope) {
-        if self.earliest_timestamp.is_none() {
-            self.earliest_timestamp = Some(Instant::now());
-        }
-        self.size_bytes += envelope.shared_message.approximate_size_bytes();
-        self.envelopes.push(envelope);
-    }
-
-    fn has_capacity(&self) -> bool {
-        self.size_bytes < MAX_SHARED_MESSAGE_BUFFER_SIZE_BYTES
-    }
-
-    fn is_empty(&self) -> bool {
-        self.envelopes.is_empty()
-    }
-
-    fn last_sequence_end(&self) -> Option<SequenceNumber> {
-        self.envelopes
-            .last()
-            .map(|envelope| envelope.sequence_number + 1)
-    }
-
-    fn next_fire_at(&self) -> Option<Instant> {
-        if self.has_capacity() {
-            self.earliest_timestamp
-                .map(|earliest| earliest + MAX_SHARED_MESSAGE_BUFFER_MS)
-        } else {
-            Some(Instant::now())
-        }
-    }
-}
 
 pub struct CloneClients {
     pub fs: FsClient,
@@ -140,7 +99,7 @@ async fn pull_shared_log_to_start_tail(
 
     let mut target_tail: Option<RangeTo<SequenceNumber>> = None;
     let mut applied_end: SequenceNumber = 0;
-    let mut buffer = SharedMessageBuffer::default();
+    let mut buffer = SharedMessageBuffer::new(MAX_SHARED_MESSAGE_BUFFER_MS);
 
     loop {
         if let Some(tail) = &target_tail
@@ -209,12 +168,12 @@ async fn flush_shared_message_buffer(
         "clone shared-message buffer flush requested while empty"
     );
 
-    let buffer = std::mem::take(buffer);
     let next_end = buffer
         .last_sequence_end()
         .expect("non-empty buffer has last sequence");
-    let message_count = buffer.envelopes.len();
-    let batch = SharedMessageBatch::try_from(buffer.envelopes)?;
+    let envelopes = buffer.drain();
+    let message_count = envelopes.len();
+    let batch = SharedMessageBatch::try_from(envelopes)?;
     semantic.apply_shared_message_batch(batch)?;
     await_apply_shared_message_batch(semantic).await?;
 
