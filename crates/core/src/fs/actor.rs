@@ -215,6 +215,7 @@ struct FsOpId(u64);
 
 struct PendingFsOp {
     kind: PendingFsOpKind,
+    #[allow(dead_code)] // reserved for stall detection
     started_at: Instant,
 }
 

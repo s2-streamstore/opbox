@@ -464,6 +464,7 @@ struct SemanticOpId(u64);
 
 struct PendingSemanticOp {
     kind: PendingSemanticOpKind,
+    #[allow(dead_code)] // reserved for stall detection
     started_at: Instant,
 }
 

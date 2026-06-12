@@ -4,47 +4,16 @@
 //! and replaying the diff as Yjs insert/delete operations.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(not(feature = "sim"))]
-use std::time::Instant;
 
 use bytes::Bytes;
 use eyre::{Result, WrapErr};
 use similar::{ChangeTag, TextDiff};
-use tracing::trace;
 use yrs::block::ClientID;
 use yrs::types::text::TextRef;
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, GetString, Options, ReadTxn, StateVector, Text, Transact, Update};
 
-const MAX_SAFE_CLIENT_ID: u64 = (1u64 << 53) - 1;
-
-macro_rules! perf_start {
-    () => {{
-        #[cfg(not(feature = "sim"))]
-        {
-            Instant::now()
-        }
-        #[cfg(feature = "sim")]
-        {
-            ()
-        }
-    }};
-}
-
-macro_rules! trace_perf {
-    ($started:expr, $($fields:tt)*) => {{
-        #[cfg(not(feature = "sim"))]
-        {
-            let elapsed_us = $started.elapsed().as_micros() as u64;
-            trace!(elapsed_us, $($fields)*);
-        }
-        #[cfg(feature = "sim")]
-        {
-            let _ = &$started;
-            trace!($($fields)*);
-        }
-    }};
-}
+pub use super::client_id_for_writer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextDocState {
@@ -57,19 +26,6 @@ pub struct TextCapture {
     pub update_bytes: Bytes,
     pub full_state_bytes: Bytes,
     pub text: String,
-}
-
-pub fn client_id_for_writer(writer_id: &[u8]) -> u64 {
-    // Writer ids are already random bytes; take them directly rather than
-    // hashing, since std's DefaultHasher is not stable across Rust releases.
-    let mut bytes = [0u8; 8];
-    let len = writer_id.len().min(8);
-    bytes[..len].copy_from_slice(&writer_id[..len]);
-    // Yrs exposes ClientID as u64, but very large ids can produce updates that
-    // fail decode in this dependency stack. Keep deterministic writer-derived
-    // ids inside the JS-safe integer range used by Yjs implementations.
-    let id = u64::from_be_bytes(bytes) & MAX_SAFE_CLIENT_ID;
-    if id == 0 { 1 } else { id }
 }
 
 static READ_ONLY_CLIENT_ID_COUNTER: AtomicU64 = AtomicU64::new(10_000_000);
@@ -231,9 +187,67 @@ impl TextObjectDoc {
         }))
     }
 
+    /// Minimum length (in bytes) of a contiguous equal run to be considered
+    /// "significant" rather than noise from coincidental character matches.
+    const MIN_SIGNIFICANT_RUN: usize = 3;
+
+    /// If no single equal run covers at least this fraction of old_len, AND
+    /// the total significant-run bytes are below
+    /// [`Self::CHAR_DIFF_RETAIN_THRESHOLD`], fall back to blunt mode.
+    const SUBSTANTIAL_RUN_FRACTION: f64 = 1.0 / 3.0;
+
+    /// Minimum fraction of old-text characters (in significant contiguous
+    /// equal runs) that must be retained for us to use the fine-grained diff.
+    const CHAR_DIFF_RETAIN_THRESHOLD: f64 = 0.5;
+
     fn apply_string_diff(&self, old: &str, new: &str) {
         let diff = TextDiff::from_chars(old, new);
         let changes: Vec<_> = diff.iter_all_changes().collect();
+
+        let old_len = old.len();
+        if old_len > 0 {
+            // Measure contiguous equal runs: their maximum length and total
+            // significant bytes. A single long run proves real shared content;
+            // many short scattered runs are coincidental LCS noise.
+            let mut max_run: usize = 0;
+            let mut significant_equal_bytes: usize = 0;
+            let mut current_run: usize = 0;
+            for c in &changes {
+                if c.tag() == ChangeTag::Equal {
+                    current_run += c.value().len();
+                } else {
+                    if current_run > max_run {
+                        max_run = current_run;
+                    }
+                    if current_run >= Self::MIN_SIGNIFICANT_RUN {
+                        significant_equal_bytes += current_run;
+                    }
+                    current_run = 0;
+                }
+            }
+            if current_run > max_run {
+                max_run = current_run;
+            }
+            if current_run >= Self::MIN_SIGNIFICANT_RUN {
+                significant_equal_bytes += current_run;
+            }
+
+            // If there's at least one run covering a substantial portion of
+            // old text, the diff has genuine shared structure → fine-grained.
+            let has_substantial_run =
+                max_run as f64 >= old_len as f64 * Self::SUBSTANTIAL_RUN_FRACTION;
+            if !has_substantial_run {
+                let retained = significant_equal_bytes as f64 / old_len as f64;
+                if retained < Self::CHAR_DIFF_RETAIN_THRESHOLD {
+                    let mut txn = self.doc.transact_mut();
+                    self.text.remove_range(&mut txn, 0, old_len as u32);
+                    if !new.is_empty() {
+                        self.text.insert(&mut txn, 0, new);
+                    }
+                    return;
+                }
+            }
+        }
 
         let mut txn = self.doc.transact_mut();
         let mut pos: u32 = 0;
@@ -403,6 +417,7 @@ pub fn capture_text_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crdt::MAX_SAFE_CLIENT_ID;
 
     #[test]
     fn captures_incremental_text_update() -> Result<()> {
@@ -462,6 +477,68 @@ mod tests {
             capture_a.update_bytes.as_ref(),
         )?;
         assert_eq!(both.text, other_both.text);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_full_overwrites_do_not_interleave() -> Result<()> {
+        let base = text_state_from_content(42, "shared document\n");
+        let client_a = client_id_for_writer(&[1u8; 16]);
+        let client_b = client_id_for_writer(&[2u8; 16]);
+        assert_ne!(client_a, client_b);
+
+        let capture_a = capture_text_change(
+            client_a,
+            base.as_ref(),
+            "shared document\n",
+            "edited by node-a\n",
+        )?
+        .expect("text changed");
+        let capture_b = capture_text_change(
+            client_b,
+            base.as_ref(),
+            "shared document\n",
+            "edited by node-b\n",
+        )?
+        .expect("text changed");
+
+        // Apply A then B.
+        let ab = {
+            let one = apply_text_update(base.as_ref(), capture_a.update_bytes.as_ref())?;
+            apply_text_update(
+                one.full_state_bytes.as_ref(),
+                capture_b.update_bytes.as_ref(),
+            )?
+        };
+        // Apply B then A.
+        let ba = {
+            let one = apply_text_update(base.as_ref(), capture_b.update_bytes.as_ref())?;
+            apply_text_update(
+                one.full_state_bytes.as_ref(),
+                capture_a.update_bytes.as_ref(),
+            )?
+        };
+        // Both orders must converge.
+        assert_eq!(ab.text, ba.text);
+        // The merged text must be one full version concatenated with the other
+        // (no character-level interleaving). One of the two orderings is valid.
+        let valid_a_first = "edited by node-a\nedited by node-b\n";
+        let valid_b_first = "edited by node-b\nedited by node-a\n";
+        assert!(
+            ab.text == valid_a_first || ab.text == valid_b_first,
+            "expected one clean ordering, got: {:?}",
+            ab.text,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn small_edit_uses_fine_grained_diff() -> Result<()> {
+        let base = text_state_from_content(1, "hello world\n");
+        let capture =
+            capture_text_change(7, base.as_ref(), "hello world\n", "hello brave world\n")?
+                .expect("text changed");
+        assert_eq!(capture.text, "hello brave world\n");
         Ok(())
     }
 

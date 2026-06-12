@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command as TokioCommand;
-use tracing::{debug, info};
+use tracing::debug;
 
 const CLIENT_COMMAND: &str = "ob";
 
@@ -69,7 +69,7 @@ enum Command {
     Status {
         sync_root: Option<PathBuf>,
     },
-    ///
+    /// Stream real-time sync events from the daemon.
     Spy {
         sync_root: Option<PathBuf>,
     },

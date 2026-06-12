@@ -18,7 +18,7 @@ use yrs::types::map::MapRef;
 use yrs::updates::decoder::Decode;
 use yrs::{Any, Doc, Map, MapPrelim, Options, ReadTxn, StateVector, Transact, Update};
 
-const MAX_SAFE_CLIENT_ID: u64 = (1u64 << 53) - 1;
+pub use super::client_id_for_writer;
 
 /// Wrapper around the global namespace Y.Doc.
 #[derive(Debug)]
@@ -294,19 +294,6 @@ impl NamespaceDoc {
     pub fn materialize(&self) -> Result<NamespaceProjection> {
         materialize_namespace(self)
     }
-}
-
-pub fn client_id_for_writer(writer_id: &[u8]) -> u64 {
-    // Writer ids are already random bytes; take them directly rather than
-    // hashing, since std's DefaultHasher is not stable across Rust releases.
-    let mut bytes = [0u8; 8];
-    let len = writer_id.len().min(8);
-    bytes[..len].copy_from_slice(&writer_id[..len]);
-    // Yrs exposes ClientID as u64, but very large ids can produce updates that
-    // fail decode in this dependency stack. Keep deterministic writer-derived
-    // ids inside the JS-safe integer range used by Yjs implementations.
-    let id = u64::from_be_bytes(bytes) & MAX_SAFE_CLIENT_ID;
-    if id == 0 { 1 } else { id }
 }
 
 static READ_ONLY_CLIENT_ID_COUNTER: AtomicU64 = AtomicU64::new(20_000_000);
