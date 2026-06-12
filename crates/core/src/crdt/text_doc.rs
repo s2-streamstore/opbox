@@ -187,20 +187,18 @@ impl TextObjectDoc {
         }))
     }
 
-    /// Minimum fraction of old-text characters (in significant contiguous runs)
-    /// that must be retained for us to use the fine-grained character-level
-    /// diff. Below this the diff is essentially a full rewrite, and we fall
-    /// back to a blunt "delete all, insert all" so concurrent overwrites
-    /// land as contiguous blocks rather than character-interleaved gibberish.
-    ///
-    /// Only equal runs of [`Self::MIN_SIGNIFICANT_RUN`] bytes or more count
-    /// towards the retained fraction — this filters out coincidental
-    /// single-character matches that LCS finds in short strings.
-    const CHAR_DIFF_RETAIN_THRESHOLD: f64 = 0.5;
-
     /// Minimum length (in bytes) of a contiguous equal run to be considered
     /// "significant" rather than noise from coincidental character matches.
     const MIN_SIGNIFICANT_RUN: usize = 3;
+
+    /// If no single equal run covers at least this fraction of old_len, AND
+    /// the total significant-run bytes are below
+    /// [`Self::CHAR_DIFF_RETAIN_THRESHOLD`], fall back to blunt mode.
+    const SUBSTANTIAL_RUN_FRACTION: f64 = 1.0 / 3.0;
+
+    /// Minimum fraction of old-text characters (in significant contiguous
+    /// equal runs) that must be retained for us to use the fine-grained diff.
+    const CHAR_DIFF_RETAIN_THRESHOLD: f64 = 0.5;
 
     fn apply_string_diff(&self, old: &str, new: &str) {
         let diff = TextDiff::from_chars(old, new);
@@ -208,32 +206,46 @@ impl TextObjectDoc {
 
         let old_len = old.len();
         if old_len > 0 {
-            // Count bytes in contiguous equal runs that are long enough to be
-            // meaningful (filters single-char coincidental LCS matches).
+            // Measure contiguous equal runs: their maximum length and total
+            // significant bytes. A single long run proves real shared content;
+            // many short scattered runs are coincidental LCS noise.
+            let mut max_run: usize = 0;
             let mut significant_equal_bytes: usize = 0;
             let mut current_run: usize = 0;
             for c in &changes {
                 if c.tag() == ChangeTag::Equal {
                     current_run += c.value().len();
                 } else {
+                    if current_run > max_run {
+                        max_run = current_run;
+                    }
                     if current_run >= Self::MIN_SIGNIFICANT_RUN {
                         significant_equal_bytes += current_run;
                     }
                     current_run = 0;
                 }
             }
+            if current_run > max_run {
+                max_run = current_run;
+            }
             if current_run >= Self::MIN_SIGNIFICANT_RUN {
                 significant_equal_bytes += current_run;
             }
 
-            let retained = significant_equal_bytes as f64 / old_len as f64;
-            if retained < Self::CHAR_DIFF_RETAIN_THRESHOLD {
-                let mut txn = self.doc.transact_mut();
-                self.text.remove_range(&mut txn, 0, old_len as u32);
-                if !new.is_empty() {
-                    self.text.insert(&mut txn, 0, new);
+            // If there's at least one run covering a substantial portion of
+            // old text, the diff has genuine shared structure → fine-grained.
+            let has_substantial_run =
+                max_run as f64 >= old_len as f64 * Self::SUBSTANTIAL_RUN_FRACTION;
+            if !has_substantial_run {
+                let retained = significant_equal_bytes as f64 / old_len as f64;
+                if retained < Self::CHAR_DIFF_RETAIN_THRESHOLD {
+                    let mut txn = self.doc.transact_mut();
+                    self.text.remove_range(&mut txn, 0, old_len as u32);
+                    if !new.is_empty() {
+                        self.text.insert(&mut txn, 0, new);
+                    }
+                    return;
                 }
-                return;
             }
         }
 
