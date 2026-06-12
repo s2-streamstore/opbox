@@ -187,28 +187,30 @@ impl TextObjectDoc {
         }))
     }
 
-    /// Fraction of old-text characters that must survive in the diff for us to
-    /// use the fine-grained (character-level) edit path. When the retained
-    /// fraction drops below this, the diff is almost a full rewrite and we
-    /// fall back to a blunt "delete all, insert all" to avoid creating many
-    /// small CRDT anchors that cause interleaving on concurrent overwrites.
+    /// Minimum fraction of characters (measured against the longer of old/new)
+    /// that must be unchanged for us to use the fine-grained character-level
+    /// diff. Below this the diff is essentially a full rewrite, and we fall
+    /// back to a blunt "delete all, insert all" so concurrent overwrites
+    /// land as contiguous blocks rather than character-interleaved gibberish.
     const CHAR_DIFF_RETAIN_THRESHOLD: f64 = 0.5;
 
     fn apply_string_diff(&self, old: &str, new: &str) {
         let diff = TextDiff::from_chars(old, new);
         let changes: Vec<_> = diff.iter_all_changes().collect();
 
-        let total_old_bytes = old.len();
-        if total_old_bytes > 0 {
+        let max_len = old.len().max(new.len());
+        if max_len > 0 {
             let equal_bytes: usize = changes
                 .iter()
                 .filter(|c| c.tag() == ChangeTag::Equal)
                 .map(|c| c.value().len())
                 .sum();
-            let retained = equal_bytes as f64 / total_old_bytes as f64;
+            let retained = equal_bytes as f64 / max_len as f64;
             if retained < Self::CHAR_DIFF_RETAIN_THRESHOLD {
                 let mut txn = self.doc.transact_mut();
-                self.text.remove_range(&mut txn, 0, total_old_bytes as u32);
+                if !old.is_empty() {
+                    self.text.remove_range(&mut txn, 0, old.len() as u32);
+                }
                 if !new.is_empty() {
                     self.text.insert(&mut txn, 0, new);
                 }
