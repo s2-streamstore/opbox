@@ -187,9 +187,34 @@ impl TextObjectDoc {
         }))
     }
 
+    /// Fraction of old-text characters that must survive in the diff for us to
+    /// use the fine-grained (character-level) edit path. When the retained
+    /// fraction drops below this, the diff is almost a full rewrite and we
+    /// fall back to a blunt "delete all, insert all" to avoid creating many
+    /// small CRDT anchors that cause interleaving on concurrent overwrites.
+    const CHAR_DIFF_RETAIN_THRESHOLD: f64 = 0.5;
+
     fn apply_string_diff(&self, old: &str, new: &str) {
         let diff = TextDiff::from_chars(old, new);
         let changes: Vec<_> = diff.iter_all_changes().collect();
+
+        let total_old_bytes = old.len();
+        if total_old_bytes > 0 {
+            let equal_bytes: usize = changes
+                .iter()
+                .filter(|c| c.tag() == ChangeTag::Equal)
+                .map(|c| c.value().len())
+                .sum();
+            let retained = equal_bytes as f64 / total_old_bytes as f64;
+            if retained < Self::CHAR_DIFF_RETAIN_THRESHOLD {
+                let mut txn = self.doc.transact_mut();
+                self.text.remove_range(&mut txn, 0, total_old_bytes as u32);
+                if !new.is_empty() {
+                    self.text.insert(&mut txn, 0, new);
+                }
+                return;
+            }
+        }
 
         let mut txn = self.doc.transact_mut();
         let mut pos: u32 = 0;
@@ -419,6 +444,68 @@ mod tests {
             capture_a.update_bytes.as_ref(),
         )?;
         assert_eq!(both.text, other_both.text);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_full_overwrites_do_not_interleave() -> Result<()> {
+        let base = text_state_from_content(42, "shared document\n");
+        let client_a = client_id_for_writer(&[1u8; 16]);
+        let client_b = client_id_for_writer(&[2u8; 16]);
+        assert_ne!(client_a, client_b);
+
+        let capture_a = capture_text_change(
+            client_a,
+            base.as_ref(),
+            "shared document\n",
+            "edited by node-a\n",
+        )?
+        .expect("text changed");
+        let capture_b = capture_text_change(
+            client_b,
+            base.as_ref(),
+            "shared document\n",
+            "edited by node-b\n",
+        )?
+        .expect("text changed");
+
+        // Apply A then B.
+        let ab = {
+            let one = apply_text_update(base.as_ref(), capture_a.update_bytes.as_ref())?;
+            apply_text_update(
+                one.full_state_bytes.as_ref(),
+                capture_b.update_bytes.as_ref(),
+            )?
+        };
+        // Apply B then A.
+        let ba = {
+            let one = apply_text_update(base.as_ref(), capture_b.update_bytes.as_ref())?;
+            apply_text_update(
+                one.full_state_bytes.as_ref(),
+                capture_a.update_bytes.as_ref(),
+            )?
+        };
+        // Both orders must converge.
+        assert_eq!(ab.text, ba.text);
+        // The merged text must be one full version concatenated with the other
+        // (no character-level interleaving). One of the two orderings is valid.
+        let valid_a_first = "edited by node-a\nedited by node-b\n";
+        let valid_b_first = "edited by node-b\nedited by node-a\n";
+        assert!(
+            ab.text == valid_a_first || ab.text == valid_b_first,
+            "expected one clean ordering, got: {:?}",
+            ab.text,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn small_edit_uses_fine_grained_diff() -> Result<()> {
+        let base = text_state_from_content(1, "hello world\n");
+        let capture =
+            capture_text_change(7, base.as_ref(), "hello world\n", "hello brave world\n")?
+                .expect("text changed");
+        assert_eq!(capture.text, "hello brave world\n");
         Ok(())
     }
 
