@@ -8,13 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use eyre::{Result, WrapErr};
 use similar::{ChangeTag, TextDiff};
-use tracing::trace;
 use yrs::block::ClientID;
 use yrs::types::text::TextRef;
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, GetString, Options, ReadTxn, StateVector, Text, Transact, Update};
 
-use super::MAX_SAFE_CLIENT_ID;
 pub use super::client_id_for_writer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +359,7 @@ pub fn capture_text_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crdt::MAX_SAFE_CLIENT_ID;
 
     #[test]
     fn captures_incremental_text_update() -> Result<()> {

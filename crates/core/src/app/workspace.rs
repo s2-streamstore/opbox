@@ -312,12 +312,12 @@ impl DaemonLock {
                     return Ok(Self { path, pid });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if let Some(existing_pid) = read_pid_file(&path)? {
-                        if process_is_alive(existing_pid) {
-                            eyre::bail!(
-                                "opbox daemon already appears to be running for this workspace (pid {existing_pid})"
-                            );
-                        }
+                    if let Some(existing_pid) = read_pid_file(&path)?
+                        && process_is_alive(existing_pid)
+                    {
+                        eyre::bail!(
+                            "opbox daemon already appears to be running for this workspace (pid {existing_pid})"
+                        );
                     }
                     std::fs::remove_file(&path)?;
                 }

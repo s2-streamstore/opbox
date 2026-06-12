@@ -81,6 +81,7 @@ enum EnginePhase {
     },
     /// Fs scan executing.
     Scanning {
+        #[allow(dead_code)] // logged via Debug
         scope: ScanScope,
     },
     /// Semantic is turning the scan result into an import plan.
@@ -97,6 +98,7 @@ enum ImportPhase {
         in_flight: BTreeSet<ImportActionId>,
     },
     Committing {
+        #[allow(dead_code)] // logged via Debug
         epoch: ImportEpoch,
     },
 }
@@ -121,7 +123,9 @@ enum ProjectionPhase {
     /// Epoch commit in flight. No plan and no in-flight set: an action
     /// completion in this phase is a bug, not a race.
     Committing {
+        #[allow(dead_code)] // logged via Debug
         epoch: ProjectionEpoch,
+        #[allow(dead_code)] // logged via Debug
         generation: ProjectionGeneration,
     },
 }
@@ -136,6 +140,7 @@ pub struct Engine {
     semantic_client: SemanticClient,
 
     log_reader_rx: mpsc::Receiver<LogReaderEvent>,
+    #[allow(dead_code)] // retained for future log reader commands
     log_reader_tx: mpsc::UnboundedSender<LogReaderRequest>,
     log_writer_rx: mpsc::UnboundedReceiver<LogWriterResponse>,
     log_writer_tx: mpsc::UnboundedSender<LogWriterRequest>,

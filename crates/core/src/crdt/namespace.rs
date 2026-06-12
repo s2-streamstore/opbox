@@ -18,7 +18,6 @@ use yrs::types::map::MapRef;
 use yrs::updates::decoder::Decode;
 use yrs::{Any, Doc, Map, MapPrelim, Options, ReadTxn, StateVector, Transact, Update};
 
-use super::MAX_SAFE_CLIENT_ID;
 pub use super::client_id_for_writer;
 
 /// Wrapper around the global namespace Y.Doc.

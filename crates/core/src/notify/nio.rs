@@ -1,4 +1,4 @@
-use crate::fs::ignore::{IgnoreRules, IGNORE_FILE_NAME};
+use crate::fs::ignore::{IGNORE_FILE_NAME, IgnoreRules};
 use crate::fs::types::ScanScope;
 use async_trait::async_trait;
 use compact_str::CompactString;
