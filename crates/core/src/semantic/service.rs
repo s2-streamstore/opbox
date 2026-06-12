@@ -27,8 +27,6 @@ use std::collections::BTreeMap;
 use std::ops::RangeToInclusive;
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(not(feature = "sim"))]
-use std::time::Instant;
 use tracing::{debug, instrument, trace, warn};
 use turso::{Connection, Database};
 use xxhash_rust::xxh3::xxh3_64;
@@ -43,34 +41,6 @@ struct DesiredStableTreeFile {
     claimed_path: crate::fs::types::RelativePath,
     claim_id: NamespaceClaimId,
     object_id: ObjectId,
-}
-
-macro_rules! perf_start {
-    () => {{
-        #[cfg(not(feature = "sim"))]
-        {
-            Instant::now()
-        }
-        #[cfg(feature = "sim")]
-        {
-            ()
-        }
-    }};
-}
-
-macro_rules! trace_perf {
-    ($started:expr, $($fields:tt)*) => {{
-        #[cfg(not(feature = "sim"))]
-        {
-            let elapsed_us = $started.elapsed().as_micros() as u64;
-            trace!(elapsed_us, $($fields)*);
-        }
-        #[cfg(feature = "sim")]
-        {
-            let _ = &$started;
-            trace!($($fields)*);
-        }
-    }};
 }
 
 #[derive(Clone)]

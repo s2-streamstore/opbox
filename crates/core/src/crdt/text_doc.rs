@@ -4,8 +4,6 @@
 //! and replaying the diff as Yjs insert/delete operations.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(not(feature = "sim"))]
-use std::time::Instant;
 
 use bytes::Bytes;
 use eyre::{Result, WrapErr};
@@ -18,34 +16,6 @@ use yrs::{Doc, GetString, Options, ReadTxn, StateVector, Text, Transact, Update}
 
 use super::MAX_SAFE_CLIENT_ID;
 pub use super::client_id_for_writer;
-
-macro_rules! perf_start {
-    () => {{
-        #[cfg(not(feature = "sim"))]
-        {
-            Instant::now()
-        }
-        #[cfg(feature = "sim")]
-        {
-            ()
-        }
-    }};
-}
-
-macro_rules! trace_perf {
-    ($started:expr, $($fields:tt)*) => {{
-        #[cfg(not(feature = "sim"))]
-        {
-            let elapsed_us = $started.elapsed().as_micros() as u64;
-            trace!(elapsed_us, $($fields)*);
-        }
-        #[cfg(feature = "sim")]
-        {
-            let _ = &$started;
-            trace!($($fields)*);
-        }
-    }};
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextDocState {
