@@ -1,4 +1,4 @@
-use crate::fs::ignore::IgnoreRules;
+use crate::fs::ignore::{IgnoreRules, IGNORE_FILE_NAME};
 use crate::fs::types::ScanScope;
 use async_trait::async_trait;
 use compact_str::CompactString;
@@ -72,6 +72,7 @@ pub struct LocalNotifyIO {
         RecommendedCache,
     >,
     rx: mpsc::UnboundedReceiver<DebounceEventResult>,
+    ignore_rules: IgnoreRules,
 }
 
 impl LocalNotifyIO {
@@ -84,16 +85,29 @@ impl LocalNotifyIO {
 
         debouncer.watch(&root, RecursiveMode::Recursive)?;
 
+        let ignore_rules = IgnoreRules::load(&root)?;
         Ok(Self {
             root,
             _debouncer: debouncer,
             rx,
+            ignore_rules,
         })
     }
 
-    fn scopes_for_result(&self, result: DebounceEventResult) -> NotifyEventBatch {
+    fn scopes_for_result(&mut self, result: DebounceEventResult) -> NotifyEventBatch {
         match result {
             Ok(events) => {
+                let ignore_file = self.root.join(IGNORE_FILE_NAME);
+                let needs_reload = events.iter().any(|e| e.event.paths.contains(&ignore_file));
+                if needs_reload {
+                    match IgnoreRules::load(&self.root) {
+                        Ok(rules) => self.ignore_rules = rules,
+                        Err(error) => {
+                            warn!(?error, "failed to reload ignore rules");
+                        }
+                    }
+                }
+
                 let mut scopes = BTreeSet::new();
                 for event in events {
                     for path in event.event.paths {
@@ -134,7 +148,7 @@ impl LocalNotifyIO {
         }
 
         let relative_path = relative_path_from_path(relative)?;
-        if IgnoreRules::load(&self.root)?.is_ignored(&relative_path) {
+        if self.ignore_rules.is_ignored(&relative_path) {
             return Ok(None);
         }
         if absolute.is_file() {
