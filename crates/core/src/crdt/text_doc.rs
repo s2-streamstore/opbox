@@ -16,7 +16,8 @@ use yrs::types::text::TextRef;
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, GetString, Options, ReadTxn, StateVector, Text, Transact, Update};
 
-const MAX_SAFE_CLIENT_ID: u64 = (1u64 << 53) - 1;
+use super::MAX_SAFE_CLIENT_ID;
+pub use super::client_id_for_writer;
 
 macro_rules! perf_start {
     () => {{
@@ -57,19 +58,6 @@ pub struct TextCapture {
     pub update_bytes: Bytes,
     pub full_state_bytes: Bytes,
     pub text: String,
-}
-
-pub fn client_id_for_writer(writer_id: &[u8]) -> u64 {
-    // Writer ids are already random bytes; take them directly rather than
-    // hashing, since std's DefaultHasher is not stable across Rust releases.
-    let mut bytes = [0u8; 8];
-    let len = writer_id.len().min(8);
-    bytes[..len].copy_from_slice(&writer_id[..len]);
-    // Yrs exposes ClientID as u64, but very large ids can produce updates that
-    // fail decode in this dependency stack. Keep deterministic writer-derived
-    // ids inside the JS-safe integer range used by Yjs implementations.
-    let id = u64::from_be_bytes(bytes) & MAX_SAFE_CLIENT_ID;
-    if id == 0 { 1 } else { id }
 }
 
 static READ_ONLY_CLIENT_ID_COUNTER: AtomicU64 = AtomicU64::new(10_000_000);
