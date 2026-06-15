@@ -434,6 +434,73 @@ mod tests {
     }
 
     #[test]
+    fn captures_clear_to_empty() -> Result<()> {
+        let base = text_state_from_content(1, "hello world\n");
+        let capture =
+            capture_text_change(7, base.as_ref(), "hello world\n", "")?.expect("text changed");
+
+        assert_eq!(capture.text, "");
+
+        let applied = apply_text_update(base.as_ref(), capture.update_bytes.as_ref())?;
+        assert_eq!(applied.text, "");
+
+        Ok(())
+    }
+
+    #[test]
+    fn captures_clear_to_empty_when_base_uses_same_client_id() -> Result<()> {
+        let base = text_state_from_content(7, "hello world\n");
+        let capture =
+            capture_text_change(7, base.as_ref(), "hello world\n", "")?.expect("text changed");
+
+        assert_eq!(capture.text, "");
+
+        let applied = apply_text_update(base.as_ref(), capture.update_bytes.as_ref())?;
+        assert_eq!(applied.text, "");
+
+        Ok(())
+    }
+
+    #[test]
+    fn captures_clear_to_empty_with_writer_derived_client_id() -> Result<()> {
+        let client_id = client_id_for_writer(&[
+            0x13, 0xb3, 0x3c, 0x85, 0xed, 0x72, 0x2a, 0x17, 0x38, 0x20, 0x3a, 0x77, 0x8c, 0xfd,
+            0x5c, 0x99,
+        ]);
+        let text = "hi there\nthis is\na new file\n";
+        let base = text_state_from_content(client_id, text);
+        let capture =
+            capture_text_change(client_id, base.as_ref(), text, "")?.expect("text changed");
+
+        assert_eq!(capture.text, "");
+
+        let applied = apply_text_update(base.as_ref(), capture.update_bytes.as_ref())?;
+        assert_eq!(applied.text, "");
+
+        Ok(())
+    }
+
+    #[test]
+    fn delete_update_targets_source_doc_structs() -> Result<()> {
+        let prior = text_state_from_content(7, "hello world\n");
+        let stable = text_state_from_content(8, "hello world\n");
+        let prior_capture =
+            capture_text_change(7, prior.as_ref(), "hello world\n", "")?.expect("text changed");
+        let stable_capture =
+            capture_text_change(7, stable.as_ref(), "hello world\n", "")?.expect("text changed");
+
+        let prior_update_on_stable =
+            apply_text_update(stable.as_ref(), prior_capture.update_bytes.as_ref())?;
+        assert_eq!(prior_update_on_stable.text, "hello world\n");
+
+        let stable_update_on_stable =
+            apply_text_update(stable.as_ref(), stable_capture.update_bytes.as_ref())?;
+        assert_eq!(stable_update_on_stable.text, "");
+
+        Ok(())
+    }
+
+    #[test]
     fn capture_mints_ops_under_writer_client_id() -> Result<()> {
         let writer_id = [0xA7u8; 16];
         let client_id = client_id_for_writer(&writer_id);
@@ -544,18 +611,18 @@ mod tests {
 
     #[test]
     fn client_id_for_writer_is_stable_and_in_safe_range() {
-        // Pin the derivation: first 8 writer-id bytes, big-endian, masked to 53
-        // bits. A silent change here would re-identify every writer.
+        // Pin the derivation: first 4 writer-id bytes, big-endian, nonzero.
+        // A silent change here would re-identify every writer.
         assert_eq!(client_id_for_writer(&[0xFFu8; 16]), MAX_SAFE_CLIENT_ID);
         assert_eq!(
             client_id_for_writer(&[0x01, 0, 0, 0, 0, 0, 0, 0x02, 0xEE, 0xEE]),
-            (0x0100_0000_0000_0002u64) & MAX_SAFE_CLIENT_ID
+            0x0100_0000
         );
         assert_eq!(client_id_for_writer(&[0u8; 16]), 1);
     }
 
     #[test]
-    fn full_state_from_large_client_id_is_valid_update() -> Result<()> {
+    fn full_state_from_max_safe_client_id_is_valid_update() -> Result<()> {
         let update = text_state_from_content(MAX_SAFE_CLIENT_ID, "from a\n");
         let base = empty_text_state(1);
         let applied = apply_text_update(base.as_ref(), update.as_ref())?;

@@ -292,15 +292,30 @@ impl SemanticService {
 
     pub(crate) async fn commit_projection_action(
         &self,
+        context: ProjectionActionCommitContext,
         result: ProjectionActionResult,
     ) -> eyre::Result<ProjectionActionResult> {
-        self.exec_tx("commit_projection_action", move |tx| {
-            Box::pin(async move {
-                let _tx = tx;
-                Ok(())
+        let applied_write = match &result {
+            ProjectionActionResult::WriteFile {
+                result:
+                    GuardedWriteResult::Written { fingerprint }
+                    | GuardedWriteResult::AlreadyApplied { fingerprint },
+                ..
+            } => Some((context.path.clone(), fingerprint.clone())),
+            _ => None,
+        };
+
+        if let Some((path, fingerprint)) = applied_write {
+            self.exec_tx("commit_projection_action", move |tx| {
+                let path = path.clone();
+                let fingerprint = fingerprint.clone();
+                Box::pin(async move {
+                    tx.mark_projection_write_intent_applied(&path, &fingerprint)
+                        .await
+                })
             })
-        })
-        .await?;
+            .await?;
+        }
 
         Ok(result)
     }
@@ -1786,12 +1801,8 @@ async fn realign_prior_from_write_intent_tx(
     tx: &SemanticTransaction<'_>,
     plan: &ImportActionStagePlan,
 ) -> Result<bool, SemanticTransactionError> {
-    let FileFingerprint::StatAndContent { content, .. } = &plan.fingerprint else {
-        return Ok(false);
-    };
-
     let Some((intent_object_id, target_doc_blob)) = tx
-        .select_projection_write_intent(&plan.path, content.hash.as_bytes())
+        .select_applied_projection_write_intent(&plan.path, &plan.fingerprint)
         .await?
     else {
         return Ok(false);
@@ -1810,8 +1821,28 @@ async fn realign_prior_from_write_intent_tx(
         return Ok(false);
     };
 
+    let Some(stable_doc_blob) = tx.select_stable_text_object_doc(&intent_object_id).await? else {
+        debug!(
+            path = %plan.path,
+            intent_object_id = ?intent_object_id,
+            "projection write intent matched disk but stable text object is missing; importing as user edit"
+        );
+        return Ok(false);
+    };
+    if stable_doc_blob != target_doc_blob {
+        // The same bytes/fingerprint can be observed after a later user edit
+        // (notably clearing a file to empty). Only suppress when the applied
+        // intent still describes the current stable CRDT doc.
+        debug!(
+            path = %plan.path,
+            intent_object_id = ?intent_object_id,
+            "projection write intent is stale relative to stable text object; importing as user edit"
+        );
+        return Ok(false);
+    }
+
     let now = time::OffsetDateTime::now_utc();
-    tx.upsert_prior_text_object(&intent_object_id, target_doc_blob, now)
+    tx.upsert_prior_text_object(&intent_object_id, stable_doc_blob, now)
         .await?;
     tx.upsert_prior_tree_file(
         &plan.path,
@@ -1860,12 +1891,14 @@ async fn stage_existing_text_file(
         StageKind::Resurrect => NamespaceClaimId::generate(),
         StageKind::New => unreachable!("asserted above"),
     };
+
     let prior_doc_blob = tx
         .select_prior_text_object_doc(&object_id)
         .await?
         .unwrap_or_else(|| text_doc::empty_text_state(client_id));
     let decode_started = perf_start!();
-    let prior_text = text_doc::decode_text_state(client_id, prior_doc_blob.as_ref())?.text;
+    let prior_text_state = text_doc::decode_text_state(client_id, prior_doc_blob.as_ref())?;
+    let prior_text = prior_text_state.text;
     trace_perf!(
         decode_started,
         path = %plan.path,
@@ -1874,38 +1907,35 @@ async fn stage_existing_text_file(
         prior_text_bytes = prior_text.len(),
         "stage_existing_text_file prior text decoded"
     );
-    let capture_started = perf_start!();
-    let capture = text_doc::capture_text_change(
+
+    let prior_capture_started = perf_start!();
+    let prior_capture = text_doc::capture_text_change(
         client_id,
         prior_doc_blob.as_ref(),
         &prior_text,
         &plan.content,
     )?;
     trace_perf!(
-        capture_started,
+        prior_capture_started,
         path = %plan.path,
         object_id = ?object_id,
         old_bytes = prior_text.len(),
         new_bytes = plan.content.len(),
-        changed = capture.is_some(),
-        "stage_existing_text_file text change captured"
+        changed = prior_capture.is_some(),
+        "stage_existing_text_file prior text change captured"
     );
 
-    let staged = match capture {
-        Some(capture) => StagedTextImport {
-            stage_kind,
-            object_id,
-            claim_id,
-            prior_doc_blob: capture.full_state_bytes,
-            text_update: capture.update_bytes,
-        },
-        None => StagedTextImport {
-            stage_kind,
-            object_id,
-            claim_id,
-            prior_doc_blob,
-            text_update: Bytes::new(),
-        },
+    let (next_prior_doc_blob, text_update) = match prior_capture {
+        Some(capture) => (capture.full_state_bytes, capture.update_bytes),
+        None => (prior_doc_blob, Bytes::new()),
+    };
+
+    let staged = StagedTextImport {
+        stage_kind,
+        object_id,
+        claim_id,
+        prior_doc_blob: next_prior_doc_blob,
+        text_update,
     };
     trace_perf!(
         total_started,

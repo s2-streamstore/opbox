@@ -142,6 +142,26 @@ CREATE TABLE IF NOT EXISTS projection_write_intents (
     CHECK (length(object_id) > 0)
 );
 
+-- Post-write evidence for projection_write_intents. A planned write intent is
+-- only trusted as self-echo evidence once FsActor has reported the exact
+-- fingerprint that landed on disk.
+CREATE TABLE IF NOT EXISTS projection_applied_write_intents (
+    path            TEXT NOT NULL,
+    target_hash     BLOB NOT NULL,
+    file_key        TEXT NOT NULL,
+    size_bytes      INTEGER NOT NULL CHECK (size_bytes >= 0),
+    mtime_ns        INTEGER NOT NULL,
+
+    PRIMARY KEY (path, target_hash),
+    FOREIGN KEY (path, target_hash)
+        REFERENCES projection_write_intents(path, target_hash)
+        ON DELETE CASCADE,
+
+    CHECK (path <> ''),
+    CHECK (length(target_hash) > 0),
+    CHECK (file_key <> '')
+);
+
 -- Durable outbox: shared-log records not yet acknowledged by the log writer.
 -- payload is Yjs update bytes for namespace/text records.
 CREATE TABLE IF NOT EXISTS outbox (
