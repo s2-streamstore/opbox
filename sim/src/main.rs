@@ -154,6 +154,9 @@ enum Workload {
     SameFileEdits,
     SameFileSplitEdits,
     OrphanedProjectionWrite,
+    ClearExistingFile,
+    ClearViaSafeSave,
+    ClearBeforeQuiescence,
 }
 
 impl Workload {
@@ -171,6 +174,9 @@ impl Workload {
             Workload::SameFileEdits => "same-file-edits",
             Workload::SameFileSplitEdits => "same-file-split-edits",
             Workload::OrphanedProjectionWrite => "orphaned-projection-write",
+            Workload::ClearExistingFile => "clear-existing-file",
+            Workload::ClearViaSafeSave => "clear-via-safe-save",
+            Workload::ClearBeforeQuiescence => "clear-before-quiescence",
         }
     }
 }
@@ -238,6 +244,15 @@ fn run_single(args: SingleArgs) -> eyre::Result<()> {
         )?,
         Workload::OrphanedProjectionWrite => {
             run_orphaned_projection_write_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::ClearExistingFile => {
+            run_clear_existing_file_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::ClearViaSafeSave => {
+            run_clear_via_safe_save_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::ClearBeforeQuiescence => {
+            run_clear_before_quiescence_workload(&mut sim, seed, args.common.max_steps)?
         }
     }
 
@@ -958,6 +973,96 @@ fn run_scoped_scan_workload(
     Ok(())
 }
 
+fn run_clear_existing_file_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("0000000000000000000000000000000d".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "hello.txt";
+        let initial = "whats good\nneat\nhi there\nyo\nyo\n";
+
+        daemon_b
+            .write_file(path, Bytes::from(initial.to_string()))
+            .await?;
+        wait_for_text_files(
+            &daemon_a,
+            &daemon_b,
+            &BTreeMap::from([(path.to_string(), initial.to_string())]),
+            steps,
+        )
+        .await?;
+
+        daemon_b
+            .replace_file_contents(path, Bytes::from_static(b""))
+            .await?;
+
+        wait_for_text_files(
+            &daemon_a,
+            &daemon_b,
+            &BTreeMap::from([(path.to_string(), String::new())]),
+            steps,
+        )
+        .await?;
+
+        println!("SIM_OK workload=clear-existing-file seed={seed}");
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
+fn run_clear_before_quiescence_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("0000000000000000000000000000000f".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "hello.txt";
+        let initial = "whats good\nneat\nhi there\nyo\nyo\n";
+
+        daemon_b
+            .write_file(path, Bytes::from(initial.to_string()))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(deterministic_delay_ms(
+            seed,
+            0xC1EA_0000_0000_0001,
+            0,
+        )))
+        .await;
+        daemon_b
+            .replace_file_contents(path, Bytes::from_static(b""))
+            .await?;
+
+        wait_for_text_files(
+            &daemon_a,
+            &daemon_b,
+            &BTreeMap::from([(path.to_string(), String::new())]),
+            steps,
+        )
+        .await?;
+
+        println!("SIM_OK workload=clear-before-quiescence seed={seed}");
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
 fn run_projection_storm_workload(
     sim: &mut turmoil::Sim<'static>,
     seed: u64,
@@ -1511,6 +1616,95 @@ fn run_safe_save_after_quiescence_workload(
         daemon_b.shutdown().await;
         Err(io_err(format!(
             "safe-save-after-quiescence did not converge with preserved object identity; expected={expected:?} original_object_id={} a={last_a:?} b={last_b:?} debug_a={last_debug_a:?} debug_b={last_debug_b:?}",
+            original_object_id.encode_b64()
+        )))
+    });
+
+    Ok(())
+}
+
+fn run_clear_via_safe_save_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("0000000000000000000000000000000e".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "hello.txt";
+        let temp_path = ".hello.txt.tmp";
+        let initial = "whats good\nneat\nhi there\nyo\nyo\n";
+
+        daemon_b
+            .write_file(path, Bytes::from(initial.to_string()))
+            .await?;
+        wait_for_text_files(
+            &daemon_a,
+            &daemon_b,
+            &BTreeMap::from([(path.to_string(), initial.to_string())]),
+            steps,
+        )
+        .await?;
+        let original_object_id =
+            wait_for_matching_prior_object_id(&daemon_a, &daemon_b, path, steps).await?;
+
+        let pause_after_temp_ms = deterministic_safe_save_pause_ms(seed, 0);
+        let pause_after_delete_ms = deterministic_safe_save_pause_ms(seed, 1);
+        let pause_after_rewrite_ms = deterministic_safe_save_pause_ms(seed, 2);
+
+        daemon_b
+            .write_file(temp_path, Bytes::from_static(b""))
+            .await?;
+        daemon_b.request_single_file_scan(temp_path).await?;
+        tokio::time::sleep(Duration::from_millis(pause_after_temp_ms)).await;
+
+        daemon_b.delete_file(path).await?;
+        daemon_b.request_single_file_scan(path).await?;
+        tokio::time::sleep(Duration::from_millis(pause_after_delete_ms)).await;
+
+        daemon_b.write_file(path, Bytes::from_static(b"")).await?;
+        daemon_b.request_single_file_scan(path).await?;
+        tokio::time::sleep(Duration::from_millis(pause_after_rewrite_ms)).await;
+
+        daemon_b.delete_file(temp_path).await?;
+        daemon_b.request_single_file_scan(temp_path).await?;
+
+        let expected = BTreeMap::from([(path.to_string(), String::new())]);
+        let mut last_a = BTreeMap::new();
+        let mut last_b = BTreeMap::new();
+        let mut last_debug_a = None;
+        let mut last_debug_b = None;
+        for _ in 0..steps {
+            last_a = daemon_a.snapshot_text_files().await?;
+            last_b = daemon_b.snapshot_text_files().await?;
+            let debug_a = daemon_a.semantic_debug_snapshot().await?;
+            let debug_b = daemon_b.semantic_debug_snapshot().await?;
+            let object_identity_preserved =
+                debug_a.prior_live_paths.get(path) == Some(&original_object_id)
+                    && debug_b.prior_live_paths.get(path) == Some(&original_object_id);
+
+            if last_a == expected && last_b == expected && object_identity_preserved {
+                println!(
+                    "SIM_OK workload=clear-via-safe-save seed={seed} object_id={} pause_after_temp_ms={pause_after_temp_ms} pause_after_delete_ms={pause_after_delete_ms} pause_after_rewrite_ms={pause_after_rewrite_ms}",
+                    original_object_id.encode_b64()
+                );
+                daemon_a.shutdown().await;
+                daemon_b.shutdown().await;
+                return Ok(());
+            }
+            last_debug_a = Some(debug_a);
+            last_debug_b = Some(debug_b);
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Err(io_err(format!(
+            "clear-via-safe-save did not converge with preserved object identity; expected={expected:?} original_object_id={} a={last_a:?} b={last_b:?} debug_a={last_debug_a:?} debug_b={last_debug_b:?}",
             original_object_id.encode_b64()
         )))
     });
@@ -2108,6 +2302,9 @@ async fn run_daemon_client(
                     SimDaemonCommand::AppendFile { path, bytes, reply } => {
                         let _ = reply.send(file_io.append_file(path, bytes).map_err(|err| err.to_string()));
                     }
+                    SimDaemonCommand::ReplaceFileContents { path, bytes, reply } => {
+                        let _ = reply.send(file_io.replace_file_contents(path, bytes).map_err(|err| err.to_string()));
+                    }
                     SimDaemonCommand::PrependFile { path, bytes, reply } => {
                         let _ = reply.send(file_io.prepend_file(path, bytes).map_err(|err| err.to_string()));
                     }
@@ -2177,6 +2374,23 @@ impl SimDaemonHandle {
         let (reply, recv) = oneshot::channel();
         self.command_tx
             .send(SimDaemonCommand::AppendFile {
+                path: path.into(),
+                bytes,
+                reply,
+            })
+            .await
+            .map_err(io_err)?;
+        recv.await.map_err(io_err)?.map_err(io_err)
+    }
+
+    async fn replace_file_contents(
+        &self,
+        path: impl Into<String>,
+        bytes: Bytes,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (reply, recv) = oneshot::channel();
+        self.command_tx
+            .send(SimDaemonCommand::ReplaceFileContents {
                 path: path.into(),
                 bytes,
                 reply,
@@ -2305,6 +2519,11 @@ enum SimDaemonCommand {
         reply: oneshot::Sender<Result<(), String>>,
     },
     AppendFile {
+        path: String,
+        bytes: Bytes,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    ReplaceFileContents {
         path: String,
         bytes: Bytes,
         reply: oneshot::Sender<Result<(), String>>,

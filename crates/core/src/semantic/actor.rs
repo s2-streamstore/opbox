@@ -154,7 +154,7 @@ impl SemanticActor {
                 }
             }
             SemanticRequest::CommitProjectionAction { result } => {
-                self.runtime_state.validate_projection_action(&result);
+                let context = self.runtime_state.validate_projection_action(&result);
                 let op_id = self.next_op_id();
                 self.pending_ops.insert(
                     op_id,
@@ -164,7 +164,7 @@ impl SemanticActor {
                 self.running_ops.push(Box::pin(async move {
                     SemanticTaskResult::CommitProjectionAction {
                         op_id,
-                        result: service.commit_projection_action(result).await,
+                        result: service.commit_projection_action(context, result).await,
                     }
                 }));
             }
@@ -702,7 +702,10 @@ impl SemanticRuntimeState {
         }
     }
 
-    fn validate_projection_action(&self, result: &ProjectionActionResult) {
+    fn validate_projection_action(
+        &self,
+        result: &ProjectionActionResult,
+    ) -> ProjectionActionCommitContext {
         let action_id = result.action_id();
         let active = self
             .active_projection
@@ -721,6 +724,11 @@ impl SemanticRuntimeState {
             !active.completed.contains_key(&action_id),
             "duplicate projection action requested: {action_id:?}"
         );
+        active
+            .expected
+            .get(&action_id)
+            .expect("projection action missing after validation")
+            .clone()
     }
 
     fn finish_projection_action(&mut self, result: ProjectionActionResult) {

@@ -1,5 +1,5 @@
 use crate::crdt::types::{ObjectId, ObjectKind, SharedMessageKind};
-use crate::fs::types::{FileKey, RelativePath};
+use crate::fs::types::{FileFingerprint, FileKey, RelativePath};
 use crate::log::types::SequenceNumber;
 use crate::semantic::service::TursoConnectionManager;
 use crate::semantic::table::{
@@ -808,18 +808,82 @@ impl<'a> SemanticTransaction<'a> {
         Ok(())
     }
 
-    pub async fn select_projection_write_intent(
+    pub async fn mark_projection_write_intent_applied(
         &self,
         path: &RelativePath,
-        target_hash: &Bytes,
+        fingerprint: &FileFingerprint,
+    ) -> Result<(), SemanticTransactionError> {
+        let FileFingerprintParts {
+            file_key,
+            size_bytes,
+            mtime_ns,
+            hash,
+        } = staged_file_fingerprint_parts(fingerprint)?;
+        let size_bytes = i64::try_from(size_bytes).map_err(|err| {
+            SemanticTransactionError::InvariantViolation(format!(
+                "projection_applied_write_intents.size_bytes out of range: {err}"
+            ))
+        })?;
+
+        // A planned write intent only becomes self-echo evidence after FsActor
+        // reports the exact fingerprint that landed on disk. If the planned
+        // intent was already removed, this intentionally records nothing.
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO projection_applied_write_intents (
+                    path, target_hash, file_key, size_bytes, mtime_ns
+                )
+                 SELECT path, target_hash, ?3, ?4, ?5
+                 FROM projection_write_intents
+                 WHERE path = ?1 AND target_hash = ?2",
+                (
+                    path.to_db_path(),
+                    hash.as_ref(),
+                    file_key,
+                    size_bytes,
+                    mtime_ns,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn select_applied_projection_write_intent(
+        &self,
+        path: &RelativePath,
+        fingerprint: &FileFingerprint,
     ) -> Result<Option<(ObjectId, Bytes)>, SemanticTransactionError> {
+        let FileFingerprintParts {
+            file_key,
+            size_bytes,
+            mtime_ns,
+            hash,
+        } = staged_file_fingerprint_parts(fingerprint)?;
+        let size_bytes = i64::try_from(size_bytes).map_err(|err| {
+            SemanticTransactionError::InvariantViolation(format!(
+                "projection_applied_write_intents.size_bytes out of range: {err}"
+            ))
+        })?;
+
         let mut rows = self
             .conn
             .query(
-                "SELECT object_id, target_doc_blob
-                 FROM projection_write_intents
-                 WHERE path = ?1 AND target_hash = ?2",
-                (path.to_db_path(), target_hash.as_ref()),
+                "SELECT p.object_id, p.target_doc_blob
+                 FROM projection_write_intents p
+                 JOIN projection_applied_write_intents a
+                   ON a.path = p.path AND a.target_hash = p.target_hash
+                 WHERE p.path = ?1
+                   AND p.target_hash = ?2
+                   AND a.file_key = ?3
+                   AND a.size_bytes = ?4
+                   AND a.mtime_ns = ?5",
+                (
+                    path.to_db_path(),
+                    hash.as_ref(),
+                    file_key,
+                    size_bytes,
+                    mtime_ns,
+                ),
             )
             .await?;
         let Some(row) = rows.next().await? else {
@@ -834,6 +898,12 @@ impl<'a> SemanticTransaction<'a> {
         &self,
         path: &RelativePath,
     ) -> Result<(), SemanticTransactionError> {
+        self.conn
+            .execute(
+                "DELETE FROM projection_applied_write_intents WHERE path = ?1",
+                (path.to_db_path(),),
+            )
+            .await?;
         self.conn
             .execute(
                 "DELETE FROM projection_write_intents WHERE path = ?1",

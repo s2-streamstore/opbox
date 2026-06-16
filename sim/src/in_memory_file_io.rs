@@ -94,6 +94,37 @@ impl InMemoryFileIO {
         Ok(())
     }
 
+    pub fn replace_file_contents(
+        &self,
+        path: impl AsRef<str>,
+        bytes: impl Into<Bytes>,
+    ) -> eyre::Result<()> {
+        let path = RelativePath::parse(path.as_ref())?;
+        let mut state = self.state.lock().expect("in-memory file io poisoned");
+        state.logical_time_ns += 1;
+        let mtime = OffsetDateTime::from_unix_timestamp_nanos(state.logical_time_ns)
+            .expect("logical sim timestamp is valid");
+        match state.files.get_mut(&path) {
+            Some(entry) => {
+                entry.bytes = bytes.into();
+                entry.mtime = mtime;
+            }
+            None => {
+                let inode = state.next_inode;
+                state.next_inode += 1;
+                state.files.insert(
+                    path,
+                    Entry {
+                        bytes: bytes.into(),
+                        inode,
+                        mtime,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn prepend_file(&self, path: impl AsRef<str>, bytes: impl AsRef<[u8]>) -> eyre::Result<()> {
         let path = RelativePath::parse(path.as_ref())?;
         let mut state = self.state.lock().expect("in-memory file io poisoned");
