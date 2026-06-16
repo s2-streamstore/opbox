@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use compact_str::CompactString;
 use opbox_core::fs::fio::FileIO;
+use opbox_core::fs::ignore::is_hard_ignored;
 use opbox_core::fs::types::{
     DeleteIfExistsResult, ExpectedBefore, FileContentFingerprint, FileFingerprint, FileHash,
     FileKey, FileStatFingerprint, GuardedDeleteResult, GuardedReadResult, GuardedWriteResult,
@@ -346,7 +347,7 @@ impl FileIO for InMemoryFileIO {
         let entries = state
             .files
             .iter()
-            .filter(|(path, _)| scope.contains_path(path))
+            .filter(|(path, _)| scope.contains_path(path) && !is_hard_ignored(path))
             .map(|(path, entry)| Self::stat_entry(path.clone(), entry))
             .collect();
         let finished_at = OffsetDateTime::from_unix_timestamp_nanos(state.logical_time_ns)

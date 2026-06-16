@@ -246,9 +246,19 @@ impl FileIO for LocalFileIO {
                 .as_ref()
                 .map(|path| self.absolute_path(path))
                 .unwrap_or_else(|| self.absolute_path_root.clone());
-            let mut read_dir = tokio::fs::read_dir(absolute_dir).await?;
+            let mut read_dir = match tokio::fs::read_dir(absolute_dir).await {
+                Ok(read_dir) => read_dir,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
 
-            while let Some(entry) = read_dir.next_entry().await? {
+            loop {
+                let entry = match read_dir.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(error) if error.kind() == ErrorKind::NotFound => break,
+                    Err(error) => return Err(error.into()),
+                };
                 let SelfPath(path) = Self::child_path(dir.as_ref(), &entry.file_name())?;
                 if ignore_rules.is_ignored(&path) {
                     continue;

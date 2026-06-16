@@ -1,6 +1,7 @@
 #[cfg(not(tokio_unstable))]
 compile_error!("opbox-sim requires --cfg tokio_unstable so turmoil can seed Tokio's runtime RNG");
 
+mod fault_injecting_file_io;
 mod in_memory_file_io;
 mod s2_connector;
 mod s2_server;
@@ -8,6 +9,7 @@ mod s2_server;
 use bytes::Bytes;
 use clap::{Parser, Subcommand, ValueEnum};
 use eyre::eyre;
+use fault_injecting_file_io::FaultInjectingFileIO;
 use in_memory_file_io::{InMemoryFileIO, InMemoryFileIOStats};
 use opbox_core::app::db::{initialize_database, open_memory_database, semantic_pool};
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
@@ -154,6 +156,10 @@ enum Workload {
     SameFileEdits,
     SameFileSplitEdits,
     OrphanedProjectionWrite,
+    FaultReadChangedBetweenStats,
+    FaultProjectionConflictBeforeSwap,
+    FaultProjectionConflictAfterSwap,
+    FaultProjectionTempLeak,
     ClearExistingFile,
     ClearViaSafeSave,
     ClearBeforeQuiescence,
@@ -174,6 +180,10 @@ impl Workload {
             Workload::SameFileEdits => "same-file-edits",
             Workload::SameFileSplitEdits => "same-file-split-edits",
             Workload::OrphanedProjectionWrite => "orphaned-projection-write",
+            Workload::FaultReadChangedBetweenStats => "fault-read-changed-between-stats",
+            Workload::FaultProjectionConflictBeforeSwap => "fault-projection-conflict-before-swap",
+            Workload::FaultProjectionConflictAfterSwap => "fault-projection-conflict-after-swap",
+            Workload::FaultProjectionTempLeak => "fault-projection-temp-leak",
             Workload::ClearExistingFile => "clear-existing-file",
             Workload::ClearViaSafeSave => "clear-via-safe-save",
             Workload::ClearBeforeQuiescence => "clear-before-quiescence",
@@ -244,6 +254,26 @@ fn run_single(args: SingleArgs) -> eyre::Result<()> {
         )?,
         Workload::OrphanedProjectionWrite => {
             run_orphaned_projection_write_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::FaultReadChangedBetweenStats => {
+            run_fault_read_changed_between_stats_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::FaultProjectionConflictBeforeSwap => {
+            run_fault_projection_conflict_before_swap_workload(
+                &mut sim,
+                seed,
+                args.common.max_steps,
+            )?
+        }
+        Workload::FaultProjectionConflictAfterSwap => {
+            run_fault_projection_conflict_after_swap_workload(
+                &mut sim,
+                seed,
+                args.common.max_steps,
+            )?
+        }
+        Workload::FaultProjectionTempLeak => {
+            run_fault_projection_temp_leak_workload(&mut sim, seed, args.common.max_steps)?
         }
         Workload::ClearExistingFile => {
             run_clear_existing_file_workload(&mut sim, seed, args.common.max_steps)?
@@ -1204,14 +1234,29 @@ fn same_path_create_conflict_path(
         return None;
     };
 
-    if conflict_path.starts_with("collide (conflict ")
-        && conflict_path.ends_with(").txt")
+    if conflict_path_matches_requested(conflict_path, requested_path)
         && conflict_content == loser_content
     {
         Some(conflict_path.clone())
     } else {
         None
     }
+}
+
+fn conflict_path_matches_requested(candidate: &str, requested_path: &str) -> bool {
+    let (dir, file_name) = match requested_path.rsplit_once('/') {
+        Some((dir, file_name)) => (Some(dir), file_name),
+        None => (None, requested_path),
+    };
+    let (stem, ext) = match file_name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
+        _ => (file_name, String::new()),
+    };
+    let prefix = match dir {
+        Some(dir) => format!("{dir}/{stem} (conflict "),
+        None => format!("{stem} (conflict "),
+    };
+    candidate.starts_with(&prefix) && candidate.ends_with(&format!("){ext}"))
 }
 
 fn run_conflict_plus_later_edit_workload(
@@ -2145,6 +2190,258 @@ fn run_orphaned_projection_write_workload(
     Ok(())
 }
 
+fn run_fault_read_changed_between_stats_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000010".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "racy-read.txt";
+        let replacement = format!("replacement after read race seed {seed}\n");
+        daemon_a
+            .inject_guarded_read_changed_between_stats(path, Bytes::from(replacement.clone()))
+            .await?;
+        daemon_a
+            .write_file(path, Bytes::from_static(b"initial scan evidence\n"))
+            .await?;
+        daemon_a.request_single_file_scan(path).await?;
+
+        let expected = BTreeMap::from([(path.to_string(), replacement)]);
+        let mut last_a = BTreeMap::new();
+        let mut last_b = BTreeMap::new();
+        let mut last_stats = InMemoryFileIOStats::default();
+        for _ in 0..steps {
+            last_a = daemon_a.snapshot_text_files().await?;
+            last_b = daemon_b.snapshot_text_files().await?;
+            last_stats = combined_stats(&daemon_a, &daemon_b).await?;
+            if last_a == expected
+                && last_b == expected
+                && last_stats.guarded_read_changed_between_stats_count > 0
+            {
+                println!(
+                    "SIM_OK workload=fault-read-changed-between-stats seed={seed} changed_between_stats={}",
+                    last_stats.guarded_read_changed_between_stats_count
+                );
+                daemon_a.shutdown().await;
+                daemon_b.shutdown().await;
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Err(io_err(format!(
+            "fault-read-changed-between-stats did not converge; expected={expected:?} a={last_a:?} b={last_b:?} stats={last_stats:?}"
+        )))
+    });
+
+    Ok(())
+}
+
+fn run_fault_projection_conflict_before_swap_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000011".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "fault-before.txt";
+        let local_content = format!("local before swap seed {seed}\n");
+        let remote_content = format!("remote projection seed {seed}\n");
+        daemon_a
+            .inject_guarded_write_conflict_before_swap(path, Bytes::from(local_content.clone()))
+            .await?;
+        daemon_b
+            .write_file(path, Bytes::from(remote_content.clone()))
+            .await?;
+        daemon_b.request_single_file_scan(path).await?;
+
+        let mut last_a = BTreeMap::new();
+        let mut last_b = BTreeMap::new();
+        let mut last_stats = InMemoryFileIOStats::default();
+        for _ in 0..steps {
+            last_a = daemon_a.snapshot_text_files().await?;
+            last_b = daemon_b.snapshot_text_files().await?;
+            last_stats = combined_stats(&daemon_a, &daemon_b).await?;
+
+            if last_a == last_b
+                && same_path_create_conflict_path(
+                    &last_a,
+                    path,
+                    &local_content,
+                    &remote_content,
+                )
+                .is_some()
+                && last_stats.guarded_write_conflict_before_swap_count > 0
+            {
+                println!(
+                    "SIM_OK workload=fault-projection-conflict-before-swap seed={seed} write_conflict_before_swap={}",
+                    last_stats.guarded_write_conflict_before_swap_count
+                );
+                daemon_a.shutdown().await;
+                daemon_b.shutdown().await;
+                return Ok(());
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Err(io_err(format!(
+            "fault-projection-conflict-before-swap did not converge; a={last_a:?} b={last_b:?} stats={last_stats:?}"
+        )))
+    });
+
+    Ok(())
+}
+
+fn run_fault_projection_conflict_after_swap_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000012".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "fault-after.txt";
+        let local_content = format!("local after swap seed {seed}\n");
+        let remote_content = format!("remote projection seed {seed}\n");
+        daemon_a
+            .inject_guarded_write_conflict_after_swap(path, Bytes::from(local_content.clone()))
+            .await?;
+        daemon_b
+            .write_file(path, Bytes::from(remote_content.clone()))
+            .await?;
+        daemon_b.request_single_file_scan(path).await?;
+
+        let mut last_a = BTreeMap::new();
+        let mut last_b = BTreeMap::new();
+        let mut last_stats = InMemoryFileIOStats::default();
+        for _ in 0..steps {
+            last_a = daemon_a.snapshot_text_files().await?;
+            last_b = daemon_b.snapshot_text_files().await?;
+            last_stats = combined_stats(&daemon_a, &daemon_b).await?;
+
+            if last_a == last_b
+                && same_path_create_conflict_path(
+                    &last_a,
+                    path,
+                    &local_content,
+                    &remote_content,
+                )
+                .is_some()
+                && last_stats.guarded_write_conflict_after_swap_count > 0
+            {
+                println!(
+                    "SIM_OK workload=fault-projection-conflict-after-swap seed={seed} write_conflict_after_swap={}",
+                    last_stats.guarded_write_conflict_after_swap_count
+                );
+                daemon_a.shutdown().await;
+                daemon_b.shutdown().await;
+                return Ok(());
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Err(io_err(format!(
+            "fault-projection-conflict-after-swap did not converge; a={last_a:?} b={last_b:?} stats={last_stats:?}"
+        )))
+    });
+
+    Ok(())
+}
+
+fn run_fault_projection_temp_leak_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000013".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "leaky.txt";
+        let temp_path = ".leaky.txt.opbox-tmp-deadbeef";
+        let remote_content = format!("remote after temp leak seed {seed}\n");
+        let temp_content = format!("orphaned temp seed {seed}\n");
+        daemon_a
+            .inject_guarded_write_temp_leak_and_fail(
+                path,
+                temp_path,
+                Bytes::from(temp_content.clone()),
+            )
+            .await?;
+        daemon_b
+            .write_file(path, Bytes::from(remote_content.clone()))
+            .await?;
+        daemon_b.request_single_file_scan(path).await?;
+
+        let expected_b = BTreeMap::from([(path.to_string(), remote_content.clone())]);
+        let mut last_a = BTreeMap::new();
+        let mut last_b = BTreeMap::new();
+        let mut last_debug_a = None;
+        let mut last_debug_b = None;
+        let mut last_stats = InMemoryFileIOStats::default();
+        for _ in 0..steps {
+            last_a = daemon_a.snapshot_text_files().await?;
+            last_b = daemon_b.snapshot_text_files().await?;
+            let debug_a = daemon_a.semantic_debug_snapshot().await?;
+            let debug_b = daemon_b.semantic_debug_snapshot().await?;
+            last_stats = combined_stats(&daemon_a, &daemon_b).await?;
+
+            let temp_is_local_only = last_a.get(temp_path).map(String::as_str)
+                == Some(temp_content.as_str())
+                && !last_b.contains_key(temp_path)
+                && !debug_a.stable_paths.contains_key(temp_path)
+                && !debug_b.stable_paths.contains_key(temp_path);
+            if last_a.get(path).map(String::as_str) == Some(remote_content.as_str())
+                && last_b == expected_b
+                && temp_is_local_only
+                && last_stats.guarded_write_conflict_count > 0
+            {
+                println!(
+                    "SIM_OK workload=fault-projection-temp-leak seed={seed} temp_path={temp_path:?} write_failures={}",
+                    last_stats.guarded_write_conflict_count
+                );
+                daemon_a.shutdown().await;
+                daemon_b.shutdown().await;
+                return Ok(());
+            }
+            last_debug_a = Some(debug_a);
+            last_debug_b = Some(debug_b);
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Err(io_err(format!(
+            "fault-projection-temp-leak did not converge; a={last_a:?} b={last_b:?} debug_a={last_debug_a:?} debug_b={last_debug_b:?} stats={last_stats:?}"
+        )))
+    });
+
+    Ok(())
+}
+
 async fn same_file_writer(
     daemon: SimDaemonHandle,
     path: &'static str,
@@ -2234,7 +2531,7 @@ fn spawn_daemon_with_initial_files(
         next_outbox_id: OutboxId::new(0),
     };
 
-    let file_io = InMemoryFileIO::new();
+    let file_io = FaultInjectingFileIO::new(InMemoryFileIO::new());
     for (path, bytes) in initial_files {
         file_io.write_file(path, bytes)?;
     }
@@ -2253,7 +2550,7 @@ fn spawn_daemon_with_initial_files(
 async fn run_daemon_client(
     name: &'static str,
     daemon_row: daemon_state::Row,
-    file_io: InMemoryFileIO,
+    file_io: FaultInjectingFileIO,
     mut command_rx: mpsc::Receiver<SimDaemonCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_basin_exists().await?;
@@ -2331,6 +2628,36 @@ async fn run_daemon_client(
                         let result = notify_handle.send_scope(scope).map_err(|err| err.to_string());
                         let _ = reply.send(result);
                     }
+                    SimDaemonCommand::InjectGuardedReadChangedBetweenStats { path, replacement, reply } => {
+                        let result = file_io
+                            .inject_guarded_read_changed_between_stats(path, replacement)
+                            .map_err(|err| err.to_string());
+                        let _ = reply.send(result);
+                    }
+                    SimDaemonCommand::InjectGuardedWriteConflictBeforeSwap { path, replacement, reply } => {
+                        let result = file_io
+                            .inject_guarded_write_conflict_before_swap(path, replacement)
+                            .map_err(|err| err.to_string());
+                        let _ = reply.send(result);
+                    }
+                    SimDaemonCommand::InjectGuardedWriteConflictAfterSwap { path, replacement, reply } => {
+                        let result = file_io
+                            .inject_guarded_write_conflict_after_swap(path, replacement)
+                            .map_err(|err| err.to_string());
+                        let _ = reply.send(result);
+                    }
+                    SimDaemonCommand::InjectGuardedWriteTempLeakAndFail { path, temp_path, bytes, reply } => {
+                        let result = file_io
+                            .inject_guarded_write_temp_leak_and_fail(path, temp_path, bytes)
+                            .map_err(|err| err.to_string());
+                        let _ = reply.send(result);
+                    }
+                    SimDaemonCommand::InjectDeleteIfExistsFailure { path, reply } => {
+                        let result = file_io
+                            .inject_delete_if_exists_failure(path)
+                            .map_err(|err| err.to_string());
+                        let _ = reply.send(result);
+                    }
                     SimDaemonCommand::Shutdown { reply } => {
                         let result = actors.shutdown(cancellation_token).await;
                         let _ = reply.send(result.map(|err| err.to_string()));
@@ -2345,7 +2672,7 @@ async fn run_daemon_client(
 #[derive(Clone)]
 struct SimDaemonHandle {
     command_tx: mpsc::Sender<SimDaemonCommand>,
-    _io: InMemoryFileIO,
+    _io: FaultInjectingFileIO,
 }
 
 impl SimDaemonHandle {
@@ -2502,6 +2829,92 @@ impl SimDaemonHandle {
         recv.await.map_err(io_err)?.map_err(io_err)
     }
 
+    async fn inject_guarded_read_changed_between_stats(
+        &self,
+        path: impl Into<String>,
+        replacement: Bytes,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (reply, recv) = oneshot::channel();
+        self.command_tx
+            .send(SimDaemonCommand::InjectGuardedReadChangedBetweenStats {
+                path: path.into(),
+                replacement,
+                reply,
+            })
+            .await
+            .map_err(io_err)?;
+        recv.await.map_err(io_err)?.map_err(io_err)
+    }
+
+    async fn inject_guarded_write_conflict_before_swap(
+        &self,
+        path: impl Into<String>,
+        replacement: Bytes,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (reply, recv) = oneshot::channel();
+        self.command_tx
+            .send(SimDaemonCommand::InjectGuardedWriteConflictBeforeSwap {
+                path: path.into(),
+                replacement,
+                reply,
+            })
+            .await
+            .map_err(io_err)?;
+        recv.await.map_err(io_err)?.map_err(io_err)
+    }
+
+    async fn inject_guarded_write_conflict_after_swap(
+        &self,
+        path: impl Into<String>,
+        replacement: Bytes,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (reply, recv) = oneshot::channel();
+        self.command_tx
+            .send(SimDaemonCommand::InjectGuardedWriteConflictAfterSwap {
+                path: path.into(),
+                replacement,
+                reply,
+            })
+            .await
+            .map_err(io_err)?;
+        recv.await.map_err(io_err)?.map_err(io_err)
+    }
+
+    async fn inject_guarded_write_temp_leak_and_fail(
+        &self,
+        path: impl Into<String>,
+        temp_path: impl Into<String>,
+        bytes: Bytes,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (reply, recv) = oneshot::channel();
+        self.command_tx
+            .send(SimDaemonCommand::InjectGuardedWriteTempLeakAndFail {
+                path: path.into(),
+                temp_path: temp_path.into(),
+                bytes,
+                reply,
+            })
+            .await
+            .map_err(io_err)?;
+        recv.await.map_err(io_err)?.map_err(io_err)
+    }
+
+    #[allow(dead_code)]
+    async fn inject_delete_if_exists_failure(
+        &self,
+        path: impl Into<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (reply, recv) = oneshot::channel();
+        self.command_tx
+            .send(SimDaemonCommand::InjectDeleteIfExistsFailure {
+                path: path.into(),
+                reply,
+            })
+            .await
+            .map_err(io_err)?;
+        recv.await.map_err(io_err)?.map_err(io_err)
+    }
+
     async fn shutdown(&self) {
         let (reply, recv) = oneshot::channel();
         let _ = self
@@ -2553,6 +2966,31 @@ enum SimDaemonCommand {
     },
     RequestScan {
         scope: ScanScope,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    InjectGuardedReadChangedBetweenStats {
+        path: String,
+        replacement: Bytes,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    InjectGuardedWriteConflictBeforeSwap {
+        path: String,
+        replacement: Bytes,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    InjectGuardedWriteConflictAfterSwap {
+        path: String,
+        replacement: Bytes,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    InjectGuardedWriteTempLeakAndFail {
+        path: String,
+        temp_path: String,
+        bytes: Bytes,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    InjectDeleteIfExistsFailure {
+        path: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Shutdown {
