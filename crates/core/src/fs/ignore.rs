@@ -66,11 +66,7 @@ impl IgnoreRules {
     }
 
     pub fn is_ignored(&self, path: &RelativePath) -> bool {
-        if path
-            .as_components()
-            .iter()
-            .any(|component| component.as_str() == METADATA_DIR_NAME)
-        {
+        if is_hard_ignored(path) {
             return true;
         }
 
@@ -82,6 +78,17 @@ impl IgnoreRules {
 
 pub fn default_ignore_file_contents() -> &'static str {
     DEFAULT_IGNORE_FILE
+}
+
+pub fn is_hard_ignored(path: &RelativePath) -> bool {
+    path.as_components().iter().any(|component| {
+        let component = component.as_str();
+        component == METADATA_DIR_NAME || is_projection_temp_component(component)
+    })
+}
+
+fn is_projection_temp_component(component: &str) -> bool {
+    component.starts_with('.') && component.contains(".opbox-tmp-")
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +182,8 @@ mod tests {
             "notes/draft.org~",
             ".idea/workspace.xml",
             "photos/Thumbs.db",
+            ".note.txt.opbox-tmp-0123456789abcdef",
+            "nested/.note.txt.opbox-tmp-0123456789abcdef",
         ] {
             assert!(
                 rules.is_ignored(&path(ignored)),
