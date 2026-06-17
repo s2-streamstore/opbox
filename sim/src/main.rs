@@ -143,44 +143,26 @@ struct SweepArgs {
 }
 
 #[derive(Debug, Clone, Copy, strum::IntoStaticStr, ValueEnum)]
+#[strum(serialize_all = "kebab-case")]
 enum Workload {
-    #[strum(serialize = "general")]
     General,
-    #[strum(serialize = "projection-storm")]
     ProjectionStorm,
-    #[strum(serialize = "same-path-create-conflict")]
     SamePathCreateConflict,
-    #[strum(serialize = "many-file-conflict-storm")]
     ManyFileConflictStorm,
-    #[strum(serialize = "delete-vs-edit")]
     DeleteVsEdit,
-    #[strum(serialize = "conflict-plus-later-edit")]
     ConflictPlusLaterEdit,
-    #[strum(serialize = "safe-save-after-quiescence")]
     SafeSaveAfterQuiescence,
-    #[strum(serialize = "rename-after-quiescence")]
     RenameAfterQuiescence,
-    #[strum(serialize = "scoped-scan")]
     ScopedScan,
-    #[strum(serialize = "same-file-edits")]
     SameFileEdits,
-    #[strum(serialize = "same-file-split-edits")]
     SameFileSplitEdits,
-    #[strum(serialize = "orphaned-projection-write")]
     OrphanedProjectionWrite,
-    #[strum(serialize = "fault-read-changed-between-stats")]
     FaultReadChangedBetweenStats,
-    #[strum(serialize = "fault-projection-conflict-before-swap")]
     FaultProjectionConflictBeforeSwap,
-    #[strum(serialize = "fault-projection-conflict-after-swap")]
     FaultProjectionConflictAfterSwap,
-    #[strum(serialize = "fault-projection-temp-leak")]
     FaultProjectionTempLeak,
-    #[strum(serialize = "clear-existing-file")]
     ClearExistingFile,
-    #[strum(serialize = "clear-via-safe-save")]
     ClearViaSafeSave,
-    #[strum(serialize = "clear-before-quiescence")]
     ClearBeforeQuiescence,
 }
 
