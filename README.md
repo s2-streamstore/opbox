@@ -1,10 +1,20 @@
 # opbox
 
-*"Drop the 'dr-'. Just 'opbox'. It's cleaner."*
+> Drop the "dr-". Just "opbox". It's cleaner...
 
-## installation
+## about
 
-### from source
+> **⚠️ Warning:** Use this software with caution. Always keep additional backups of your data.
+> 
+Real-time, multiplayer sync for plain text files on disk using CRDTs.
+
+## running it
+
+The only external service this relies on is [s2.dev](https://s2.dev). You can sign up for an account and use the cloud version, or run [s2-lite](https://github.com/s2-streamstore/s2#s2-lite) yourself.
+
+### installation
+
+#### from source
 
 ```bash
 cargo install --path crates/client
@@ -13,9 +23,9 @@ cargo install --path crates/daemon
 
 Then you interact with the `ob` command.
 
-## use
+### use
 
-### create a new workspace
+#### create a new workspace
 
 ```bash
 export S2_ACCESS_TOKEN="my-access-token"
@@ -28,7 +38,7 @@ ob init
 ```
 This will print your `workspace_id`.
 
-### clone an existing workspace
+#### clone an existing workspace
 
 ```bash
 export S2_ACCESS_TOKEN="my-access-token"
@@ -40,14 +50,14 @@ cd /path/to/my/project
 ob clone --workspace my-worspace-id-from-init
 ```
 
-### sync!
+#### sync!
 
 ```bash
 cd /path/to/my/project
 ob start
 ```
 
-### spy
+#### spy
 
 Monitor the shared log (CRDT operations being read from S2) in real time within a workspace:
 
@@ -63,3 +73,4 @@ spying on opbox workspace e4wtker801s559vp97drk6xbnfkq6ez7 (pid 41152)
 #98      text        obj=WUmyY6V/  from=n2c4dr0x  outbox=95  33B  ts=1781201317024000000  +5ch -0  insert="yo yo"
 #99      text        obj=WUmyY6V/  from=n2c4dr0x  outbox=96  24B  ts=1781201322218000000  +0ch -6
 ```
+
