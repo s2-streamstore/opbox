@@ -249,19 +249,12 @@ async fn await_commit_projection_epoch(semantic: &mut SemanticClient) -> eyre::R
 
 fn fail_if_projection_action_invalidated(result: &ProjectionActionResult) -> eyre::Result<()> {
     if result.invalidates_projection() {
+        let result_kind: &'static str = result.into();
         eyre::bail!(
             "clone projection action invalidated projection; result={}",
-            projection_action_result_kind(result)
+            result_kind
         );
     }
 
     Ok(())
-}
-
-fn projection_action_result_kind(result: &ProjectionActionResult) -> &'static str {
-    match result {
-        ProjectionActionResult::WriteFile { .. } => "write_file",
-        ProjectionActionResult::DeleteFile { .. } => "delete_file",
-        ProjectionActionResult::Failed { .. } => "failed",
-    }
 }

@@ -3321,6 +3321,7 @@ dependencies = [
  "s2-lite",
  "s2-sdk",
  "slatedb",
+ "strum 0.28.0",
  "time",
  "tokio",
  "tokio-util",

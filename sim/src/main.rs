@@ -142,52 +142,51 @@ struct SweepArgs {
     child_proc_log_level: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, strum::IntoStaticStr, ValueEnum)]
 enum Workload {
+    #[strum(serialize = "general")]
     General,
+    #[strum(serialize = "projection-storm")]
     ProjectionStorm,
+    #[strum(serialize = "same-path-create-conflict")]
     SamePathCreateConflict,
+    #[strum(serialize = "many-file-conflict-storm")]
     ManyFileConflictStorm,
+    #[strum(serialize = "delete-vs-edit")]
     DeleteVsEdit,
+    #[strum(serialize = "conflict-plus-later-edit")]
     ConflictPlusLaterEdit,
+    #[strum(serialize = "safe-save-after-quiescence")]
     SafeSaveAfterQuiescence,
+    #[strum(serialize = "rename-after-quiescence")]
     RenameAfterQuiescence,
+    #[strum(serialize = "scoped-scan")]
     ScopedScan,
+    #[strum(serialize = "same-file-edits")]
     SameFileEdits,
+    #[strum(serialize = "same-file-split-edits")]
     SameFileSplitEdits,
+    #[strum(serialize = "orphaned-projection-write")]
     OrphanedProjectionWrite,
+    #[strum(serialize = "fault-read-changed-between-stats")]
     FaultReadChangedBetweenStats,
+    #[strum(serialize = "fault-projection-conflict-before-swap")]
     FaultProjectionConflictBeforeSwap,
+    #[strum(serialize = "fault-projection-conflict-after-swap")]
     FaultProjectionConflictAfterSwap,
+    #[strum(serialize = "fault-projection-temp-leak")]
     FaultProjectionTempLeak,
+    #[strum(serialize = "clear-existing-file")]
     ClearExistingFile,
+    #[strum(serialize = "clear-via-safe-save")]
     ClearViaSafeSave,
+    #[strum(serialize = "clear-before-quiescence")]
     ClearBeforeQuiescence,
 }
 
 impl Workload {
     fn as_str(self) -> &'static str {
-        match self {
-            Workload::General => "general",
-            Workload::ProjectionStorm => "projection-storm",
-            Workload::SamePathCreateConflict => "same-path-create-conflict",
-            Workload::ManyFileConflictStorm => "many-file-conflict-storm",
-            Workload::DeleteVsEdit => "delete-vs-edit",
-            Workload::ConflictPlusLaterEdit => "conflict-plus-later-edit",
-            Workload::SafeSaveAfterQuiescence => "safe-save-after-quiescence",
-            Workload::RenameAfterQuiescence => "rename-after-quiescence",
-            Workload::ScopedScan => "scoped-scan",
-            Workload::SameFileEdits => "same-file-edits",
-            Workload::SameFileSplitEdits => "same-file-split-edits",
-            Workload::OrphanedProjectionWrite => "orphaned-projection-write",
-            Workload::FaultReadChangedBetweenStats => "fault-read-changed-between-stats",
-            Workload::FaultProjectionConflictBeforeSwap => "fault-projection-conflict-before-swap",
-            Workload::FaultProjectionConflictAfterSwap => "fault-projection-conflict-after-swap",
-            Workload::FaultProjectionTempLeak => "fault-projection-temp-leak",
-            Workload::ClearExistingFile => "clear-existing-file",
-            Workload::ClearViaSafeSave => "clear-via-safe-save",
-            Workload::ClearBeforeQuiescence => "clear-before-quiescence",
-        }
+        self.into()
     }
 }
 
