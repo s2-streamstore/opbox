@@ -19,7 +19,7 @@ Then you interact with the `ob` command.
 
 ```bash
 export S2_ACCESS_TOKEN="my-access-token"
-export S2_BUCKET_NAME="my-bucket-name"
+export S2_BASIN_NAME="my-basin-name"
 
 cd /path/to/my/project
 
@@ -32,7 +32,7 @@ This will print your `workspace_id`.
 
 ```bash
 export S2_ACCESS_TOKEN="my-access-token"
-export S2_BUCKET_NAME="my-bucket-name"
+export S2_BASIN_NAME="my-basin-name"
 
 cd /path/to/my/project
 
