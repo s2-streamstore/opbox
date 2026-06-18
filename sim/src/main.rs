@@ -2676,6 +2676,7 @@ async fn run_daemon_client(
         semantic_service,
         daemon_row,
         s2_basin,
+        clone_log_read_stop: None,
         spy_tx: None,
     });
     let mut actors = runtime.spawn(cancellation_token.clone());
