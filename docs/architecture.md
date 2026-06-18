@@ -10,9 +10,10 @@ Let's get these out of the way.
   - Our ops represent changes (to text files, or to the namespace representing what files exist); because they are CRDT operations, they can be applied in any order, any amount of times, and our workspaces should still meaningfully converge to a single stable representation.
 - Workspace
   - Our equivalent of a "repo" in a git analogy. This is the thing being synced. You can have a workspace synced with a directory locally.
-- Shared log
+- Shared log / journal
   - How we transmit CRDT ops and make them available to all daemons syncing with the same workspace
-  - 
+  - We use S2 for this, since it's durable, and can be appended and read from an arbitrary number of concurrent users in real-time
+  - The daemon will capture CRDT ops from local activity even if it loses connectivity to the shared log (e.g., no WiFi); opbox is designed to be a "local first" app; when connection is regained, it will sync with the remote workspace by appending local ops to the log and reading any missed ops from other sync clients
 - Semantic engine
   - This owns all of the logic around CRDTs, tracking of files that exist locally, changes which exist remotely, etc.
   - This is the daemon-specific durability layer. Each local workspace clone uses a Turso (`sqlite`-style) database, stored in `$LOCAL_WORKSPACE/.opbox/storage.db`.
@@ -45,10 +46,13 @@ Let's get these out of the way.
       - Imports can be triggered after a scan reveals that a file has changed, been created, deleted; it can also be triggered when a projection is invalidated because, for instance, a guarded write failed (indicating the file changed since we last saw it)
 
 
-## Questions
-
-- Why a db?
-- Why Turso?
-- 
 
 ## Sharp edges
+
+
+## Questions
+
+- Why is a db needed?
+- Why Turso?
+- Why not a mountable VFS?
+- 
