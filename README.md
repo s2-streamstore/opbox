@@ -81,3 +81,19 @@ spying on opbox workspace e4wtker801s559vp97drk6xbnfkq6ez7 (pid 41152)
 #99      text        obj=WUmyY6V/  from=n2c4dr0x  outbox=96  24B  ts=1781201322218000000  +0ch -6
 ```
 
+### configuration
+
+Can override env vars for the daemon by creating a `.opbox/env` file in your workspace root.
+
+This is also useful for increasing the log level of the daemon:
+
+```bash
+# in workspace root
+echo "RUST_LOG=opbox=trace,info" >> .opbox/env
+
+# restart the daemon
+ob stop && ob start
+
+# tail the log file
+ob tail -f # (just a wrapper over `tail -f ./opbox/daemon.log`)
+```

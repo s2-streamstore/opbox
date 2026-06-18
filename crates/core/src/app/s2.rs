@@ -9,7 +9,7 @@ use std::num::NonZeroU32;
 use std::str::FromStr;
 use tracing::warn;
 
-use super::user_config::UserConfig;
+use super::{user_config::UserConfig, workspace::WorkspaceEnv};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct S2ConnectionConfig {
@@ -70,6 +70,31 @@ impl S2ConnectionConfig {
         })
     }
 
+    pub fn from_env_overrides_workspace_or_user_config(
+        env_overrides: &WorkspaceEnv,
+        workspace_account_endpoint: Option<&str>,
+        workspace_basin_endpoint: Option<&str>,
+        user_config: &UserConfig,
+    ) -> eyre::Result<Self> {
+        let access_token = optional_override_or_env(env_overrides, "S2_ACCESS_TOKEN")?
+            .or_else(|| user_config.access_token.clone())
+            .ok_or_else(|| {
+                eyre!(
+                    "S2_ACCESS_TOKEN is not set and opbox user config has no access-token; \
+                     run `ob config set access-token <token>` or export S2_ACCESS_TOKEN"
+                )
+            })?;
+        Ok(Self {
+            access_token,
+            account_endpoint: optional_override_or_env(env_overrides, "S2_ACCOUNT_ENDPOINT")?
+                .or_else(|| workspace_account_endpoint.map(str::to_owned))
+                .or_else(|| user_config.account_endpoint.clone()),
+            basin_endpoint: optional_override_or_env(env_overrides, "S2_BASIN_ENDPOINT")?
+                .or_else(|| workspace_basin_endpoint.map(str::to_owned))
+                .or_else(|| user_config.basin_endpoint.clone()),
+        })
+    }
+
     pub fn endpoint_pair_for_metadata(&self) -> (Option<String>, Option<String>) {
         match (&self.account_endpoint, &self.basin_endpoint) {
             (Some(account_endpoint), Some(basin_endpoint)) => {
@@ -91,6 +116,17 @@ fn optional_env(key: &str) -> eyre::Result<Option<String>> {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => eyre::bail!("{key} is not valid unicode"),
+    }
+}
+
+fn optional_override_or_env(
+    env_overrides: &WorkspaceEnv,
+    key: &str,
+) -> eyre::Result<Option<String>> {
+    if let Some(value) = env_overrides.get(key) {
+        Ok(Some(value.to_string()))
+    } else {
+        optional_env(key)
     }
 }
 

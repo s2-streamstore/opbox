@@ -9,7 +9,8 @@ use opbox_core::app::s2::{
 };
 use opbox_core::app::user_config::{UserConfig, load_user_config};
 use opbox_core::app::workspace::{
-    DaemonLock, canonicalize_existing_dir, load_configured_daemon_state, remove_pid, write_pid,
+    DaemonLock, WorkspaceEnv, canonicalize_existing_dir, load_configured_daemon_state,
+    load_workspace_env, remove_pid, workspace_env_path, write_pid,
 };
 use opbox_core::fs::fio::local::LocalFileIO;
 use opbox_core::notify::nio::LocalNotifyIO;
@@ -28,28 +29,43 @@ struct Args {
     root: PathBuf,
 }
 
-fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+fn init_tracing(sync_root: &PathBuf, workspace_env: &WorkspaceEnv) -> eyre::Result<()> {
+    let filter = if let Some(rust_log) = workspace_env.get("RUST_LOG") {
+        tracing_subscriber::EnvFilter::try_new(rust_log).map_err(|err| {
+            eyre::eyre!(
+                "invalid RUST_LOG in {}: {err}",
+                workspace_env_path(sync_root).display()
+            )
+        })?
+    } else {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
         .try_init();
+    Ok(())
 }
 
 fn main() -> eyre::Result<()> {
     let args = Args::parse();
     let sync_root = canonicalize_existing_dir(&args.root)?;
-    init_tracing();
+    let workspace_env = load_workspace_env(&sync_root)?;
+    init_tracing(&sync_root, &workspace_env)?;
     let user_config = load_user_config()?;
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run(sync_root, user_config))
+        .block_on(run(sync_root, user_config, workspace_env))
 }
 
-async fn run(sync_root: PathBuf, user_config: UserConfig) -> eyre::Result<()> {
+async fn run(
+    sync_root: PathBuf,
+    user_config: UserConfig,
+    workspace_env: WorkspaceEnv,
+) -> eyre::Result<()> {
     let _lock = DaemonLock::acquire(&sync_root)?;
     write_pid(&sync_root)?;
     let _pid_guard = PidGuard {
@@ -57,7 +73,8 @@ async fn run(sync_root: PathBuf, user_config: UserConfig) -> eyre::Result<()> {
     };
 
     let (db_path, daemon_row) = load_configured_daemon_state(&sync_root).await?;
-    let s2_connection = S2ConnectionConfig::from_env_workspace_or_user_config(
+    let s2_connection = S2ConnectionConfig::from_env_overrides_workspace_or_user_config(
+        &workspace_env,
         daemon_row.s2_account_endpoint.as_deref(),
         daemon_row.s2_basin_endpoint.as_deref(),
         &user_config,

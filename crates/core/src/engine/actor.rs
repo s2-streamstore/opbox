@@ -21,7 +21,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
 use tokio_muxt::{CoalesceMode, MuxTimer};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 const MAX_SHARED_MESSAGE_BUFFER_MS: Duration = Duration::from_millis(10);
 const FULL_SCAN_INTERVAL: Duration = Duration::from_millis(120000);
@@ -350,8 +350,21 @@ impl Engine {
     }
 
     fn mark_link_online(&mut self, role: ConnectivityRole) {
+        let link = self.connectivity.link(role);
+        let previous_state = link.state;
+        let previous_error = link.last_error.clone();
+
         self.connectivity.link_mut(role).online();
-        debug!(role = role.as_str(), "shared log link online");
+        if previous_error.is_some() || matches!(previous_state, LinkRuntimeState::Offline) {
+            info!(
+                role = role.as_str(),
+                ?previous_state,
+                last_error = previous_error.as_deref(),
+                "shared log link resumed online"
+            );
+        } else {
+            debug!(role = role.as_str(), "shared log link online");
+        }
         self.publish_connectivity_status();
     }
 
