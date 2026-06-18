@@ -4,17 +4,21 @@
 
 > **⚠️ Warning:** Use this software with caution. Always keep additional backups of your data.
 
-Real-time, editor agnostic, multiplayer sync for plain text files. Using CRDTs!
+Real-time, editor agnostic, multiplayer sync for regular UTF-8 text files.
 
-Great for collaborating on an Obsidian graph or a code base without going through `git` for everything.
+Great for collaborating on an Obsidian graph or a codebase without going through `git` for everything.
 
 ### how it works 
 
-A local daemon listens for both local and remote changes to files in your workspace.
+A local daemon listens for both local and remote changes to files in a synced workspace directory.
 
-For every text file in your directory, opbox manages a CRDT-backed shadow of it. When you save a change to a local file, opbox solves for an equivalent CRDT operation by doing a regular text diff, then modeling it as an update to the shadow CRDT file. This op is then shared with other sync daemons via a shared, durable journal (S2).
+For every text file in your directory, opbox locally maintains a CRDT-backed shadow version of it. When you save a change to a local file, it solves for an equivalent CRDT operation by doing a regular text diff, then modeling it as an update operation to the CRDT document.
+
+This op is then published to other sync daemons by appending it to a shared, durable journal (S2).
 
 Daemons listen for new ops on the journal, update the local CRDT shadow, and then materialize new versions of the text files on disk.
+
+See [docs/architecture.md](docs/architecture.md) for more detail.
 
 ## running it
 
