@@ -4,6 +4,17 @@
 
 ### Install opbox
 
+#### from source
+
+```bash
+cargo install --path crates/client
+cargo install --path crates/daemon
+```
+
+You should have `ob` and `opbox-daemon` in your `$PATH` now.
+
+#### from release
+
 TODO
 
 ### S2 configuration

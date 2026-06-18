@@ -187,7 +187,9 @@ enum EnginePhase {
     },
     /// Semantic is turning the scan result into an import plan.
     PlanningImport,
+    /// An import is in progress.
     Importing(ImportPhase),
+    /// A projection plan is in progress.
     Projecting(ProjectionPhase),
 }
 

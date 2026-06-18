@@ -15,59 +15,11 @@ The only external service this relies on is [s2.dev](https://s2.dev). You can si
 > [!TIP] 
 > Head over to the [quickstart](docs/quickstart.md) to get up and running.
 
-### installation
+## architecture
 
-#### from source
+TODO
 
-```bash
-cargo install --path crates/client
-cargo install --path crates/daemon
-```
-
-Then you interact with the `ob` command.
-
-### use
-
-#### configure
-
-```bash
-ob config set default-basin "opbox-dev"
-ob config set access-token "-- my actual access token! --"
-```
-
-#### create a new workspace
-
-```bash
-export S2_ACCESS_TOKEN="my-access-token"
-export S2_BASIN_NAME="my-basin-name"
-
-cd /path/to/my/project
-
-# start a new opbox workspace
-ob init
-```
-This will print your `workspace_id`.
-
-#### clone an existing workspace
-
-```bash
-export S2_ACCESS_TOKEN="my-access-token"
-export S2_BASIN_NAME="my-basin-name"
-
-cd /path/to/my/project
-
-# clone an existing opbox workspace
-ob clone --workspace my-worspace-id-from-init
-```
-
-#### sync!
-
-```bash
-cd /path/to/my/project
-ob start
-```
-
-#### spy
+### spy
 
 Monitor the shared log (CRDT operations being read from S2) in real time within a workspace:
 
