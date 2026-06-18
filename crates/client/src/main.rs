@@ -1,5 +1,6 @@
 use clap::builder::styling;
 use clap::{Parser, Subcommand, ValueEnum};
+use opbox_core::app::connectivity::{ConnectivityOverallState, LinkState, LinkStatus};
 use opbox_core::app::db::{open_database, semantic_pool};
 use opbox_core::app::ipc;
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
@@ -357,6 +358,7 @@ async fn run_bootstrap(bootstrap: Bootstrap) -> eyre::Result<()> {
         s2_basin: bootstrap.s2_basin,
         clone_log_read_stop: bootstrap.clone_log_read_stop,
         spy_tx: None,
+        connectivity_status_tx: None,
     })
     .run_until_shutdown()
     .await?;
@@ -595,10 +597,63 @@ fn print_daemon_status(title: &str, status: &ipc::DaemonStatus, style: CliStyle)
     print_status_row("root", &status.root, style);
     print_status_row("pid", status.pid, style);
     print_status_row("stable cursor", status.stable_cursor_end, style);
+    print_status_row("connectivity", connectivity_status_text(status), style);
 }
 
 fn print_status_row(label: &str, value: impl std::fmt::Display, style: CliStyle) {
     println!("  {}  {}", style.dim(format!("{label:<13}")), value);
+}
+
+fn connectivity_status_text(status: &ipc::DaemonStatus) -> String {
+    let now = time::OffsetDateTime::now_utc();
+    match status.connectivity.overall {
+        ConnectivityOverallState::Online => "online".to_string(),
+        ConnectivityOverallState::Reconnecting => "reconnecting to S2".to_string(),
+        ConnectivityOverallState::Offline => {
+            let retry = retry_after_text(&status.connectivity.reader, now)
+                .or_else(|| retry_after_text(&status.connectivity.writer, now));
+            match retry {
+                Some(retry) => format!("offline, retrying in {retry}"),
+                None => "offline".to_string(),
+            }
+        }
+        ConnectivityOverallState::Degraded => {
+            let mut parts = Vec::new();
+            if status.connectivity.reader.state != LinkState::Online {
+                parts.push(format!(
+                    "reader {}",
+                    link_detail_text(&status.connectivity.reader, now)
+                ));
+            }
+            if status.connectivity.writer.state != LinkState::Online {
+                parts.push(format!(
+                    "writer {}",
+                    link_detail_text(&status.connectivity.writer, now)
+                ));
+            }
+            format!("degraded, {}", parts.join(", "))
+        }
+    }
+}
+
+fn link_detail_text(status: &LinkStatus, now: time::OffsetDateTime) -> String {
+    match status.state {
+        LinkState::Online => "online".to_string(),
+        LinkState::Reconnecting => "reconnecting".to_string(),
+        LinkState::Offline => retry_after_text(status, now)
+            .map(|retry| format!("offline, retrying in {retry}"))
+            .unwrap_or_else(|| "offline".to_string()),
+    }
+}
+
+fn retry_after_text(status: &LinkStatus, now: time::OffsetDateTime) -> Option<String> {
+    let retry_after = status.retry_after(now)?;
+    let secs = retry_after.as_secs();
+    if secs == 0 {
+        Some("now".to_string())
+    } else {
+        Some(format!("{secs}s"))
+    }
 }
 
 fn validate_config_value(key: ConfigKey, value: &str) -> eyre::Result<()> {

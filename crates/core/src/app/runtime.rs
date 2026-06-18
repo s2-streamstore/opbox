@@ -1,3 +1,4 @@
+use crate::app::connectivity::ConnectivitySnapshot;
 use crate::engine::actor::{Engine, EngineClients, EngineConfig, EngineEvents};
 use crate::engine::clone as engine_clone;
 use crate::engine::init as engine_init;
@@ -15,7 +16,7 @@ use crate::semantic::service::SemanticService;
 use crate::semantic::table::daemon_state;
 use crate::spy::SpyEvent;
 use s2_sdk::S2Basin;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
@@ -41,6 +42,7 @@ pub struct AppRuntimeConfig<IO, NIO = ()> {
     pub s2_basin: S2Basin,
     pub clone_log_read_stop: Option<LogReadStop>,
     pub spy_tx: Option<broadcast::Sender<SpyEvent>>,
+    pub connectivity_status_tx: Option<watch::Sender<ConnectivitySnapshot>>,
 }
 
 pub struct AppRuntime<IO, NIO = ()> {
@@ -66,6 +68,7 @@ where
             s2_basin,
             clone_log_read_stop,
             spy_tx,
+            connectivity_status_tx,
         } = self.config;
 
         let (semantic_request_tx, semantic_request_rx) = mpsc::unbounded_channel();
@@ -190,6 +193,7 @@ where
                     semantic: semantic_event_rx,
                     commands: engine_command_rx,
                     spy: spy_tx,
+                    connectivity_status: connectivity_status_tx,
                 };
 
                 let engine = Engine::new(EngineConfig {

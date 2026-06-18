@@ -123,6 +123,10 @@ async fn pull_shared_log_to_reader_end(
         };
 
         match event.ok_or_else(|| eyre!("log reader stopped while clone waited for read bound"))? {
+            LogReaderEvent::Connected => {}
+            LogReaderEvent::Disconnected { reason } => {
+                eyre::bail!("log reader disconnected during clone: {reason}");
+            }
             LogReaderEvent::Status { tail } => {
                 eyre::bail!(
                     "clone received unexpected log reader status for bounded read; tail={tail:?}"
@@ -204,6 +208,10 @@ fn handle_log_reader_event(
     buffer: &mut SharedMessageBuffer,
 ) -> eyre::Result<()> {
     match event.ok_or_else(|| eyre!("log reader stopped while clone waited for shared log"))? {
+        LogReaderEvent::Connected => {}
+        LogReaderEvent::Disconnected { reason } => {
+            eyre::bail!("log reader disconnected during clone: {reason}");
+        }
         LogReaderEvent::Status { tail } => {
             debug!(?tail, "clone captured start tail");
             *target_tail = Some(tail);

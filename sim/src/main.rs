@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use eyre::eyre;
 use fault_injecting_file_io::FaultInjectingFileIO;
 use in_memory_file_io::{InMemoryFileIO, InMemoryFileIOStats};
+use opbox_core::app::connectivity::{ConnectivitySnapshot, LinkState};
 use opbox_core::app::db::{initialize_database, open_memory_database, semantic_pool};
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::crdt::types::ObjectId;
@@ -30,7 +31,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::time::{Duration, SystemTime};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -156,6 +157,7 @@ enum Workload {
     RenameAfterQuiescence,
     ScopedScan,
     LargeTextMultipart,
+    OfflineReconnectMerge,
     SameFileEdits,
     SameFileSplitEdits,
     OrphanedProjectionWrite,
@@ -225,6 +227,9 @@ fn run_single(args: SingleArgs) -> eyre::Result<()> {
         Workload::ScopedScan => run_scoped_scan_workload(&mut sim, seed, args.common.max_steps)?,
         Workload::LargeTextMultipart => {
             run_large_text_multipart_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::OfflineReconnectMerge => {
+            run_offline_reconnect_merge_workload(&mut sim, seed, args.common.max_steps)?
         }
         Workload::SameFileEdits => run_same_file_edits_workload(
             &mut sim,
@@ -1955,6 +1960,95 @@ fn run_large_text_multipart_workload(
     Ok(())
 }
 
+fn run_offline_reconnect_merge_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000011".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "shared.txt";
+        let initial = format!("shared paragraph seed {seed}\n\n");
+        daemon_a
+            .write_file(path, Bytes::from(initial.clone()))
+            .await?;
+        daemon_a.request_single_file_scan(path).await?;
+        wait_for_file_text(&daemon_a, &daemon_b, path, &initial, steps).await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+
+        turmoil::partition("daemon-b", "s2-lite");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let b_markers = (0..4)
+            .map(|idx| format!("B-offline-{idx}-seed-{seed}"))
+            .collect::<Vec<_>>();
+        for (idx, marker) in b_markers.iter().enumerate() {
+            daemon_b
+                .append_file(path, Bytes::from(format!("{marker}\n")))
+                .await?;
+            daemon_b.request_single_file_scan(path).await?;
+            wait_for_outbox_at_least(&daemon_b, idx as u64 + 1, steps).await?;
+        }
+        wait_for_writer_not_online_with_released_outbox(
+            &daemon_b,
+            u64::try_from(b_markers.len()).expect("marker count fits u64"),
+            steps,
+        )
+        .await?;
+
+        let a_markers = (0..4)
+            .map(|idx| format!("A-online-{idx}-seed-{seed}"))
+            .collect::<Vec<_>>();
+        for marker in &a_markers {
+            daemon_a
+                .append_file(path, Bytes::from(format!("{marker}\n")))
+                .await?;
+            daemon_a.request_single_file_scan(path).await?;
+        }
+
+        let pre_repair_a = snapshot_file_text(&daemon_a, path).await?;
+        let pre_repair_b = snapshot_file_text(&daemon_b, path).await?;
+        let pre_repair_b_debug = daemon_b.semantic_debug_snapshot().await?;
+        print_document_snapshot("before-repair", "daemon-a", path, &pre_repair_a);
+        print_document_snapshot("before-repair", "daemon-b", path, &pre_repair_b);
+        println!(
+            "DOC_SNAPSHOT_META workload=offline-reconnect-merge seed={seed} moment=before-repair daemon=daemon-b outbox_rows={} outbox_inflight_rows={}",
+            pre_repair_b_debug.outbox_rows,
+            pre_repair_b_debug.outbox_inflight_rows
+        );
+
+        turmoil::repair("daemon-b", "s2-lite");
+        wait_for_connectivity_online(&daemon_b, steps).await?;
+
+        let expected_markers = a_markers
+            .iter()
+            .chain(b_markers.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let final_text =
+            wait_for_shared_text_with_markers(&daemon_a, &daemon_b, path, &expected_markers, steps)
+                .await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+        print_document_snapshot("after-merge", "both", path, &final_text);
+
+        println!(
+            "SIM_OK workload=offline-reconnect-merge seed={seed} markers={} final_bytes={}",
+            expected_markers.len(),
+            final_text.len()
+        );
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
 fn deterministic_large_text(seed: u64, label: &str, min_bytes: usize) -> String {
     let mut text = format!("{label} seed {seed}\n");
     let mut idx = 0usize;
@@ -2090,6 +2184,144 @@ async fn wait_for_text_files(
 
     Err(io_err(format!(
         "text files did not converge; expected={expected:?} a={last_a:?} b={last_b:?}"
+    )))
+}
+
+async fn snapshot_file_text(
+    daemon: &SimDaemonHandle,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    daemon
+        .snapshot_text_files()
+        .await?
+        .get(path)
+        .cloned()
+        .ok_or_else(|| io_err(format!("missing snapshot path {path:?}")))
+}
+
+fn print_document_snapshot(moment: &str, daemon: &str, path: &str, text: &str) {
+    println!(
+        "DOC_SNAPSHOT_BEGIN workload=offline-reconnect-merge moment={moment} daemon={daemon} path={path:?} bytes={}",
+        text.len()
+    );
+    print!("{text}");
+    if !text.ends_with('\n') {
+        println!();
+    }
+    println!(
+        "DOC_SNAPSHOT_END workload=offline-reconnect-merge moment={moment} daemon={daemon} path={path:?}"
+    );
+}
+
+async fn wait_for_outbox_empty(
+    daemon: &SimDaemonHandle,
+    steps: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut last_debug = None;
+    for _ in 0..steps {
+        let debug = daemon.semantic_debug_snapshot().await?;
+        if debug.outbox_rows == 0 && debug.outbox_inflight_rows == 0 {
+            return Ok(());
+        }
+        last_debug = Some(debug);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(io_err(format!(
+        "outbox did not drain; last_debug={last_debug:?}"
+    )))
+}
+
+async fn wait_for_outbox_at_least(
+    daemon: &SimDaemonHandle,
+    expected_rows: u64,
+    steps: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut last_debug = None;
+    for _ in 0..steps {
+        let debug = daemon.semantic_debug_snapshot().await?;
+        if debug.outbox_rows >= expected_rows {
+            return Ok(());
+        }
+        last_debug = Some(debug);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(io_err(format!(
+        "outbox did not accumulate expected rows; expected_rows={expected_rows} last_debug={last_debug:?}"
+    )))
+}
+
+async fn wait_for_writer_not_online_with_released_outbox(
+    daemon: &SimDaemonHandle,
+    expected_rows: u64,
+    steps: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut last_status = None;
+    let mut last_debug = None;
+    for _ in 0..steps {
+        let status = daemon.connectivity_status().await?;
+        let debug = daemon.semantic_debug_snapshot().await?;
+        if status.writer.state != LinkState::Online
+            && debug.outbox_rows >= expected_rows
+            && debug.outbox_inflight_rows == 0
+        {
+            return Ok(());
+        }
+        last_status = Some(status);
+        last_debug = Some(debug);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(io_err(format!(
+        "daemon writer did not enter offline/reconnecting with released outbox; expected_rows={expected_rows} last_status={last_status:?} last_debug={last_debug:?}"
+    )))
+}
+
+async fn wait_for_connectivity_online(
+    daemon: &SimDaemonHandle,
+    steps: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut last_status = None;
+    for _ in 0..steps {
+        let status = daemon.connectivity_status().await?;
+        if status.reader.state == LinkState::Online && status.writer.state == LinkState::Online {
+            return Ok(());
+        }
+        last_status = Some(status);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(io_err(format!(
+        "daemon connectivity did not become online; last_status={last_status:?}"
+    )))
+}
+
+async fn wait_for_shared_text_with_markers(
+    daemon_a: &SimDaemonHandle,
+    daemon_b: &SimDaemonHandle,
+    path: &str,
+    expected_markers: &[String],
+    steps: u64,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut last_a = BTreeMap::new();
+    let mut last_b = BTreeMap::new();
+    for _ in 0..steps {
+        last_a = daemon_a.snapshot_text_files().await?;
+        last_b = daemon_b.snapshot_text_files().await?;
+        if let (Some(a_text), Some(b_text)) = (last_a.get(path), last_b.get(path))
+            && a_text == b_text
+            && missing_markers(Some(a_text), expected_markers).is_empty()
+        {
+            return Ok(a_text.clone());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let missing_a = missing_markers(last_a.get(path).map(String::as_str), expected_markers);
+    let missing_b = missing_markers(last_b.get(path).map(String::as_str), expected_markers);
+    Err(io_err(format!(
+        "shared text did not converge with expected markers; missing_a={missing_a:?} missing_b={missing_b:?} a={last_a:?} b={last_b:?}"
     )))
 }
 
@@ -2668,6 +2900,8 @@ async fn run_daemon_client(
         .map_err(io_err)?
         .basin(daemon_row.s2_basin.clone());
     let (notify_io, notify_handle) = channel_notify_io();
+    let (connectivity_status_tx, connectivity_status_rx) =
+        watch::channel(ConnectivitySnapshot::starting());
     let cancellation_token = CancellationToken::new();
     let runtime = AppRuntime::new(AppRuntimeConfig {
         mode: RunMode::Sync,
@@ -2678,6 +2912,7 @@ async fn run_daemon_client(
         s2_basin,
         clone_log_read_stop: None,
         spy_tx: None,
+        connectivity_status_tx: Some(connectivity_status_tx),
     });
     let mut actors = runtime.spawn(cancellation_token.clone());
 
@@ -2727,6 +2962,9 @@ async fn run_daemon_client(
                             .await
                             .map_err(|err| err.to_string());
                         let _ = reply.send(result);
+                    }
+                    SimDaemonCommand::ConnectivityStatus { reply } => {
+                        let _ = reply.send(connectivity_status_rx.borrow().clone());
                     }
                     SimDaemonCommand::RequestScan { scope, reply } => {
                         let result = notify_handle.send_scope(scope).map_err(|err| err.to_string());
@@ -2908,6 +3146,17 @@ impl SimDaemonHandle {
         recv.await.map_err(io_err)?.map_err(io_err)
     }
 
+    async fn connectivity_status(
+        &self,
+    ) -> Result<ConnectivitySnapshot, Box<dyn std::error::Error>> {
+        let (reply, recv) = oneshot::channel();
+        self.command_tx
+            .send(SimDaemonCommand::ConnectivityStatus { reply })
+            .await
+            .map_err(io_err)?;
+        recv.await.map_err(io_err)
+    }
+
     async fn request_single_file_scan(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let path = RelativePath::parse(path).map_err(io_err)?;
         let (reply, recv) = oneshot::channel();
@@ -3067,6 +3316,9 @@ enum SimDaemonCommand {
     },
     SemanticDebugSnapshot {
         reply: oneshot::Sender<Result<SemanticDebugSnapshot, String>>,
+    },
+    ConnectivityStatus {
+        reply: oneshot::Sender<ConnectivitySnapshot>,
     },
     RequestScan {
         scope: ScanScope,

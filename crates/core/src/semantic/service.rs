@@ -24,7 +24,7 @@ use crate::types::{OutboxId, SharedMessageBatch};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use std::collections::BTreeMap;
-use std::ops::RangeToInclusive;
+use std::ops::{RangeTo, RangeToInclusive};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, instrument, trace, warn};
@@ -53,6 +53,8 @@ pub struct SemanticService {
 pub struct SemanticDebugSnapshot {
     pub prior_live_paths: BTreeMap<String, ObjectId>,
     pub stable_paths: BTreeMap<String, ObjectId>,
+    pub outbox_rows: u64,
+    pub outbox_inflight_rows: u64,
 }
 
 impl SemanticService {
@@ -78,9 +80,13 @@ impl SemanticService {
                     .into_iter()
                     .map(|row| (row.path.to_string(), row.object_id))
                     .collect();
+                let outbox_rows = tx.count_table("outbox").await?;
+                let outbox_inflight_rows = tx.count_outbox_inflight().await?;
                 Ok(SemanticDebugSnapshot {
                     prior_live_paths,
                     stable_paths,
+                    outbox_rows,
+                    outbox_inflight_rows,
                 })
             })
         })
@@ -365,6 +371,13 @@ impl SemanticService {
         .await
     }
 
+    pub(crate) async fn release_outbox(&self) -> eyre::Result<u64> {
+        self.exec_tx("release_outbox", move |tx| {
+            Box::pin(async move { tx.release_outbox_messages().await })
+        })
+        .await
+    }
+
     pub(crate) async fn trim_outbox(
         &self,
         through: RangeToInclusive<OutboxId>,
@@ -374,6 +387,15 @@ impl SemanticService {
                 tx.trim_outbox(through).await?;
                 Ok(())
             })
+        })
+        .await
+    }
+
+    pub(crate) async fn read_stable_cursor(
+        &self,
+    ) -> eyre::Result<RangeTo<crate::log::types::SequenceNumber>> {
+        self.exec_tx("read_stable_cursor", move |tx| {
+            Box::pin(async move { tx.select_stable_cursor().await })
         })
         .await
     }

@@ -1,3 +1,4 @@
+use crate::app::connectivity::ConnectivitySnapshot;
 use crate::app::db::load_daemon_state;
 use crate::app::workspace::{real_socket_path, remove_stale_socket_files, socket_link_path};
 use crate::semantic::table::daemon_state;
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -33,6 +34,7 @@ pub struct DaemonStatus {
     pub stable_cursor_end: u64,
     pub daemon_writer_id_b64: String,
     pub started_at_ns: i64,
+    pub connectivity: ConnectivitySnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +50,7 @@ pub struct ControlServerConfig {
     pub daemon_state: daemon_state::Row,
     pub started_at: OffsetDateTime,
     pub spy_tx: broadcast::Sender<SpyEvent>,
+    pub connectivity_status_rx: watch::Receiver<ConnectivitySnapshot>,
 }
 
 pub async fn request_status(sync_root: &Path) -> eyre::Result<DaemonStatus> {
@@ -305,6 +308,7 @@ async fn load_status(config: &ControlServerConfig) -> eyre::Result<DaemonStatus>
         daemon_writer_id_b64: daemon_state.daemon_writer_id.encode_b64(),
         started_at_ns: i64::try_from(config.started_at.unix_timestamp_nanos())
             .expect("started_at timestamp nanos fit in i64"),
+        connectivity: config.connectivity_status_rx.borrow().clone(),
     })
 }
 
@@ -402,6 +406,7 @@ impl Drop for SocketGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::connectivity::ConnectivitySnapshot;
     use crate::app::db::{configure_connection, create_initialized_database, open_database};
     use crate::app::workspace::metadata_dir;
     use crate::types::{DaemonWriterId, OutboxId, WorkspaceId};
@@ -426,6 +431,8 @@ mod tests {
         create_initialized_database(&db_path, &daemon_row).await?;
 
         let (spy_tx, _) = broadcast::channel(8);
+        let (_connectivity_tx, connectivity_status_rx) =
+            watch::channel(ConnectivitySnapshot::starting());
         let token = CancellationToken::new();
         let (stop_tx, _stop_rx) = mpsc::unbounded_channel();
         let server = tokio::spawn({
@@ -436,6 +443,7 @@ mod tests {
                 daemon_state: daemon_row,
                 started_at: OffsetDateTime::UNIX_EPOCH,
                 spy_tx,
+                connectivity_status_rx,
             };
             async move { serve_control(config, token, stop_tx).await }
         });

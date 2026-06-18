@@ -1,9 +1,11 @@
 use clap::Parser;
+use opbox_core::app::connectivity::ConnectivitySnapshot;
 use opbox_core::app::db::{open_database, semantic_pool};
 use opbox_core::app::ipc::{self, ControlServerConfig};
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::app::s2::{
-    S2ConnectionConfig, ensure_workspace_stream_exists, s2_basin_from_config,
+    S2ConnectionConfig, ensure_workspace_stream_exists, report_is_s2_connectivity,
+    s2_basin_from_config,
 };
 use opbox_core::app::user_config::{UserConfig, load_user_config};
 use opbox_core::app::workspace::{
@@ -15,7 +17,7 @@ use opbox_core::semantic::service::SemanticService;
 use std::path::PathBuf;
 use std::time::Duration;
 use time::OffsetDateTime;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
@@ -61,13 +63,24 @@ async fn run(sync_root: PathBuf, user_config: UserConfig) -> eyre::Result<()> {
         &user_config,
     )?;
     let s2_basin = s2_basin_from_config(daemon_row.s2_basin.clone(), &s2_connection).await?;
-    ensure_workspace_stream_exists(&s2_basin, &daemon_row.workspace_id).await?;
+    match ensure_workspace_stream_exists(&s2_basin, &daemon_row.workspace_id).await {
+        Ok(()) => {}
+        Err(err) if report_is_s2_connectivity(&err) => {
+            tracing::warn!(
+                ?err,
+                "could not verify workspace stream at startup; daemon will start offline"
+            );
+        }
+        Err(err) => return Err(err),
+    }
 
     let db = open_database(&db_path).await?;
     let pool = semantic_pool(db).await?;
     let semantic_service = SemanticService::new(pool);
     let notify_io = Some(LocalNotifyIO::new(&sync_root, Duration::from_millis(50))?);
     let (spy_tx, _) = broadcast::channel(1024);
+    let (connectivity_status_tx, connectivity_status_rx) =
+        watch::channel(ConnectivitySnapshot::starting());
 
     let token = CancellationToken::new();
     let mut actors = AppRuntime::new(AppRuntimeConfig {
@@ -79,6 +92,7 @@ async fn run(sync_root: PathBuf, user_config: UserConfig) -> eyre::Result<()> {
         s2_basin,
         clone_log_read_stop: None,
         spy_tx: Some(spy_tx.clone()),
+        connectivity_status_tx: Some(connectivity_status_tx),
     })
     .spawn(token.clone());
 
@@ -88,6 +102,7 @@ async fn run(sync_root: PathBuf, user_config: UserConfig) -> eyre::Result<()> {
         daemon_state: daemon_row.clone(),
         started_at: OffsetDateTime::now_utc(),
         spy_tx,
+        connectivity_status_rx,
     };
     let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
     let mut control_task = tokio::spawn({

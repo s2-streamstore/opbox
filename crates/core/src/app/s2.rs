@@ -96,7 +96,7 @@ fn optional_env(key: &str) -> eyre::Result<Option<String>> {
 
 pub fn s2_client_from_config(connection: &S2ConnectionConfig) -> eyre::Result<S2> {
     let mut config = S2Config::new(&connection.access_token)
-        .with_retry(RetryConfig::new().with_max_attempts(NonZeroU32::new(1024).unwrap()));
+        .with_retry(RetryConfig::new().with_max_attempts(NonZeroU32::new(5).unwrap()));
 
     match (&connection.account_endpoint, &connection.basin_endpoint) {
         (Some(account_endpoint), Some(basin_endpoint)) => {
@@ -118,6 +118,44 @@ pub fn s2_client_from_config(connection: &S2ConnectionConfig) -> eyre::Result<S2
     }
 
     Ok(S2::new(config)?)
+}
+
+pub fn s2_error_is_connectivity(error: &S2Error) -> bool {
+    match error {
+        S2Error::Client(message) => {
+            let message = message.to_ascii_lowercase();
+            !message.contains("malformed access token")
+        }
+        S2Error::Server(err) => matches!(
+            err.code.as_str(),
+            "client_hangup"
+                | "hot_server"
+                | "other"
+                | "rate_limited"
+                | "request_timeout"
+                | "storage"
+                | "transaction_conflict"
+                | "unavailable"
+                | "upstream_timeout"
+        ),
+        S2Error::Validation(_) | S2Error::AppendConditionFailed(_) | S2Error::ReadUnwritten(_) => {
+            false
+        }
+    }
+}
+
+pub fn s2_error_is_not_found(error: &S2Error) -> bool {
+    matches!(
+        error,
+        S2Error::Server(err)
+            if matches!(err.code.as_str(), "basin_not_found" | "stream_not_found")
+    )
+}
+
+pub fn report_is_s2_connectivity(error: &eyre::Report) -> bool {
+    error
+        .downcast_ref::<S2Error>()
+        .is_some_and(s2_error_is_connectivity)
 }
 
 pub fn s2_client_from_env(access_token: &str) -> eyre::Result<S2> {
