@@ -63,7 +63,11 @@ async fn run(sync_root: PathBuf, user_config: UserConfig) -> eyre::Result<()> {
     };
 
     let (db_path, daemon_row) = load_configured_daemon_state(&sync_root).await?;
-    let s2_connection = S2ConnectionConfig::from_env_or_user_config(&user_config)?;
+    let s2_connection = S2ConnectionConfig::from_env_workspace_or_user_config(
+        daemon_row.s2_account_endpoint.as_deref(),
+        daemon_row.s2_basin_endpoint.as_deref(),
+        &user_config,
+    )?;
     let s2_basin = s2_basin_from_config(daemon_row.s2_basin.clone(), &s2_connection).await?;
     ensure_workspace_stream_exists(&s2_basin, &daemon_row.workspace_id).await?;
 

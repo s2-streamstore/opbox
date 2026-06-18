@@ -48,7 +48,8 @@ pub async fn load_daemon_state(db_path: &Path) -> eyre::Result<daemon_state::Row
     configure_connection(&conn).await?;
     let mut rows = conn
         .query(
-            "SELECT workspace_id, s2_basin, writer_id, stable_cursor, next_outbox_id
+            "SELECT workspace_id, s2_basin, writer_id, stable_cursor, next_outbox_id,
+                    s2_account_endpoint, s2_basin_endpoint
              FROM daemon_state
              WHERE id = 1",
             (),
@@ -144,13 +145,17 @@ pub async fn insert_daemon_state(conn: &Connection, row: &daemon_state::Row) -> 
             id,
             workspace_id,
             s2_basin,
+            s2_account_endpoint,
+            s2_basin_endpoint,
             writer_id,
             stable_cursor,
             next_outbox_id
-        ) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         (
             row.workspace_id.0.as_str(),
             row.s2_basin.as_ref(),
+            row.s2_account_endpoint.as_deref(),
+            row.s2_basin_endpoint.as_deref(),
             row.daemon_writer_id.0.as_ref(),
             stable_cursor,
             next_outbox_id,

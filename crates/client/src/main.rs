@@ -164,12 +164,19 @@ fn root_or_current(sync_root: Option<PathBuf>) -> eyre::Result<PathBuf> {
     }
 }
 
-fn fresh_daemon_state_row(workspace_id: WorkspaceId, basin: BasinName) -> daemon_state::Row {
+fn fresh_daemon_state_row(
+    workspace_id: WorkspaceId,
+    basin: BasinName,
+    connection: &S2ConnectionConfig,
+) -> daemon_state::Row {
     let writer_id = rand::random::<[u8; 16]>();
+    let (s2_account_endpoint, s2_basin_endpoint) = connection.endpoint_pair_for_metadata();
 
     daemon_state::Row {
         workspace_id,
         s2_basin: basin,
+        s2_account_endpoint,
+        s2_basin_endpoint,
         daemon_writer_id: DaemonWriterId(bytes::Bytes::copy_from_slice(&writer_id)),
         stable_cursor: ..0,
         next_outbox_id: OutboxId::new(0),
@@ -239,7 +246,7 @@ async fn bootstrap_init(
     let workspace_id = WorkspaceId::generate();
     debug!(?workspace_id, "generated workspace id");
     create_workspace_stream(&s2_basin, &workspace_id).await?;
-    let daemon_row = fresh_daemon_state_row(workspace_id, basin);
+    let daemon_row = fresh_daemon_state_row(workspace_id, basin, &s2_connection);
     create_metadata_dir(&sync_root)?;
     create_default_ignore_file(&sync_root)?;
     create_initialized_database(&sync_root, &daemon_row).await?;
@@ -268,7 +275,7 @@ async fn bootstrap_clone(
     ensure_sync_root_unconfigured(&sync_root).await?;
     let s2_basin = s2_basin_from_config(basin.clone(), &s2_connection).await?;
     ensure_workspace_stream_exists(&s2_basin, &workspace).await?;
-    let daemon_row = fresh_daemon_state_row(workspace, basin);
+    let daemon_row = fresh_daemon_state_row(workspace, basin, &s2_connection);
     create_metadata_dir(&sync_root)?;
     create_initialized_database(&sync_root, &daemon_row).await?;
     Ok(Bootstrap {
@@ -756,8 +763,8 @@ fn run_daemon_logs(follow: bool, sync_root: Option<PathBuf>) -> eyre::Result<()>
     Err(eyre::eyre!("failed to exec tail -f: {error}"))
 }
 
-/// Snapshot resolved S2 settings into `.opbox/env` so the daemon can run
-/// without the user's shell environment or user config. Returns the persisted
+/// Snapshot resolved S2 token/basin into `.opbox/env` for compatibility.
+/// Workspace endpoints live in daemon_state metadata. Returns the persisted
 /// names. Never overwrites an existing env file.
 fn persist_s2_env(
     sync_root: &Path,
@@ -771,12 +778,6 @@ fn persist_s2_env(
         ),
         ("S2_BASIN".to_string(), basin.as_ref().to_string()),
     ];
-    if let Some(account_endpoint) = &connection.account_endpoint {
-        vars.push(("S2_ACCOUNT_ENDPOINT".to_string(), account_endpoint.clone()));
-    }
-    if let Some(basin_endpoint) = &connection.basin_endpoint {
-        vars.push(("S2_BASIN_ENDPOINT".to_string(), basin_endpoint.clone()));
-    }
     vars.sort();
 
     let mut body = String::from(
@@ -956,7 +957,7 @@ mod tests {
     use opbox_core::app::workspace::metadata_dir;
 
     #[test]
-    fn persists_resolved_s2_config_to_workspace_env_once() -> eyre::Result<()> {
+    fn persists_resolved_s2_token_and_basin_to_workspace_env_once() -> eyre::Result<()> {
         let sync_root =
             std::env::temp_dir().join(format!("ob-env-persist-test-{}", rand::random::<u64>()));
         std::fs::create_dir(&sync_root)?;
@@ -972,13 +973,13 @@ mod tests {
         let persisted = persist_s2_env(&sync_root, &basin, &connection)?;
         assert!(persisted.contains(&"S2_ACCESS_TOKEN".to_string()));
         assert!(persisted.contains(&"S2_BASIN".to_string()));
-        assert!(persisted.contains(&"S2_ACCOUNT_ENDPOINT".to_string()));
-        assert!(persisted.contains(&"S2_BASIN_ENDPOINT".to_string()));
+        assert!(!persisted.contains(&"S2_ACCOUNT_ENDPOINT".to_string()));
+        assert!(!persisted.contains(&"S2_BASIN_ENDPOINT".to_string()));
         let body = std::fs::read_to_string(workspace_env_path(&sync_root))?;
         assert!(body.contains("S2_ACCESS_TOKEN=tok-123"));
         assert!(body.contains("S2_BASIN=test-basin"));
-        assert!(body.contains("S2_ACCOUNT_ENDPOINT=account.s2.test"));
-        assert!(body.contains("S2_BASIN_ENDPOINT={basin}.s2.test"));
+        assert!(!body.contains("S2_ACCOUNT_ENDPOINT"));
+        assert!(!body.contains("S2_BASIN_ENDPOINT"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -999,6 +1000,23 @@ mod tests {
         assert!(body.contains("tok-123"));
 
         let _ = std::fs::remove_dir_all(&sync_root);
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_daemon_state_pins_complete_endpoint_pair() -> eyre::Result<()> {
+        let workspace_id = WorkspaceId("0123456789abcdefghijklmnopqrstuv".to_string());
+        let basin: BasinName = "test-basin".parse()?;
+        let connection = S2ConnectionConfig {
+            access_token: "tok-123".to_string(),
+            account_endpoint: Some("account.s2.test".to_string()),
+            basin_endpoint: Some("{basin}.s2.test".to_string()),
+        };
+
+        let row = fresh_daemon_state_row(workspace_id, basin, &connection);
+        assert_eq!(row.s2_account_endpoint.as_deref(), Some("account.s2.test"));
+        assert_eq!(row.s2_basin_endpoint.as_deref(), Some("{basin}.s2.test"));
+
         Ok(())
     }
 }

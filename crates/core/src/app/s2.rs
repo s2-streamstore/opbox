@@ -45,6 +45,39 @@ impl S2ConnectionConfig {
                 .or_else(|| user_config.basin_endpoint.clone()),
         })
     }
+
+    pub fn from_env_workspace_or_user_config(
+        workspace_account_endpoint: Option<&str>,
+        workspace_basin_endpoint: Option<&str>,
+        user_config: &UserConfig,
+    ) -> eyre::Result<Self> {
+        let access_token = optional_env("S2_ACCESS_TOKEN")?
+            .or_else(|| user_config.access_token.clone())
+            .ok_or_else(|| {
+                eyre!(
+                    "S2_ACCESS_TOKEN is not set and opbox user config has no access-token; \
+                     run `ob config set access-token <token>` or export S2_ACCESS_TOKEN"
+                )
+            })?;
+        Ok(Self {
+            access_token,
+            account_endpoint: optional_env("S2_ACCOUNT_ENDPOINT")?
+                .or_else(|| workspace_account_endpoint.map(str::to_owned))
+                .or_else(|| user_config.account_endpoint.clone()),
+            basin_endpoint: optional_env("S2_BASIN_ENDPOINT")?
+                .or_else(|| workspace_basin_endpoint.map(str::to_owned))
+                .or_else(|| user_config.basin_endpoint.clone()),
+        })
+    }
+
+    pub fn endpoint_pair_for_metadata(&self) -> (Option<String>, Option<String>) {
+        match (&self.account_endpoint, &self.basin_endpoint) {
+            (Some(account_endpoint), Some(basin_endpoint)) => {
+                (Some(account_endpoint.clone()), Some(basin_endpoint.clone()))
+            }
+            _ => (None, None),
+        }
+    }
 }
 
 fn required_env(key: &str) -> eyre::Result<String> {

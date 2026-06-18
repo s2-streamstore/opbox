@@ -2507,6 +2507,8 @@ fn spawn_daemon_with_initial_files(
     let daemon_row = daemon_state::Row {
         workspace_id,
         s2_basin: SIM_BASIN.parse()?,
+        s2_account_endpoint: None,
+        s2_basin_endpoint: None,
         daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&[daemon_index; 16])),
         stable_cursor: ..0,
         next_outbox_id: OutboxId::new(0),
