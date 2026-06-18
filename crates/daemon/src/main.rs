@@ -7,8 +7,7 @@ use opbox_core::app::s2::{
 };
 use opbox_core::app::user_config::{UserConfig, load_user_config};
 use opbox_core::app::workspace::{
-    DaemonLock, canonicalize_existing_dir, load_configured_daemon_state, load_workspace_env,
-    remove_pid, write_pid,
+    DaemonLock, canonicalize_existing_dir, load_configured_daemon_state, remove_pid, write_pid,
 };
 use opbox_core::fs::fio::local::LocalFileIO;
 use opbox_core::notify::nio::LocalNotifyIO;
@@ -39,14 +38,7 @@ fn init_tracing() {
 fn main() -> eyre::Result<()> {
     let args = Args::parse();
     let sync_root = canonicalize_existing_dir(&args.root)?;
-    // Load .opbox/env while still single-threaded (set_var is unsafe under
-    // concurrent env reads) and before tracing init, so RUST_LOG from the
-    // file takes effect too.
-    let env_applied = load_workspace_env(&sync_root)?;
     init_tracing();
-    if !env_applied.is_empty() {
-        info!(vars = ?env_applied, "loaded workspace env from .opbox/env");
-    }
     let user_config = load_user_config()?;
 
     tokio::runtime::Builder::new_multi_thread()

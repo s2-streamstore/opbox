@@ -13,7 +13,7 @@ use opbox_core::app::user_config::{
 use opbox_core::app::workspace::{
     NotInWorkspace, canonicalize_existing_dir, create_metadata_dir, current_dir, daemon_log_path,
     ensure_clean_clone_root, ensure_sync_root_unconfigured, find_workspace_root,
-    load_configured_daemon_state, remove_socket_pointer, storage_db_path, workspace_env_path,
+    load_configured_daemon_state, remove_socket_pointer, storage_db_path,
 };
 use opbox_core::fs::fio::local::LocalFileIO;
 use opbox_core::fs::ignore::{IGNORE_FILE_NAME, default_ignore_file_contents};
@@ -143,7 +143,6 @@ struct Bootstrap {
     sync_root: PathBuf,
     daemon_row: daemon_state::Row,
     s2_basin: S2Basin,
-    s2_connection: S2ConnectionConfig,
 }
 
 fn init_tracing() {
@@ -256,7 +255,6 @@ async fn bootstrap_init(
         sync_root,
         daemon_row,
         s2_basin,
-        s2_connection,
     })
 }
 
@@ -284,7 +282,6 @@ async fn bootstrap_clone(
         sync_root,
         daemon_row,
         s2_basin,
-        s2_connection,
     })
 }
 
@@ -293,7 +290,6 @@ async fn run_bootstrap(bootstrap: Bootstrap) -> eyre::Result<()> {
     let sync_root = bootstrap.sync_root.clone();
     let workspace_id = bootstrap.daemon_row.workspace_id.clone();
     let basin = bootstrap.daemon_row.s2_basin.clone();
-    let s2_connection = bootstrap.s2_connection.clone();
 
     let db = open_database(&bootstrap.db_path).await?;
     let pool = semantic_pool(db).await?;
@@ -314,7 +310,6 @@ async fn run_bootstrap(bootstrap: Bootstrap) -> eyre::Result<()> {
     if mode == RunMode::Clone {
         create_default_ignore_file(&sync_root)?;
     }
-    let persisted_env = persist_s2_env(&sync_root, &basin, &s2_connection)?;
 
     let style = CliStyle::for_stdout();
     let title = match mode {
@@ -328,30 +323,11 @@ async fn run_bootstrap(bootstrap: Bootstrap) -> eyre::Result<()> {
     }
     print_status_row("basin", basin.as_ref(), style);
     print_status_row("root", sync_root.display(), style);
-    if !persisted_env.is_empty() {
-        println!(
-            "\nsaved {} to {} for the daemon; delete that file to use the shell environment instead",
-            style.bold(persisted_env.join(", ")),
-            style.bold(".opbox/env"),
-        );
-    }
     if mode == RunMode::Init {
         println!();
         println!(
             "your workspace is: {}",
             style.bold(style.green(&workspace_id.0))
-        );
-        println!();
-        println!("share this with others who want to sync with it:");
-        println!();
-        println!(
-            "  {} {}",
-            style.dim("$"),
-            style.bold(format!(
-                "S2_BASIN={} {CLIENT_COMMAND} clone --workspace {} <dir>",
-                basin.as_ref(),
-                workspace_id.0
-            ))
         );
         println!();
     }
@@ -763,54 +739,6 @@ fn run_daemon_logs(follow: bool, sync_root: Option<PathBuf>) -> eyre::Result<()>
     Err(eyre::eyre!("failed to exec tail -f: {error}"))
 }
 
-/// Snapshot resolved S2 token/basin into `.opbox/env` for compatibility.
-/// Workspace endpoints live in daemon_state metadata. Returns the persisted
-/// names. Never overwrites an existing env file.
-fn persist_s2_env(
-    sync_root: &Path,
-    basin: &BasinName,
-    connection: &S2ConnectionConfig,
-) -> eyre::Result<Vec<String>> {
-    let mut vars = vec![
-        (
-            "S2_ACCESS_TOKEN".to_string(),
-            connection.access_token.clone(),
-        ),
-        ("S2_BASIN".to_string(), basin.as_ref().to_string()),
-    ];
-    vars.sort();
-
-    let mut body = String::from(
-        "# S2_* environment variables captured by `ob init`/`ob clone`.\n\
-         # Loaded by the opbox daemon at startup; the process environment\n\
-         # takes precedence over entries here.\n",
-    );
-    for (key, value) in &vars {
-        body.push_str(key);
-        body.push('=');
-        body.push_str(value);
-        body.push('\n');
-    }
-
-    let path = workspace_env_path(sync_root);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    match options.open(&path) {
-        Ok(mut file) => {
-            use std::io::Write;
-            file.write_all(body.as_bytes())?;
-            Ok(vars.into_iter().map(|(key, _)| key).collect())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(Vec::new()),
-        Err(error) => Err(eyre::eyre!("failed to write {}: {error}", path.display())),
-    }
-}
-
 fn with_failure_banner(command: &'static str, result: eyre::Result<()>) -> eyre::Result<()> {
     if result.is_err() {
         let style = CliStyle::for_stderr();
@@ -954,54 +882,6 @@ fn render_error(error: &eyre::Report) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opbox_core::app::workspace::metadata_dir;
-
-    #[test]
-    fn persists_resolved_s2_token_and_basin_to_workspace_env_once() -> eyre::Result<()> {
-        let sync_root =
-            std::env::temp_dir().join(format!("ob-env-persist-test-{}", rand::random::<u64>()));
-        std::fs::create_dir(&sync_root)?;
-        std::fs::create_dir(metadata_dir(&sync_root))?;
-
-        let basin: BasinName = "test-basin".parse()?;
-        let connection = S2ConnectionConfig {
-            access_token: "tok-123".to_string(),
-            account_endpoint: Some("account.s2.test".to_string()),
-            basin_endpoint: Some("{basin}.s2.test".to_string()),
-        };
-
-        let persisted = persist_s2_env(&sync_root, &basin, &connection)?;
-        assert!(persisted.contains(&"S2_ACCESS_TOKEN".to_string()));
-        assert!(persisted.contains(&"S2_BASIN".to_string()));
-        assert!(!persisted.contains(&"S2_ACCOUNT_ENDPOINT".to_string()));
-        assert!(!persisted.contains(&"S2_BASIN_ENDPOINT".to_string()));
-        let body = std::fs::read_to_string(workspace_env_path(&sync_root))?;
-        assert!(body.contains("S2_ACCESS_TOKEN=tok-123"));
-        assert!(body.contains("S2_BASIN=test-basin"));
-        assert!(!body.contains("S2_ACCOUNT_ENDPOINT"));
-        assert!(!body.contains("S2_BASIN_ENDPOINT"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(workspace_env_path(&sync_root))?
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600, "env file must not be world-readable");
-        }
-
-        // A second run must not clobber the existing file.
-        let connection = S2ConnectionConfig {
-            access_token: "tok-456".to_string(),
-            account_endpoint: None,
-            basin_endpoint: None,
-        };
-        assert!(persist_s2_env(&sync_root, &basin, &connection)?.is_empty());
-        let body = std::fs::read_to_string(workspace_env_path(&sync_root))?;
-        assert!(body.contains("tok-123"));
-
-        let _ = std::fs::remove_dir_all(&sync_root);
-        Ok(())
-    }
 
     #[test]
     fn fresh_daemon_state_pins_complete_endpoint_pair() -> eyre::Result<()> {
