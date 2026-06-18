@@ -3,9 +3,10 @@ use crate::fs::types::{
     ExpectedBefore, FileFingerprint, GuardedDeleteResult, GuardedReadResult, GuardedWriteResult,
     RelativePath, ScanResult, TreeEntry,
 };
+use crate::log::types::SequenceNumber;
 use crate::types::{OutboxId, SharedMessageBatch};
 use bytes::Bytes;
-use std::ops::RangeToInclusive;
+use std::ops::{RangeTo, RangeToInclusive};
 use tokio::sync::oneshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -226,11 +227,21 @@ pub enum SemanticRequest {
         reply: oneshot::Sender<eyre::Result<Vec<(OutboxId, SharedMessage)>>>,
     },
 
+    /// Release all reserved outbox rows that were not durably acknowledged.
+    ReleaseOutbox {
+        reply: oneshot::Sender<eyre::Result<u64>>,
+    },
+
     /// Notify semantic state that it is safe to trim messages from the head of the outbox.
     ///
     /// This is safe only after engine has appended, and witnessed acknowledgements,
     /// the associated messages to the shared log.
     TrimOutbox { through: RangeToInclusive<OutboxId> },
+
+    /// Read the applied shared-log cursor from semantic state.
+    ReadStableCursor {
+        reply: oneshot::Sender<eyre::Result<RangeTo<SequenceNumber>>>,
+    },
 
     /// Apply shared log messages to stable semantic state.
     ApplySharedMessageBatch {

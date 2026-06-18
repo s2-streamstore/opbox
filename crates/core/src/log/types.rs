@@ -14,6 +14,7 @@ pub enum LogReadStop {
 
 pub enum LogReaderRequest {
     Status,
+    Reconnect { start_at: SequenceNumber },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +33,8 @@ pub struct SharedMessageEnvelope {
 
 #[derive(Debug)]
 pub enum LogReaderEvent {
+    Connected,
+    Disconnected { reason: String },
     Status { tail: RangeTo<SequenceNumber> },
     Read(SharedMessageEnvelope),
     Ended { cursor: RangeTo<SequenceNumber> },
@@ -39,6 +42,7 @@ pub enum LogReaderEvent {
 
 pub enum LogWriterRequest {
     Status,
+    Reconnect,
     Append {
         outbox_id: OutboxId,
         shared_message: SharedMessage,
@@ -46,6 +50,10 @@ pub enum LogWriterRequest {
 }
 
 pub enum LogWriterResponse {
+    Connected,
+    Disconnected {
+        reason: String,
+    },
     Ping,
     Durable {
         outbox_range: RangeToInclusive<OutboxId>,

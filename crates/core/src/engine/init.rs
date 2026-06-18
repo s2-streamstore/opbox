@@ -185,6 +185,10 @@ async fn await_durable_through(
             .await
             .ok_or_else(|| eyre!("log writer stopped while init waited for durable append"))?
         {
+            LogWriterResponse::Connected => {}
+            LogWriterResponse::Disconnected { reason } => {
+                eyre::bail!("log writer disconnected during init: {reason}");
+            }
             LogWriterResponse::Ping => {}
             LogWriterResponse::Durable { outbox_range } if outbox_range.end >= target => {
                 return Ok(outbox_range.end);

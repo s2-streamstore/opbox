@@ -1140,6 +1140,33 @@ impl<'a> SemanticTransaction<'a> {
         Ok(())
     }
 
+    pub async fn release_outbox_messages(&self) -> Result<u64, SemanticTransactionError> {
+        let released = self
+            .conn
+            .execute("UPDATE outbox SET inflight = 0 WHERE inflight = 1", ())
+            .await?;
+        Ok(released)
+    }
+
+    #[cfg(feature = "sim")]
+    pub async fn count_outbox_inflight(&self) -> Result<u64, SemanticTransactionError> {
+        let mut rows = self
+            .conn
+            .query("SELECT COUNT(*) FROM outbox WHERE inflight = 1", ())
+            .await?;
+        let row = rows.next().await?.ok_or_else(|| {
+            SemanticTransactionError::InvariantViolation(
+                "missing outbox inflight count row".to_string(),
+            )
+        })?;
+        let count = u64::try_from(row.get::<i64>(0)?).map_err(|err| {
+            SemanticTransactionError::InvariantViolation(format!(
+                "outbox inflight count out of range: {err}"
+            ))
+        })?;
+        Ok(count)
+    }
+
     pub async fn select_import_staged_files(
         &self,
         epoch: ImportEpoch,

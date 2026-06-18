@@ -1,5 +1,6 @@
 use crate::crdt::types::SharedMessage;
 use crate::fs::types::ScanResult;
+use crate::log::types::SequenceNumber;
 use crate::semantic::types::{
     ImportActionResult, ImportEpoch, NextWork, ProjectionActionResult, ProjectionEpoch,
     ProjectionEpochEndReason, SemanticRequest,
@@ -8,7 +9,7 @@ use crate::types::{OutboxId, SharedMessageBatch};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use std::ops::RangeToInclusive;
+use std::ops::{RangeTo, RangeToInclusive};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tracing::instrument;
@@ -26,6 +27,8 @@ pub enum SemanticClientResponse {
     },
     ApplySharedMessageBatch(eyre::Result<()>),
     ReadOutbox(eyre::Result<Vec<(OutboxId, SharedMessage)>>),
+    ReleaseOutbox(eyre::Result<u64>),
+    ReadStableCursor(eyre::Result<RangeTo<SequenceNumber>>),
 }
 
 pub struct SemanticClient {
@@ -164,6 +167,20 @@ impl SemanticClient {
         )?;
         self.in_flight_read_outbox = true;
         Ok(())
+    }
+
+    pub fn release_outbox(&mut self) -> eyre::Result<()> {
+        self.enqueue(
+            |reply| SemanticRequest::ReleaseOutbox { reply },
+            SemanticClientResponse::ReleaseOutbox,
+        )
+    }
+
+    pub fn read_stable_cursor(&mut self) -> eyre::Result<()> {
+        self.enqueue(
+            |reply| SemanticRequest::ReadStableCursor { reply },
+            SemanticClientResponse::ReadStableCursor,
+        )
     }
 
     pub fn can_accept_apply_shared_message_batch(&self) -> bool {

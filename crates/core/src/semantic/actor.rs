@@ -221,6 +221,20 @@ impl SemanticActor {
                     }
                 }));
             }
+            SemanticRequest::ReleaseOutbox { reply } => {
+                let op_id = self.next_op_id();
+                self.pending_ops.insert(
+                    op_id,
+                    PendingSemanticOp::new(PendingSemanticOpKind::ReleaseOutbox { reply }),
+                );
+                let service = self.service.clone();
+                self.running_ops.push(Box::pin(async move {
+                    SemanticTaskResult::ReleaseOutbox {
+                        op_id,
+                        result: service.release_outbox().await,
+                    }
+                }));
+            }
             SemanticRequest::TrimOutbox { through } => {
                 let op_id = self.next_op_id();
                 self.pending_ops.insert(
@@ -232,6 +246,20 @@ impl SemanticActor {
                     SemanticTaskResult::TrimOutbox {
                         op_id,
                         result: service.trim_outbox(through).await,
+                    }
+                }));
+            }
+            SemanticRequest::ReadStableCursor { reply } => {
+                let op_id = self.next_op_id();
+                self.pending_ops.insert(
+                    op_id,
+                    PendingSemanticOp::new(PendingSemanticOpKind::ReadStableCursor { reply }),
+                );
+                let service = self.service.clone();
+                self.running_ops.push(Box::pin(async move {
+                    SemanticTaskResult::ReadStableCursor {
+                        op_id,
+                        result: service.read_stable_cursor().await,
                     }
                 }));
             }
@@ -342,8 +370,20 @@ impl SemanticActor {
             ) => {
                 let _ = reply.send(result);
             }
+            (
+                SemanticTaskResult::ReleaseOutbox { result, .. },
+                PendingSemanticOpKind::ReleaseOutbox { reply },
+            ) => {
+                let _ = reply.send(result);
+            }
             (SemanticTaskResult::TrimOutbox { result, .. }, PendingSemanticOpKind::TrimOutbox) => {
                 result?;
+            }
+            (
+                SemanticTaskResult::ReadStableCursor { result, .. },
+                PendingSemanticOpKind::ReadStableCursor { reply },
+            ) => {
+                let _ = reply.send(result);
             }
             (result, pending) => {
                 return Err(eyre!(
@@ -917,8 +957,16 @@ enum PendingSemanticOpKind {
             eyre::Result<Vec<(crate::types::OutboxId, crate::crdt::types::SharedMessage)>>,
         >,
     },
+    #[strum(serialize = "release_outbox")]
+    ReleaseOutbox {
+        reply: oneshot::Sender<eyre::Result<u64>>,
+    },
     #[strum(serialize = "trim_outbox")]
     TrimOutbox,
+    #[strum(serialize = "read_stable_cursor")]
+    ReadStableCursor {
+        reply: oneshot::Sender<eyre::Result<std::ops::RangeTo<crate::log::types::SequenceNumber>>>,
+    },
     #[strum(serialize = "apply_shared_message_batch")]
     ApplySharedMessageBatch {
         reply: oneshot::Sender<eyre::Result<()>>,
@@ -972,10 +1020,20 @@ enum SemanticTaskResult {
         op_id: SemanticOpId,
         result: eyre::Result<Vec<(crate::types::OutboxId, crate::crdt::types::SharedMessage)>>,
     },
+    #[strum(serialize = "release_outbox")]
+    ReleaseOutbox {
+        op_id: SemanticOpId,
+        result: eyre::Result<u64>,
+    },
     #[strum(serialize = "trim_outbox")]
     TrimOutbox {
         op_id: SemanticOpId,
         result: eyre::Result<()>,
+    },
+    #[strum(serialize = "read_stable_cursor")]
+    ReadStableCursor {
+        op_id: SemanticOpId,
+        result: eyre::Result<std::ops::RangeTo<crate::log::types::SequenceNumber>>,
     },
 }
 
@@ -990,8 +1048,10 @@ impl SemanticTaskResult {
             | Self::CommitProjectionEpoch { op_id, .. }
             | Self::GetNextWork { op_id, .. }
             | Self::ReadOutbox { op_id, .. }
+            | Self::ReleaseOutbox { op_id, .. }
             | Self::ApplySharedMessageBatch { op_id, .. }
-            | Self::TrimOutbox { op_id, .. } => *op_id,
+            | Self::TrimOutbox { op_id, .. }
+            | Self::ReadStableCursor { op_id, .. } => *op_id,
         }
     }
 

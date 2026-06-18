@@ -46,3 +46,55 @@ jobs:
 
       - name: Run trace-level meta test
         run: cargo run --locked -p opbox-sim -- meta same-file-split-edits --seed 1 --max-steps 500 --child-proc-log-level trace
+
+  s2-smoke:
+    name: S2.dev CLI Smoke
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUST_BACKTRACE: "1"
+      S2_ACCESS_TOKEN: ${{ secrets.S2_ACCESS_TOKEN }}
+      S2_BASIN: ${{ secrets.S2_BASIN }}
+
+    steps:
+      - name: Check S2 smoke secrets
+        id: smoke-secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${S2_ACCESS_TOKEN}" && -n "${S2_BASIN}" ]]; then
+            echo "available=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "available=false" >> "${GITHUB_OUTPUT}"
+            echo "S2_ACCESS_TOKEN and S2_BASIN secrets are required; skipping S2 smoke."
+          fi
+
+      - name: Checkout
+        if: steps.smoke-secrets.outputs.available == 'true'
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        if: steps.smoke-secrets.outputs.available == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install ob debug binaries
+        if: steps.smoke-secrets.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          install_root="${RUNNER_TEMP}/opbox-install"
+          target_dir="${RUNNER_TEMP}/opbox-target"
+          cargo install --locked --debug --path crates/client --root "${install_root}" --target-dir "${target_dir}"
+          cargo install --locked --debug --path crates/daemon --root "${install_root}" --target-dir "${target_dir}"
+          echo "${install_root}/bin" >> "${GITHUB_PATH}"
+
+      - name: Init, write, clone, verify
+        if: steps.smoke-secrets.outputs.available == 'true'
+        shell: bash
+        env:
+          OPBOX_CONFIG_DIR: ${{ runner.temp }}/opbox-config
+          OPBOX_SMOKE_ROOT: ${{ runner.temp }}/opbox-s2-smoke
+        run: bash scripts/s2-smoke.sh

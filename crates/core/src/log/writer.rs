@@ -1,3 +1,4 @@
+use crate::app::s2::s2_error_is_connectivity;
 use crate::log::codec;
 use crate::log::codec::{ObjectPointer, S2Package};
 use crate::log::types::{LogWriterRequest, LogWriterResponse, SharedMessageOrigin};
@@ -19,6 +20,29 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
+
+enum WriterRunError {
+    Disconnected(String),
+    Fatal(eyre::Report),
+}
+
+impl WriterRunError {
+    fn from_s2(error: S2Error) -> Self {
+        if s2_error_is_connectivity(&error) {
+            Self::Disconnected(error.to_string())
+        } else {
+            Self::Fatal(error.into())
+        }
+    }
+
+    fn fatal(error: impl Into<eyre::Report>) -> Self {
+        Self::Fatal(error.into())
+    }
+}
+
+enum WriterRunOutcome {
+    Cancelled,
+}
 
 pub struct LogWriterActor {
     basin: S2Basin,
@@ -57,66 +81,123 @@ impl LogWriterActor {
     }
 
     /// Return the now unblocked pointer record when completed.
-    pub async fn upload_parts(
+    async fn upload_parts(
         s2: S2Basin,
         workspace_id: WorkspaceId,
         outbox_id: OutboxId,
         pointer_record: AppendRecord,
         pointer: ObjectPointer,
         parts: Vec<AppendRecord>,
-    ) -> eyre::Result<(OutboxId, AppendRecord)> {
-        let stream_name = pointer.stream_name(workspace_id)?;
-        Self::ensure_stream_exists(&s2, stream_name.clone()).await?;
+    ) -> Result<(OutboxId, AppendRecord), WriterRunError> {
+        let stream_name = pointer
+            .stream_name(workspace_id)
+            .map_err(WriterRunError::fatal)?;
+        Self::ensure_stream_exists(&s2, stream_name.clone())
+            .await
+            .map_err(WriterRunError::from_s2)?;
         let stream = s2.stream(stream_name);
 
         let session = stream.append_session(AppendSessionConfig::new());
         let mut set = JoinSet::new();
 
         for (idx, part) in parts.into_iter().enumerate() {
-            let batch = AppendRecordBatch::try_from_iter([part])?;
+            let batch = AppendRecordBatch::try_from_iter([part]).map_err(WriterRunError::fatal)?;
             let input = AppendInput::new(batch).with_match_seq_num(idx as u64);
-            let ticket = session.submit(input).await?;
+            let ticket = session
+                .submit(input)
+                .await
+                .map_err(WriterRunError::from_s2)?;
             set.spawn(ticket);
         }
 
         set.join_all()
             .await
             .into_iter()
-            .collect::<Result<Vec<AppendAck>, S2Error>>()?;
+            .collect::<Result<Vec<AppendAck>, S2Error>>()
+            .map_err(WriterRunError::from_s2)?;
 
         Ok((outbox_id, pointer_record))
     }
 
     pub async fn run(mut self, token: CancellationToken) -> eyre::Result<()> {
+        loop {
+            match self.run_connected(&token).await {
+                Ok(WriterRunOutcome::Cancelled) => return Ok(()),
+                Err(WriterRunError::Disconnected(reason)) => {
+                    self.resp_tx
+                        .send(LogWriterResponse::Disconnected { reason })?;
+                    if !self.wait_for_reconnect(&token).await? {
+                        return Ok(());
+                    }
+                }
+                Err(WriterRunError::Fatal(error)) => return Err(error),
+            }
+        }
+    }
+
+    async fn wait_for_reconnect(&mut self, token: &CancellationToken) -> eyre::Result<bool> {
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    debug!("cancelled");
+                    return Ok(false);
+                }
+                req = self.req_rx.recv() => {
+                    match req {
+                        Some(LogWriterRequest::Reconnect) => return Ok(true),
+                        Some(LogWriterRequest::Status) => {
+                            self.resp_tx.send(LogWriterResponse::Ping)?;
+                        }
+                        Some(LogWriterRequest::Append { .. }) => {}
+                        None => return Err(eyre::eyre!("log writer request channel closed")),
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_connected(
+        &mut self,
+        token: &CancellationToken,
+    ) -> Result<WriterRunOutcome, WriterRunError> {
         let mut big_upload = None;
-        let main_stream_name = StreamName::from_str(&format!("{}/ops", self.workspace.0.as_str()))?;
-        Self::ensure_stream_exists(&self.basin, main_stream_name.clone()).await?;
+        let main_stream_name = StreamName::from_str(&format!("{}/ops", self.workspace.0.as_str()))
+            .map_err(WriterRunError::fatal)?;
+        Self::ensure_stream_exists(&self.basin, main_stream_name.clone())
+            .await
+            .map_err(WriterRunError::from_s2)?;
 
         let stream = self.basin.stream(main_stream_name);
         let producer = stream.producer(
             ProducerConfig::new()
-                .with_max_unacked_bytes(1024 * 1024 * 100)?
+                .with_max_unacked_bytes(1024 * 1024 * 100)
+                .map_err(WriterRunError::fatal)?
                 .with_batching(BatchingConfig::new().with_linger(Duration::from_millis(5))),
         );
+        self.resp_tx
+            .send(LogWriterResponse::Connected)
+            .map_err(WriterRunError::fatal)?;
 
         let mut inflight = 0;
         let mut next_expected_outbox_id: Option<OutboxId> = None;
-        let mut pending_appends = FuturesOrdered::new();
+        let mut pending_appends: FuturesOrdered<
+            BoxFuture<'static, (OutboxId, Result<IndexedAppendAck, S2Error>)>,
+        > = FuturesOrdered::new();
 
         loop {
             tokio::select! {
                 _ = token.cancelled() => {
                     debug!("cancelled");
 
-                    return Ok(());
+                    return Ok(WriterRunOutcome::Cancelled);
                 }
 
                 Some((outbox_id, res)) = pending_appends.next(), if !pending_appends.is_empty() => {
                     inflight -= 1;
-                    let _res = res?;
+                    let _res = res.map_err(WriterRunError::from_s2)?;
                     self.resp_tx.send(LogWriterResponse::Durable {
                         outbox_range: ..=outbox_id
-                    })?;
+                    }).map_err(WriterRunError::fatal)?;
                 }
 
                 res = async {
@@ -134,22 +215,28 @@ impl LogWriterActor {
                         Ok(Ok((outbox_id, pointer_record))) => {
                             // TODO: append the pointer record now that all parts are durable.
                             inflight += 1;
-                            let ticket = producer.submit(pointer_record).await?;
-                            let f: BoxFuture<'static, (OutboxId, eyre::Result<IndexedAppendAck>)> = Box::pin(async move {
-                                (outbox_id, ticket.await.map_err(Into::into))
+                            let ticket = producer
+                                .submit(pointer_record)
+                                .await
+                                .map_err(WriterRunError::from_s2)?;
+                            let f: BoxFuture<'static, (OutboxId, Result<IndexedAppendAck, S2Error>)> = Box::pin(async move {
+                                (outbox_id, ticket.await)
                             });
                             pending_appends.push_back(f);
                         }
                         Ok(Err(err)) => return Err(err),
-                        Err(join_err) => return Err(eyre::Report::new(join_err)),
+                        Err(join_err) => return Err(WriterRunError::fatal(eyre::Report::new(join_err))),
                     }
                 }
 
                 Some(req) = self.req_rx.recv(), if big_upload.is_none() && inflight < 1024 * 1024 => {
                     match req {
                         LogWriterRequest::Status => {
-
+                            self.resp_tx
+                                .send(LogWriterResponse::Ping)
+                                .map_err(WriterRunError::fatal)?;
                         },
+                        LogWriterRequest::Reconnect => {},
                         // only if big upload not in prog
                         LogWriterRequest::Append { outbox_id, shared_message } => {
                             if let Some(expected) = next_expected_outbox_id {
@@ -169,12 +256,16 @@ impl LogWriterActor {
                                 daemon_writer_id: self.daemon_writer_id.clone(),
                                 outbox_id,
                             };
-                            match codec::shared_to_s2_package(shared_message, &origin)? {
+                            match codec::shared_to_s2_package(shared_message, &origin)
+                                .map_err(WriterRunError::fatal)? {
                                 S2Package::Inlined{ record } => {
                                     inflight += 1;
-                                    let ticket = producer.submit(record).await?;
-                                    let f: BoxFuture<'static, (OutboxId, eyre::Result<IndexedAppendAck>)> = Box::pin(async move {
-                                        (outbox_id, ticket.await.map_err(Into::into))
+                                    let ticket = producer
+                                        .submit(record)
+                                        .await
+                                        .map_err(WriterRunError::from_s2)?;
+                                    let f: BoxFuture<'static, (OutboxId, Result<IndexedAppendAck, S2Error>)> = Box::pin(async move {
+                                        (outbox_id, ticket.await)
                                     });
                                     pending_appends.push_back(f);
                                 }
@@ -198,7 +289,7 @@ impl LogWriterActor {
                 }
 
                 else => {
-                    return Err(eyre::eyre!("log writer exiting"));
+                    return Err(WriterRunError::fatal(eyre::eyre!("log writer exiting")));
                 }
             }
         }

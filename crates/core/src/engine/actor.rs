@@ -1,4 +1,5 @@
 use super::shared_message_buffer::SharedMessageBuffer;
+use crate::app::connectivity::{ConnectivityRole, ConnectivitySnapshot, LinkStatus};
 use crate::fs::client::{FsClient, FsClientResponse};
 use crate::fs::types::{GuardedWriteResult, RelativePath, ScanScope};
 use crate::log::types::{LogReaderEvent, LogReaderRequest, LogWriterRequest, LogWriterResponse};
@@ -15,20 +16,120 @@ use eyre::eyre;
 use std::collections::{BTreeSet, VecDeque};
 use std::pin::Pin;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use time::OffsetDateTime;
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
 use tokio_muxt::{CoalesceMode, MuxTimer};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 const MAX_SHARED_MESSAGE_BUFFER_MS: Duration = Duration::from_millis(10);
 const FULL_SCAN_INTERVAL: Duration = Duration::from_millis(120000);
 const READ_OUTBOX_BATCH_SIZE: u64 = 1024;
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Ordinalize, Debug, Clone, Copy, PartialEq, Eq)]
 enum TimerEvent {
     SharedMessageBufferDrain,
     FullScan,
+    ReaderReconnect,
+    WriterReconnect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkRuntimeState {
+    Online,
+    Reconnecting,
+    Offline,
+}
+
+#[derive(Debug, Clone)]
+struct LinkRuntime {
+    state: LinkRuntimeState,
+    last_error: Option<String>,
+    retry_at: Option<Instant>,
+    retry_at_wall: Option<OffsetDateTime>,
+}
+
+impl LinkRuntime {
+    fn reconnecting() -> Self {
+        Self {
+            state: LinkRuntimeState::Reconnecting,
+            last_error: None,
+            retry_at: None,
+            retry_at_wall: None,
+        }
+    }
+
+    fn online(&mut self) {
+        self.state = LinkRuntimeState::Online;
+        self.last_error = None;
+        self.retry_at = None;
+        self.retry_at_wall = None;
+    }
+
+    fn offline(&mut self, reason: String, retry_at: Instant, retry_at_wall: OffsetDateTime) {
+        self.state = LinkRuntimeState::Offline;
+        self.last_error = Some(reason);
+        self.retry_at = Some(retry_at);
+        self.retry_at_wall = Some(retry_at_wall);
+    }
+
+    fn reconnect(&mut self) {
+        self.state = LinkRuntimeState::Reconnecting;
+        self.retry_at = None;
+        self.retry_at_wall = None;
+    }
+
+    fn is_online(&self) -> bool {
+        self.state == LinkRuntimeState::Online
+    }
+
+    fn status(&self) -> LinkStatus {
+        match self.state {
+            LinkRuntimeState::Online => LinkStatus::online(),
+            LinkRuntimeState::Reconnecting => LinkStatus::reconnecting(self.last_error.clone()),
+            LinkRuntimeState::Offline => LinkStatus::offline(
+                self.last_error
+                    .clone()
+                    .unwrap_or_else(|| "connection failed".to_string()),
+                self.retry_at_wall.unwrap_or_else(OffsetDateTime::now_utc),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EngineConnectivity {
+    reader: LinkRuntime,
+    writer: LinkRuntime,
+}
+
+impl EngineConnectivity {
+    fn new() -> Self {
+        Self {
+            reader: LinkRuntime::reconnecting(),
+            writer: LinkRuntime::reconnecting(),
+        }
+    }
+
+    fn link(&self, role: ConnectivityRole) -> &LinkRuntime {
+        match role {
+            ConnectivityRole::Reader => &self.reader,
+            ConnectivityRole::Writer => &self.writer,
+        }
+    }
+
+    fn link_mut(&mut self, role: ConnectivityRole) -> &mut LinkRuntime {
+        match role {
+            ConnectivityRole::Reader => &mut self.reader,
+            ConnectivityRole::Writer => &mut self.writer,
+        }
+    }
+
+    fn snapshot(&self) -> ConnectivitySnapshot {
+        ConnectivitySnapshot::from_links(self.reader.status(), self.writer.status())
+    }
 }
 
 fn coalesce_scan_scopes(left: ScanScope, right: ScanScope) -> ScanScope {
@@ -148,6 +249,7 @@ pub struct Engine {
     semantic_event_rx: mpsc::UnboundedReceiver<SemanticEvent>,
     command_rx: mpsc::UnboundedReceiver<EngineCommand>,
     spy_tx: Option<broadcast::Sender<SpyEvent>>,
+    connectivity_status_tx: Option<watch::Sender<ConnectivitySnapshot>>,
 
     phase: EnginePhase,
     /// Daemon-owned temp files left by failed guarded writes. These are GC-only:
@@ -162,6 +264,10 @@ pub struct Engine {
     /// in flight so batches are handed to LogWriter in outbox-id order.
     outbox_read_in_flight: bool,
     outbox_read_requested: bool,
+    outbox_release_in_flight: bool,
+    outbox_release_requested: bool,
+    reader_reconnect_cursor_in_flight: bool,
+    connectivity: EngineConnectivity,
 
     /// Monotone source for `BoundarySeq` stamps. `GetNextWork` reserves
     /// projection epochs in Semantic, so it is single-flight by construction:
@@ -183,6 +289,7 @@ pub struct EngineEvents {
     pub semantic: mpsc::UnboundedReceiver<SemanticEvent>,
     pub commands: mpsc::UnboundedReceiver<EngineCommand>,
     pub spy: Option<broadcast::Sender<SpyEvent>>,
+    pub connectivity_status: Option<watch::Sender<ConnectivitySnapshot>>,
 }
 
 pub struct EngineConfig {
@@ -204,11 +311,16 @@ impl Engine {
             semantic_event_rx: events.semantic,
             command_rx: events.commands,
             spy_tx: events.spy,
+            connectivity_status_tx: events.connectivity_status,
             phase: EnginePhase::Idle,
             cleanup_queue: VecDeque::new(),
             shared_message_buffer: SharedMessageBuffer::new(MAX_SHARED_MESSAGE_BUFFER_MS),
             outbox_read_in_flight: false,
             outbox_read_requested: false,
+            outbox_release_in_flight: false,
+            outbox_release_requested: false,
+            reader_reconnect_cursor_in_flight: false,
+            connectivity: EngineConnectivity::new(),
             next_boundary: 0,
             pending_scan_scope: None,
         }
@@ -229,6 +341,74 @@ impl Engine {
         event: TimerEvent,
     ) {
         (*timer).as_mut().cancel(event as usize);
+    }
+
+    fn publish_connectivity_status(&self) {
+        if let Some(tx) = &self.connectivity_status_tx {
+            let _ = tx.send(self.connectivity.snapshot());
+        }
+    }
+
+    fn mark_link_online(&mut self, role: ConnectivityRole) {
+        let link = self.connectivity.link(role);
+        let previous_state = link.state;
+        let previous_error = link.last_error.clone();
+
+        self.connectivity.link_mut(role).online();
+        if previous_error.is_some() || matches!(previous_state, LinkRuntimeState::Offline) {
+            info!(
+                role = role.as_str(),
+                ?previous_state,
+                last_error = previous_error.as_deref(),
+                "shared log link resumed online"
+            );
+        } else {
+            debug!(role = role.as_str(), "shared log link online");
+        }
+        self.publish_connectivity_status();
+    }
+
+    fn mark_link_disconnected(
+        &mut self,
+        role: ConnectivityRole,
+        reason: String,
+        timer: &mut Pin<&mut MuxTimer<{ TimerEvent::VARIANT_COUNT }>>,
+    ) -> eyre::Result<()> {
+        let retry_at = Instant::now() + RECONNECT_INTERVAL;
+        let retry_at_wall = OffsetDateTime::now_utc()
+            + time::Duration::try_from(RECONNECT_INTERVAL)
+                .expect("reconnect interval fits time::Duration");
+        self.connectivity
+            .link_mut(role)
+            .offline(reason.clone(), retry_at, retry_at_wall);
+        warn!(
+            role = role.as_str(),
+            %reason,
+            retry_in_ms = RECONNECT_INTERVAL.as_millis(),
+            "shared log link offline"
+        );
+        let event = match role {
+            ConnectivityRole::Reader => TimerEvent::ReaderReconnect,
+            ConnectivityRole::Writer => TimerEvent::WriterReconnect,
+        };
+        Self::coalescing_arm_at(timer, event, retry_at);
+        self.publish_connectivity_status();
+
+        if role == ConnectivityRole::Writer {
+            self.outbox_read_requested = true;
+            self.request_outbox_release()?;
+        }
+        Ok(())
+    }
+
+    fn mark_link_reconnecting(&mut self, role: ConnectivityRole) {
+        self.connectivity.link_mut(role).reconnect();
+        debug!(role = role.as_str(), "shared log link reconnecting");
+        self.publish_connectivity_status();
+    }
+
+    fn link_is_online(&self, role: ConnectivityRole) -> bool {
+        self.connectivity.link(role).is_online()
     }
 
     fn set_phase(&mut self, phase: EnginePhase) {
@@ -380,10 +560,30 @@ impl Engine {
     }
 
     fn maybe_start_outbox_read(&mut self) -> eyre::Result<()> {
-        if self.outbox_read_requested && !self.outbox_read_in_flight {
+        if self.outbox_read_requested
+            && !self.outbox_read_in_flight
+            && !self.outbox_release_in_flight
+            && !self.outbox_release_requested
+            && self.link_is_online(ConnectivityRole::Writer)
+        {
             self.semantic_client.read_outbox(READ_OUTBOX_BATCH_SIZE)?;
             self.outbox_read_requested = false;
             self.outbox_read_in_flight = true;
+        }
+
+        Ok(())
+    }
+
+    fn request_outbox_release(&mut self) -> eyre::Result<()> {
+        self.outbox_release_requested = true;
+        self.maybe_start_outbox_release()
+    }
+
+    fn maybe_start_outbox_release(&mut self) -> eyre::Result<()> {
+        if self.outbox_release_requested && !self.outbox_release_in_flight {
+            self.semantic_client.release_outbox()?;
+            self.outbox_release_requested = false;
+            self.outbox_release_in_flight = true;
         }
 
         Ok(())
@@ -587,6 +787,7 @@ impl Engine {
         let timer = MuxTimer::<{ TimerEvent::VARIANT_COUNT }>::default();
         tokio::pin!(timer);
 
+        self.publish_connectivity_status();
         self.request_scan(ScanScope::Full)?;
         self.request_outbox_read()?;
         Self::coalescing_arm_at(
@@ -627,12 +828,37 @@ impl Engine {
                                 Instant::now() + FULL_SCAN_INTERVAL,
                             );
                         }
+                        TimerEvent::ReaderReconnect => {
+                            if matches!(
+                                self.connectivity.link(ConnectivityRole::Reader).state,
+                                LinkRuntimeState::Offline
+                            ) && !self.reader_reconnect_cursor_in_flight {
+                                self.mark_link_reconnecting(ConnectivityRole::Reader);
+                                self.semantic_client.read_stable_cursor()?;
+                                self.reader_reconnect_cursor_in_flight = true;
+                            }
+                        }
+                        TimerEvent::WriterReconnect => {
+                            if matches!(
+                                self.connectivity.link(ConnectivityRole::Writer).state,
+                                LinkRuntimeState::Offline
+                            ) {
+                                self.mark_link_reconnecting(ConnectivityRole::Writer);
+                                self.log_writer_tx.send(LogWriterRequest::Reconnect)?;
+                            }
+                        }
                     }
                 }
 
                 Some(reader_event) = self.log_reader_rx.recv(), if self.shared_message_buffer.has_capacity() => {
                     trace!(?reader_event);
                     match reader_event {
+                        LogReaderEvent::Connected => {
+                            self.mark_link_online(ConnectivityRole::Reader);
+                        }
+                        LogReaderEvent::Disconnected { reason } => {
+                            self.mark_link_disconnected(ConnectivityRole::Reader, reason, &mut timer)?;
+                        }
                         LogReaderEvent::Status{ .. } => {}
                         LogReaderEvent::Read(envelope) => {
                             if let Some(spy_tx) = &self.spy_tx {
@@ -657,6 +883,13 @@ impl Engine {
 
                 Some(writer_event) = self.log_writer_rx.recv() => {
                     match writer_event {
+                        LogWriterResponse::Connected => {
+                            self.mark_link_online(ConnectivityRole::Writer);
+                            self.maybe_start_outbox_read()?;
+                        }
+                        LogWriterResponse::Disconnected { reason } => {
+                            self.mark_link_disconnected(ConnectivityRole::Writer, reason, &mut timer)?;
+                        }
                         LogWriterResponse::Ping => {},
                         LogWriterResponse::Durable{ outbox_range } => {
                             self.semantic_client.trim_outbox(outbox_range)?;
@@ -721,16 +954,47 @@ impl Engine {
                             self.outbox_read_in_flight = false;
                             let messages = result?;
                             let read_any = !messages.is_empty();
-                            for (outbox_id, shared_message) in messages {
-                                self.log_writer_tx.send(LogWriterRequest::Append {
-                                    outbox_id,
-                                    shared_message,
-                                })?;
+                            if self.link_is_online(ConnectivityRole::Writer) {
+                                for (outbox_id, shared_message) in messages {
+                                    self.log_writer_tx.send(LogWriterRequest::Append {
+                                        outbox_id,
+                                        shared_message,
+                                    })?;
+                                }
+                            } else if read_any {
+                                self.request_outbox_release()?;
                             }
                             if read_any {
                                 self.outbox_read_requested = true;
                             }
                             self.maybe_start_outbox_read()?;
+                        }
+                        SemanticClientResponse::ReleaseOutbox(result) => {
+                            assert!(
+                                self.outbox_release_in_flight,
+                                "release-outbox response without an in-flight release"
+                            );
+                            self.outbox_release_in_flight = false;
+                            let released = result?;
+                            debug!(released, "released outbox reservations");
+                            self.maybe_start_outbox_release()?;
+                            self.maybe_start_outbox_read()?;
+                        }
+                        SemanticClientResponse::ReadStableCursor(result) => {
+                            assert!(
+                                self.reader_reconnect_cursor_in_flight,
+                                "read-stable-cursor response without an in-flight reader reconnect"
+                            );
+                            self.reader_reconnect_cursor_in_flight = false;
+                            let cursor = result?;
+                            if matches!(
+                                self.connectivity.link(ConnectivityRole::Reader).state,
+                                LinkRuntimeState::Reconnecting
+                            ) {
+                                self.log_reader_tx.send(LogReaderRequest::Reconnect {
+                                    start_at: cursor.end,
+                                })?;
+                            }
                         }
                     }
                 }

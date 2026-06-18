@@ -1,3 +1,4 @@
+use crate::app::connectivity::ConnectivitySnapshot;
 use crate::engine::actor::{Engine, EngineClients, EngineConfig, EngineEvents};
 use crate::engine::clone as engine_clone;
 use crate::engine::init as engine_init;
@@ -15,7 +16,7 @@ use crate::semantic::service::SemanticService;
 use crate::semantic::table::daemon_state;
 use crate::spy::SpyEvent;
 use s2_sdk::S2Basin;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
@@ -41,6 +42,7 @@ pub struct AppRuntimeConfig<IO, NIO = ()> {
     pub s2_basin: S2Basin,
     pub clone_log_read_stop: Option<LogReadStop>,
     pub spy_tx: Option<broadcast::Sender<SpyEvent>>,
+    pub connectivity_status_tx: Option<watch::Sender<ConnectivitySnapshot>>,
 }
 
 pub struct AppRuntime<IO, NIO = ()> {
@@ -66,6 +68,7 @@ where
             s2_basin,
             clone_log_read_stop,
             spy_tx,
+            connectivity_status_tx,
         } = self.config;
 
         let (semantic_request_tx, semantic_request_rx) = mpsc::unbounded_channel();
@@ -78,16 +81,6 @@ where
         let fs_client = FsClient::new(fs_request_tx);
         let fs_actor = FsActor::new(file_io, fs_request_rx);
 
-        let (log_writer_req_tx, log_writer_req_rx) = mpsc::unbounded_channel();
-        let (log_writer_resp_tx, log_writer_resp_rx) = mpsc::unbounded_channel();
-        let log_writer = LogWriterActor::new(
-            s2_basin.clone(),
-            daemon_row.workspace_id.clone(),
-            daemon_row.daemon_writer_id.clone(),
-            log_writer_req_rx,
-            log_writer_resp_tx,
-        );
-
         let mut actors = JoinSet::<ActorResult>::new();
 
         actors.spawn({
@@ -98,13 +91,22 @@ where
             let token = cancellation_token.clone();
             async move { ("fs", fs_actor.run(token).await) }
         });
-        actors.spawn({
-            let token = cancellation_token.clone();
-            async move { ("log_writer", log_writer.run(token).await) }
-        });
-
         match mode {
             RunMode::Init => {
+                let (log_writer_req_tx, log_writer_req_rx) = mpsc::unbounded_channel();
+                let (log_writer_resp_tx, log_writer_resp_rx) = mpsc::unbounded_channel();
+                let log_writer = LogWriterActor::new(
+                    s2_basin.clone(),
+                    daemon_row.workspace_id.clone(),
+                    daemon_row.daemon_writer_id.clone(),
+                    log_writer_req_rx,
+                    log_writer_resp_tx,
+                );
+
+                actors.spawn({
+                    let token = cancellation_token.clone();
+                    async move { ("log_writer", log_writer.run(token).await) }
+                });
                 actors.spawn(async move {
                     let _semantic_event_rx = semantic_event_rx;
                     let result = engine_init::run(engine_init::InitConfig {
@@ -164,6 +166,16 @@ where
                 });
             }
             RunMode::Sync => {
+                let (log_writer_req_tx, log_writer_req_rx) = mpsc::unbounded_channel();
+                let (log_writer_resp_tx, log_writer_resp_rx) = mpsc::unbounded_channel();
+                let log_writer = LogWriterActor::new(
+                    s2_basin.clone(),
+                    daemon_row.workspace_id.clone(),
+                    daemon_row.daemon_writer_id.clone(),
+                    log_writer_req_rx,
+                    log_writer_resp_tx,
+                );
+
                 let (log_reader_req_tx, log_reader_req_rx) = mpsc::unbounded_channel();
                 let (log_reader_resp_tx, log_reader_resp_rx) =
                     mpsc::channel(LOG_READER_EVENT_CHANNEL_CAPACITY);
@@ -190,6 +202,7 @@ where
                     semantic: semantic_event_rx,
                     commands: engine_command_rx,
                     spy: spy_tx,
+                    connectivity_status: connectivity_status_tx,
                 };
 
                 let engine = Engine::new(EngineConfig {
@@ -204,6 +217,10 @@ where
                 actors.spawn({
                     let token = cancellation_token.clone();
                     async move { ("log_reader", log_reader.run(token).await) }
+                });
+                actors.spawn({
+                    let token = cancellation_token.clone();
+                    async move { ("log_writer", log_writer.run(token).await) }
                 });
                 if let Some(notify_io) = notify_io {
                     let notify_actor = NotifyActor::new(notify_io, engine_command_tx.clone());
