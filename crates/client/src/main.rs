@@ -33,12 +33,6 @@ const STYLES: styling::Styles = styling::Styles::styled()
     .literal(styling::AnsiColor::Blue.on_default().bold())
     .placeholder(styling::AnsiColor::Cyan.on_default());
 
-// const GENERAL_USAGE: &str = color_print::cstr!(
-//     r#"
-//     <dim>$</dim> <bold>ob init/bold>
-//     <dim>$</dim> <bold>s2 list-basins --prefix "foo" --limit 100</bold>
-//     "#
-// );
 
 #[derive(Parser, Debug)]
 #[command(name = "ob", version, styles = STYLES)]
@@ -54,26 +48,35 @@ enum Command {
     Init {
         sync_root: Option<PathBuf>,
     },
+
     /// Clone an existing workspace from the basin named by $S2_BASIN.
     Clone {
         #[arg(long)]
         workspace: WorkspaceId,
         sync_root: Option<PathBuf>,
     },
+
+    /// Start the daemon in an existing workspace.
     Start {
         sync_root: Option<PathBuf>,
     },
+
+    /// Stop the daemon.
     Stop {
         sync_root: Option<PathBuf>,
     },
+
+    /// Get status of current workspace.
     Status {
         sync_root: Option<PathBuf>,
     },
-    /// Stream real-time sync events from the daemon.
+
+    /// Attach to daemon in order to see CRDT ops as they are received.
     Spy {
         sync_root: Option<PathBuf>,
     },
-    /// Inspect the daemon for a workspace.
+
+    /// Inspect the daemon process logs.
     Logs {
         /// Tail the log (via `tail -f`).
         #[arg(short, long)]
