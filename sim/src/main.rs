@@ -22,7 +22,8 @@ use opbox_core::types::{DaemonWriterId, OutboxId, WorkspaceId};
 use rand::SeedableRng;
 use s2_sdk::S2;
 use s2_sdk::types::{
-    AccountEndpoint, BasinEndpoint, BasinName, CreateBasinInput, S2Config, S2Endpoints, S2Error,
+    AccountEndpoint, BasinEndpoint, BasinName, CreateBasinInput, ListStreamsInput, S2Config,
+    S2Endpoints, S2Error,
 };
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
@@ -154,6 +155,7 @@ enum Workload {
     SafeSaveAfterQuiescence,
     RenameAfterQuiescence,
     ScopedScan,
+    LargeTextMultipart,
     SameFileEdits,
     SameFileSplitEdits,
     OrphanedProjectionWrite,
@@ -221,6 +223,9 @@ fn run_single(args: SingleArgs) -> eyre::Result<()> {
             run_rename_after_quiescence_workload(&mut sim, seed, args.common.max_steps)?
         }
         Workload::ScopedScan => run_scoped_scan_workload(&mut sim, seed, args.common.max_steps)?,
+        Workload::LargeTextMultipart => {
+            run_large_text_multipart_workload(&mut sim, seed, args.common.max_steps)?
+        }
         Workload::SameFileEdits => run_same_file_edits_workload(
             &mut sim,
             seed,
@@ -1885,6 +1890,121 @@ fn run_same_file_edits_workload(
     });
 
     Ok(())
+}
+
+fn run_large_text_multipart_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000010".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let s2_workspace_id = workspace_id.clone();
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "multipart.txt";
+        let inline_threshold = opbox_core::log::codec::max_inline_record_size();
+        let initial = deterministic_large_text(seed, "initial", inline_threshold * 3 + 257);
+        let append = deterministic_large_text(seed, "append", inline_threshold * 2 + 257);
+        let final_text = format!("{initial}{append}");
+        let expected_min_object_records = initial.len().div_ceil(inline_threshold)
+            + append.len().div_ceil(inline_threshold);
+
+        daemon_a
+            .write_file(path, Bytes::from(initial.clone()))
+            .await?;
+        daemon_a.request_single_file_scan(path).await?;
+        wait_for_file_text(&daemon_a, &daemon_b, path, &initial, steps).await?;
+        let object_id = wait_for_matching_prior_object_id(&daemon_a, &daemon_b, path, steps)
+            .await?;
+
+        daemon_b
+            .append_file(path, Bytes::from(append.clone()))
+            .await?;
+        daemon_b.request_single_file_scan(path).await?;
+        wait_for_file_text(&daemon_a, &daemon_b, path, &final_text, steps).await?;
+        wait_for_preserved_prior_object_id(&daemon_a, &daemon_b, path, &object_id, steps)
+            .await?;
+        let object_stats = multipart_object_stream_stats(&s2_workspace_id).await?;
+        if object_stats.stream_count < 2
+            || object_stats.record_count < expected_min_object_records as u64
+        {
+            daemon_a.shutdown().await;
+            daemon_b.shutdown().await;
+            return Err(io_err(format!(
+                "large-text-multipart did not create expected multipart object streams; expected_min_streams=2 expected_min_object_records={expected_min_object_records} actual={object_stats:?}"
+            )));
+        }
+
+        println!(
+            "SIM_OK workload=large-text-multipart seed={seed} inline_threshold={inline_threshold} initial_bytes={} append_bytes={} final_bytes={} object_streams={} object_records={} object_id={}",
+            initial.len(),
+            append.len(),
+            final_text.len(),
+            object_stats.stream_count,
+            object_stats.record_count,
+            object_id.encode_b64()
+        );
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
+fn deterministic_large_text(seed: u64, label: &str, min_bytes: usize) -> String {
+    let mut text = format!("{label} seed {seed}\n");
+    let mut idx = 0usize;
+    while text.len() < min_bytes {
+        text.push_str(&format!(
+            "{label}-{idx:04}-seed-{seed}-abcdefghijklmnopqrstuvwxyz0123456789\n"
+        ));
+        idx += 1;
+    }
+    text
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MultipartObjectStreamStats {
+    stream_count: usize,
+    record_count: u64,
+}
+
+async fn multipart_object_stream_stats(
+    workspace_id: &WorkspaceId,
+) -> Result<MultipartObjectStreamStats, Box<dyn std::error::Error>> {
+    let basin_name: BasinName = SIM_BASIN.parse().map_err(io_err)?;
+    let basin = sim_s2_client().map_err(io_err)?.basin(basin_name);
+    let prefix = format!("{}/objects/", workspace_id.0)
+        .parse()
+        .map_err(io_err)?;
+    let page = basin
+        .list_streams(ListStreamsInput::new().with_prefix(prefix).with_limit(1000))
+        .await
+        .map_err(io_err)?;
+    if page.has_more {
+        return Err(io_err(
+            "large-text-multipart produced more than 1000 object streams",
+        ));
+    }
+
+    let mut record_count = 0u64;
+    for stream in &page.values {
+        let tail = basin
+            .stream(stream.name.clone())
+            .check_tail()
+            .await
+            .map_err(io_err)?;
+        record_count += tail.seq_num;
+    }
+
+    Ok(MultipartObjectStreamStats {
+        stream_count: page.values.len(),
+        record_count,
+    })
 }
 
 #[derive(Clone, Copy)]
