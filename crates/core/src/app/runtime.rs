@@ -81,16 +81,6 @@ where
         let fs_client = FsClient::new(fs_request_tx);
         let fs_actor = FsActor::new(file_io, fs_request_rx);
 
-        let (log_writer_req_tx, log_writer_req_rx) = mpsc::unbounded_channel();
-        let (log_writer_resp_tx, log_writer_resp_rx) = mpsc::unbounded_channel();
-        let log_writer = LogWriterActor::new(
-            s2_basin.clone(),
-            daemon_row.workspace_id.clone(),
-            daemon_row.daemon_writer_id.clone(),
-            log_writer_req_rx,
-            log_writer_resp_tx,
-        );
-
         let mut actors = JoinSet::<ActorResult>::new();
 
         actors.spawn({
@@ -101,13 +91,22 @@ where
             let token = cancellation_token.clone();
             async move { ("fs", fs_actor.run(token).await) }
         });
-        actors.spawn({
-            let token = cancellation_token.clone();
-            async move { ("log_writer", log_writer.run(token).await) }
-        });
-
         match mode {
             RunMode::Init => {
+                let (log_writer_req_tx, log_writer_req_rx) = mpsc::unbounded_channel();
+                let (log_writer_resp_tx, log_writer_resp_rx) = mpsc::unbounded_channel();
+                let log_writer = LogWriterActor::new(
+                    s2_basin.clone(),
+                    daemon_row.workspace_id.clone(),
+                    daemon_row.daemon_writer_id.clone(),
+                    log_writer_req_rx,
+                    log_writer_resp_tx,
+                );
+
+                actors.spawn({
+                    let token = cancellation_token.clone();
+                    async move { ("log_writer", log_writer.run(token).await) }
+                });
                 actors.spawn(async move {
                     let _semantic_event_rx = semantic_event_rx;
                     let result = engine_init::run(engine_init::InitConfig {
@@ -167,6 +166,16 @@ where
                 });
             }
             RunMode::Sync => {
+                let (log_writer_req_tx, log_writer_req_rx) = mpsc::unbounded_channel();
+                let (log_writer_resp_tx, log_writer_resp_rx) = mpsc::unbounded_channel();
+                let log_writer = LogWriterActor::new(
+                    s2_basin.clone(),
+                    daemon_row.workspace_id.clone(),
+                    daemon_row.daemon_writer_id.clone(),
+                    log_writer_req_rx,
+                    log_writer_resp_tx,
+                );
+
                 let (log_reader_req_tx, log_reader_req_rx) = mpsc::unbounded_channel();
                 let (log_reader_resp_tx, log_reader_resp_rx) =
                     mpsc::channel(LOG_READER_EVENT_CHANNEL_CAPACITY);
@@ -208,6 +217,10 @@ where
                 actors.spawn({
                     let token = cancellation_token.clone();
                     async move { ("log_reader", log_reader.run(token).await) }
+                });
+                actors.spawn({
+                    let token = cancellation_token.clone();
+                    async move { ("log_writer", log_writer.run(token).await) }
                 });
                 if let Some(notify_io) = notify_io {
                     let notify_actor = NotifyActor::new(notify_io, engine_command_tx.clone());
