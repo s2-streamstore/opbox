@@ -1,23 +1,21 @@
 # opbox
 
-> Drop the "dr-". Just "opbox". It's cleaner...
-
 ## about
 
 > **⚠️ Warning:** Use this software with caution. Always keep additional backups of your data.
-> 
+
 Real-time, multiplayer sync for plain text files on disk using CRDTs.
 
 ## running it
 
 The only external service this relies on is [s2.dev](https://s2.dev). You can sign up for an account and use the cloud version, or run [s2-lite](https://github.com/s2-streamstore/s2#s2-lite) yourself.
 
-> [!TIP] 
+> [!TIP]
 > Head over to the [quickstart](docs/quickstart.md) to get up and running.
 
 ## architecture
 
-TODO
+See the in-progress [architecture notes](docs/architecture.md) and [design notes](docs/design-notes.md).
 
 ### spy
 
@@ -38,17 +36,17 @@ spying on opbox workspace e4wtker801s559vp97drk6xbnfkq6ez7 (pid 41152)
 
 ### configuration
 
-Can override env vars for the daemon by creating a `.opbox/env` file in your workspace root.
+You can override selected daemon environment values by creating a `.opbox/env` file in your workspace root. The file is read by the daemon at startup and is never written by `ob`.
 
 This is also useful for increasing the log level of the daemon:
 
 ```bash
 # in workspace root
-echo "RUST_LOG=opbox=trace,info" >> .opbox/env
+echo "RUST_LOG=opbox_core=trace,opbox_daemon=trace,info" >> .opbox/env
 
 # restart the daemon
 ob stop && ob start
 
 # tail the log file
-ob tail -f # (just a wrapper over `tail -f ./opbox/daemon.log`)
+ob logs --follow
 ```

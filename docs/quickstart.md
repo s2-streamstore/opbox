@@ -4,18 +4,16 @@
 
 ### Install opbox
 
-#### from source
+#### From source
 
 ```bash
-cargo install --path crates/client
-cargo install --path crates/daemon
+cargo install --locked --path crates/client
+cargo install --locked --path crates/daemon
 ```
 
 You should have `ob` and `opbox-daemon` in your `$PATH` now.
 
-#### from release
-
-TODO
+If you install from a release archive, place both `ob` and `opbox-daemon` in the same directory on your `$PATH`.
 
 ### S2 configuration
 
@@ -41,7 +39,7 @@ ob config set access-token "MY_TOKEN"
 ob config set default-basin "MY_BASIN"
 ```
 
-This configuration is stored in an OS user-level config file, and will be used for all opbox workspaces unless the workspace has a local override.
+`ob config` writes to an OS user-level opbox config file, not to the current workspace. These values become the defaults for every opbox workspace you create or clone as this OS user. For one-off commands, exported environment variables such as `S2_ACCESS_TOKEN` and `S2_BASIN` take precedence.
 
 At this point, you're set.
 
@@ -81,11 +79,15 @@ To listen for local changes and apply remote changes, start the daemon:
 ob start
 ```
 
+> [!TIP]
+> Most `ob` commands operate on the local workspace. If your `$PWD` is not in a workspace directory (or a subdirectory of it), they won't work. Similar to `git`.
+>
+> `ob config` is the exception: it is user-wide, not workspace-local.
+
 ## Cloning an existing workspace
 
-> [!NOTE] 
-> Make sure your opbox config is correct.
-> If you did the S2 setup steps, just make sure to send the access token and basin to anyone you want to share your workspace with. They will also need to configure via `ob config`.
+> [!NOTE]
+> Make sure your user-wide opbox config is correct. If you did the S2 setup steps, send the access token and basin to anyone you want to share your workspace with. They will need to set those values in their own user config with `ob config`.
 
 This will likely be done on another computer.
 
@@ -95,10 +97,5 @@ cd ~/my-opbox-workspace-clone-1
 
 # the directory must be empty to start
 # then, use the workspace id from earlier
-ob clone --workspace tgyz0q5a5051djmmpsm6vy7fv3m3egy4 
+ob clone --workspace tgyz0q5a5051djmmpsm6vy7fv3m3egy4
 ```
-
-
-
-
-
