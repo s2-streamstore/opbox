@@ -5,7 +5,7 @@ use crate::fs::actor::FsActor;
 use crate::fs::client::FsClient;
 use crate::fs::fio::FileIO;
 use crate::log::reader::LogReaderActor;
-use crate::log::types::LOG_READER_EVENT_CHANNEL_CAPACITY;
+use crate::log::types::{LOG_READER_EVENT_CHANNEL_CAPACITY, LogReadStop};
 use crate::log::writer::LogWriterActor;
 use crate::notify::actor::NotifyActor;
 use crate::notify::nio::NotifyIO;
@@ -39,6 +39,7 @@ pub struct AppRuntimeConfig<IO, NIO = ()> {
     pub semantic_service: SemanticService,
     pub daemon_row: daemon_state::Row,
     pub s2_basin: S2Basin,
+    pub clone_log_read_stop: Option<LogReadStop>,
     pub spy_tx: Option<broadcast::Sender<SpyEvent>>,
 }
 
@@ -63,6 +64,7 @@ where
             semantic_service,
             daemon_row,
             s2_basin,
+            clone_log_read_stop,
             spy_tx,
         } = self.config;
 
@@ -131,6 +133,7 @@ where
                     s2_basin.clone(),
                     daemon_row.workspace_id.clone(),
                     daemon_row.stable_cursor.end,
+                    clone_log_read_stop,
                     log_reader_req_rx,
                     log_reader_resp_tx,
                 );
@@ -150,6 +153,7 @@ where
                         events: engine_clone::CloneEvents {
                             log_reader: log_reader_resp_rx,
                         },
+                        log_read_stop: clone_log_read_stop,
                     })
                     .await
                     .map(|result| {
@@ -168,6 +172,7 @@ where
                     s2_basin.clone(),
                     daemon_row.workspace_id.clone(),
                     daemon_row.stable_cursor.end,
+                    None,
                     log_reader_req_rx,
                     log_reader_resp_tx,
                 );

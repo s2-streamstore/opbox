@@ -77,6 +77,7 @@ async fn run(sync_root: PathBuf, user_config: UserConfig) -> eyre::Result<()> {
         semantic_service,
         daemon_row: daemon_row.clone(),
         s2_basin,
+        clone_log_read_stop: None,
         spy_tx: Some(spy_tx.clone()),
     })
     .spawn(token.clone());

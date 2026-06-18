@@ -1,6 +1,8 @@
 use crate::crdt::types::SharedMessage;
 use crate::log::codec::{self, ObjectPointer};
-use crate::log::types::{LogReaderEvent, LogReaderRequest, SequenceNumber, SharedMessageEnvelope};
+use crate::log::types::{
+    LogReadStop, LogReaderEvent, LogReaderRequest, SequenceNumber, SharedMessageEnvelope,
+};
 use crate::types::WorkspaceId;
 use bytes::BytesMut;
 use futures::StreamExt;
@@ -22,6 +24,7 @@ pub struct LogReaderActor {
     basin: S2Basin,
     workspace: WorkspaceId,
     start_at: SequenceNumber,
+    stop: Option<LogReadStop>,
     req_rx: mpsc::UnboundedReceiver<LogReaderRequest>,
     event_tx: Sender<LogReaderEvent>,
 }
@@ -31,6 +34,7 @@ impl LogReaderActor {
         basin: S2Basin,
         workspace: WorkspaceId,
         start_at: SequenceNumber,
+        stop: Option<LogReadStop>,
         req_rx: mpsc::UnboundedReceiver<LogReaderRequest>,
         event_tx: mpsc::Sender<LogReaderEvent>,
     ) -> Self {
@@ -38,6 +42,7 @@ impl LogReaderActor {
             basin,
             workspace,
             start_at,
+            stop,
             req_rx,
             event_tx,
         }
@@ -137,12 +142,16 @@ impl LogReaderActor {
         Self::ensure_stream_exists(&self.basin, main_stream_name.clone()).await?;
         let stream = self.basin.stream(main_stream_name);
 
-        let mut batches = stream
-            .read_session(
-                ReadInput::new()
-                    .with_start(ReadStart::new().with_from(ReadFrom::SeqNum(self.start_at))),
-            )
-            .await?;
+        let mut read_input = ReadInput::new()
+            .with_start(ReadStart::new().with_from(ReadFrom::SeqNum(self.start_at)));
+        if let Some(stop) = self.stop {
+            let read_stop = match stop {
+                LogReadStop::UntilTimestampMs(until_ms) => ReadStop::new().with_until(..until_ms),
+            };
+            read_input = read_input.with_stop(read_stop);
+        }
+        let mut batches = stream.read_session(read_input).await?;
+        let mut next_sequence_number = self.start_at;
 
         loop {
             tokio::select! {
@@ -165,6 +174,13 @@ impl LogReaderActor {
 
                 batch = batches.next() => {
                     let Some(batch) = batch else {
+                        if self.stop.is_some() {
+                            self.event_tx.send(LogReaderEvent::Ended {
+                                cursor: ..next_sequence_number,
+                            }).await?;
+                            token.cancelled().await;
+                            return Ok(());
+                        }
                         eyre::bail!("log reader read session ended");
                     };
                     let batch = batch?;
@@ -177,6 +193,8 @@ impl LogReaderActor {
 
                     for record in batch.records {
                         let sequence_number = record.seq_num;
+                        next_sequence_number = sequence_number.checked_add(1)
+                            .ok_or_else(|| eyre::eyre!("log reader sequence number overflow"))?;
                         let timestamp =
                             OffsetDateTime::from_unix_timestamp_nanos(record.timestamp as i128 * 1_000_000)
                                 .expect("valid timestamp");

@@ -647,6 +647,11 @@ impl Engine {
                                 );
                             }
                         }
+                        LogReaderEvent::Ended { cursor } => {
+                            eyre::bail!(
+                                "sync engine received unexpected bounded log reader end: {cursor:?}"
+                            );
+                        }
                     }
                 }
 

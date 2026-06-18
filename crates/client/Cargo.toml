@@ -11,6 +11,7 @@ eyre = "0.6.12"
 opbox-core = { path = "../core" }
 rand = "0.9.4"
 s2-sdk = { version = "0.31.2", features = ["_hidden"] }
+time = { version = "0.3.47", features = ["parsing"] }
 tokio = { version = "1.52.0", features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }

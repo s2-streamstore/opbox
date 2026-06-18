@@ -17,6 +17,7 @@ use opbox_core::app::workspace::{
 };
 use opbox_core::fs::fio::local::LocalFileIO;
 use opbox_core::fs::ignore::{IGNORE_FILE_NAME, default_ignore_file_contents};
+use opbox_core::log::types::LogReadStop;
 use opbox_core::semantic::service::SemanticService;
 use opbox_core::semantic::table::daemon_state;
 use opbox_core::spy::{SpyEvent, SpySharedMessageKind};
@@ -28,7 +29,10 @@ use s2_sdk::{
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::str::FromStr;
 use std::time::Duration;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::process::Command as TokioCommand;
 use tracing::debug;
 
@@ -61,6 +65,9 @@ enum Command {
     Clone {
         #[arg(long)]
         workspace: WorkspaceId,
+        /// Clone only shared log records at or before this RFC3339 timestamp.
+        #[arg(long, value_name = "RFC3339")]
+        as_of: Option<CloneAsOf>,
         sync_root: Option<PathBuf>,
     },
 
@@ -143,6 +150,49 @@ struct Bootstrap {
     sync_root: PathBuf,
     daemon_row: daemon_state::Row,
     s2_basin: S2Basin,
+    clone_log_read_stop: Option<LogReadStop>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CloneAsOf {
+    exclusive_until_timestamp_ms: u64,
+}
+
+impl CloneAsOf {
+    fn log_read_stop(self) -> LogReadStop {
+        LogReadStop::UntilTimestampMs(self.exclusive_until_timestamp_ms)
+    }
+}
+
+impl FromStr for CloneAsOf {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.as_bytes().get(10) {
+            Some(b'T' | b't') => {}
+            _ => {
+                return Err(
+                    "timestamp must use RFC3339 format, e.g. 2026-06-18T01:30:00Z".to_string(),
+                );
+            }
+        }
+        let timestamp = OffsetDateTime::parse(value, &Rfc3339)
+            .map_err(|err| format!("invalid RFC3339 timestamp: {err}"))?;
+        let timestamp_ns = timestamp.unix_timestamp_nanos();
+        if timestamp_ns < 0 {
+            return Err("as-of timestamp must be at or after the Unix epoch".to_string());
+        }
+
+        let inclusive_timestamp_ms = u64::try_from(timestamp_ns / 1_000_000)
+            .map_err(|err| format!("as-of timestamp is out of range: {err}"))?;
+        let exclusive_until_timestamp_ms = inclusive_timestamp_ms
+            .checked_add(1)
+            .ok_or_else(|| "as-of timestamp is out of range".to_string())?;
+
+        Ok(Self {
+            exclusive_until_timestamp_ms,
+        })
+    }
 }
 
 fn init_tracing() {
@@ -255,12 +305,14 @@ async fn bootstrap_init(
         sync_root,
         daemon_row,
         s2_basin,
+        clone_log_read_stop: None,
     })
 }
 
 async fn bootstrap_clone(
     workspace: WorkspaceId,
     sync_root: Option<PathBuf>,
+    clone_log_read_stop: Option<LogReadStop>,
     user_config: &UserConfig,
 ) -> eyre::Result<Bootstrap> {
     let basin = basin_from_config(user_config)?;
@@ -282,6 +334,7 @@ async fn bootstrap_clone(
         sync_root,
         daemon_row,
         s2_basin,
+        clone_log_read_stop,
     })
 }
 
@@ -302,6 +355,7 @@ async fn run_bootstrap(bootstrap: Bootstrap) -> eyre::Result<()> {
         semantic_service,
         daemon_row: bootstrap.daemon_row,
         s2_basin: bootstrap.s2_basin,
+        clone_log_read_stop: bootstrap.clone_log_read_stop,
         spy_tx: None,
     })
     .run_until_shutdown()
@@ -840,12 +894,22 @@ async fn main() {
         ),
         Command::Clone {
             workspace,
+            as_of,
             sync_root,
         } => with_failure_banner(
             "clone",
             async {
                 let user_config = load_user_config()?;
-                run_bootstrap(bootstrap_clone(workspace, sync_root, &user_config).await?).await
+                run_bootstrap(
+                    bootstrap_clone(
+                        workspace,
+                        sync_root,
+                        as_of.map(CloneAsOf::log_read_stop),
+                        &user_config,
+                    )
+                    .await?,
+                )
+                .await
             }
             .await,
         ),
@@ -898,5 +962,17 @@ mod tests {
         assert_eq!(row.s2_basin_endpoint.as_deref(), Some("{basin}.s2.test"));
 
         Ok(())
+    }
+
+    #[test]
+    fn clone_as_of_converts_to_exclusive_s2_millisecond() {
+        let as_of: CloneAsOf = "1970-01-01T00:00:00Z".parse().unwrap();
+        assert_eq!(as_of.log_read_stop(), LogReadStop::UntilTimestampMs(1));
+
+        let as_of: CloneAsOf = "1970-01-01T00:00:00.999999999Z".parse().unwrap();
+        assert_eq!(as_of.log_read_stop(), LogReadStop::UntilTimestampMs(1000));
+
+        assert!("1969-12-31T23:59:59Z".parse::<CloneAsOf>().is_err());
+        assert!("2026-06-18:01:30:00Z".parse::<CloneAsOf>().is_err());
     }
 }

@@ -7,6 +7,11 @@ pub type SequenceNumber = u64;
 
 pub const LOG_READER_EVENT_CHANNEL_CAPACITY: usize = 10;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogReadStop {
+    UntilTimestampMs(u64),
+}
+
 pub enum LogReaderRequest {
     Status,
 }
@@ -29,6 +34,7 @@ pub struct SharedMessageEnvelope {
 pub enum LogReaderEvent {
     Status { tail: RangeTo<SequenceNumber> },
     Read(SharedMessageEnvelope),
+    Ended { cursor: RangeTo<SequenceNumber> },
 }
 
 pub enum LogWriterRequest {

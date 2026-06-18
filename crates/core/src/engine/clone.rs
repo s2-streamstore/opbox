@@ -1,7 +1,7 @@
 use super::shared_message_buffer::SharedMessageBuffer;
 use crate::fs::client::{FsClient, FsClientResponse};
 use crate::fs::types::ScanScope;
-use crate::log::types::{LogReaderEvent, LogReaderRequest, SequenceNumber};
+use crate::log::types::{LogReadStop, LogReaderEvent, LogReaderRequest, SequenceNumber};
 use crate::semantic::client::{SemanticClient, SemanticClientResponse};
 use crate::semantic::types::{NextWork, ProjectionActionResult, ProjectionEpochEndReason};
 use crate::types::SharedMessageBatch;
@@ -26,6 +26,7 @@ pub struct CloneEvents {
 pub struct CloneConfig {
     pub clients: CloneClients,
     pub events: CloneEvents,
+    pub log_read_stop: Option<LogReadStop>,
 }
 
 #[derive(Debug)]
@@ -35,7 +36,11 @@ pub struct CloneResult {
 }
 
 pub async fn run(config: CloneConfig) -> eyre::Result<CloneResult> {
-    let CloneConfig { clients, events } = config;
+    let CloneConfig {
+        clients,
+        events,
+        log_read_stop,
+    } = config;
     let CloneClients {
         mut fs,
         mut semantic,
@@ -54,8 +59,11 @@ pub async fn run(config: CloneConfig) -> eyre::Result<CloneResult> {
         );
     }
 
-    let applied_log_cursor =
-        pull_shared_log_to_start_tail(&mut semantic, &log_reader, &mut log_reader_rx).await?;
+    let applied_log_cursor = if log_read_stop.is_some() {
+        pull_shared_log_to_reader_end(&mut semantic, &mut log_reader_rx).await?
+    } else {
+        pull_shared_log_to_start_tail(&mut semantic, &log_reader, &mut log_reader_rx).await?
+    };
 
     semantic.get_next_work(0)?;
     let next_work = await_get_next_work(&mut semantic).await?;
@@ -87,6 +95,60 @@ pub async fn run(config: CloneConfig) -> eyre::Result<CloneResult> {
         applied_log_cursor,
         projected_actions,
     })
+}
+
+async fn pull_shared_log_to_reader_end(
+    semantic: &mut SemanticClient,
+    log_reader_rx: &mut mpsc::Receiver<LogReaderEvent>,
+) -> eyre::Result<RangeTo<SequenceNumber>> {
+    let mut applied_end: SequenceNumber = 0;
+    let mut buffer = SharedMessageBuffer::new(MAX_SHARED_MESSAGE_BUFFER_MS);
+
+    loop {
+        if !buffer.has_capacity() {
+            applied_end = flush_shared_message_buffer(semantic, &mut buffer).await?;
+            continue;
+        }
+
+        let event = if let Some(deadline) = buffer.next_fire_at() {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    applied_end = flush_shared_message_buffer(semantic, &mut buffer).await?;
+                    continue;
+                }
+                event = log_reader_rx.recv() => event,
+            }
+        } else {
+            log_reader_rx.recv().await
+        };
+
+        match event.ok_or_else(|| eyre!("log reader stopped while clone waited for read bound"))? {
+            LogReaderEvent::Status { tail } => {
+                eyre::bail!(
+                    "clone received unexpected log reader status for bounded read; tail={tail:?}"
+                );
+            }
+            LogReaderEvent::Read(envelope) => {
+                trace!(
+                    sequence_number = envelope.sequence_number,
+                    "clone buffered log message"
+                );
+                buffer.insert(envelope);
+            }
+            LogReaderEvent::Ended { cursor } => {
+                if !buffer.is_empty() {
+                    applied_end = flush_shared_message_buffer(semantic, &mut buffer).await?;
+                }
+                if applied_end != cursor.end {
+                    eyre::bail!(
+                        "clone bounded read ended at cursor {cursor:?}, but applied cursor is ..{applied_end}"
+                    );
+                }
+                debug!(?cursor, "clone reached bounded read end");
+                return Ok(cursor);
+            }
+        }
+    }
 }
 
 async fn pull_shared_log_to_start_tail(
@@ -152,6 +214,9 @@ fn handle_log_reader_event(
                 "clone buffered log message"
             );
             buffer.insert(envelope);
+        }
+        LogReaderEvent::Ended { cursor } => {
+            eyre::bail!("clone received unexpected bounded read end: {cursor:?}");
         }
     }
 
