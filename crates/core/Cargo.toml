@@ -28,6 +28,8 @@ turso = { version = "0.6.0-pre.18", default-features = false }
 secrecy = "0.10.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.9.8"
+dirs = "6.0.0"
 rand = "0.9.4"
 fast32 = "1.0.3"
 base64 = "0.22.1"

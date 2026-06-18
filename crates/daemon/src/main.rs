@@ -2,7 +2,10 @@ use clap::Parser;
 use opbox_core::app::db::{open_database, semantic_pool};
 use opbox_core::app::ipc::{self, ControlServerConfig};
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
-use opbox_core::app::s2::{ensure_workspace_stream_exists, s2_basin_from_env};
+use opbox_core::app::s2::{
+    S2ConnectionConfig, ensure_workspace_stream_exists, s2_basin_from_config,
+};
+use opbox_core::app::user_config::{UserConfig, load_user_config};
 use opbox_core::app::workspace::{
     DaemonLock, canonicalize_existing_dir, load_configured_daemon_state, load_workspace_env,
     remove_pid, write_pid,
@@ -44,14 +47,15 @@ fn main() -> eyre::Result<()> {
     if !env_applied.is_empty() {
         info!(vars = ?env_applied, "loaded workspace env from .opbox/env");
     }
+    let user_config = load_user_config()?;
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run(sync_root))
+        .block_on(run(sync_root, user_config))
 }
 
-async fn run(sync_root: PathBuf) -> eyre::Result<()> {
+async fn run(sync_root: PathBuf, user_config: UserConfig) -> eyre::Result<()> {
     let _lock = DaemonLock::acquire(&sync_root)?;
     write_pid(&sync_root)?;
     let _pid_guard = PidGuard {
@@ -59,7 +63,8 @@ async fn run(sync_root: PathBuf) -> eyre::Result<()> {
     };
 
     let (db_path, daemon_row) = load_configured_daemon_state(&sync_root).await?;
-    let s2_basin = s2_basin_from_env(daemon_row.s2_basin.clone()).await?;
+    let s2_connection = S2ConnectionConfig::from_env_or_user_config(&user_config)?;
+    let s2_basin = s2_basin_from_config(daemon_row.s2_basin.clone(), &s2_connection).await?;
     ensure_workspace_stream_exists(&s2_basin, &daemon_row.workspace_id).await?;
 
     let db = open_database(&db_path).await?;

@@ -25,6 +25,13 @@ Then you interact with the `ob` command.
 
 ### use
 
+#### configure
+
+```bash
+ob config set default-basin "opbox-dev"
+ob config set access-token "-- my actual access token! --"
+```
+
 #### create a new workspace
 
 ```bash

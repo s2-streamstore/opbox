@@ -1,27 +1,111 @@
 use crate::types::WorkspaceId;
 use eyre::eyre;
 use s2_sdk::types::{
-    BasinName, CreateStreamInput, RetryConfig, S2Config, S2Endpoints, S2Error, StreamName,
+    AccountEndpoint, BasinEndpoint, BasinName, CreateStreamInput, RetryConfig, S2Config,
+    S2Endpoints, S2Error, StreamName,
 };
 use s2_sdk::{S2, S2Basin};
 use std::num::NonZeroU32;
 use std::str::FromStr;
+use tracing::warn;
 
-pub fn s2_client_from_env(access_token: &str) -> eyre::Result<S2> {
-    let mut config = S2Config::new(access_token)
+use super::user_config::UserConfig;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct S2ConnectionConfig {
+    pub access_token: String,
+    pub account_endpoint: Option<String>,
+    pub basin_endpoint: Option<String>,
+}
+
+impl S2ConnectionConfig {
+    pub fn from_env() -> eyre::Result<Self> {
+        let access_token = required_env("S2_ACCESS_TOKEN")?;
+        Ok(Self {
+            access_token,
+            account_endpoint: optional_env("S2_ACCOUNT_ENDPOINT")?,
+            basin_endpoint: optional_env("S2_BASIN_ENDPOINT")?,
+        })
+    }
+
+    pub fn from_env_or_user_config(user_config: &UserConfig) -> eyre::Result<Self> {
+        let access_token = optional_env("S2_ACCESS_TOKEN")?
+            .or_else(|| user_config.access_token.clone())
+            .ok_or_else(|| {
+                eyre!(
+                    "S2_ACCESS_TOKEN is not set and opbox user config has no access-token; \
+                     run `ob config set access-token <token>` or export S2_ACCESS_TOKEN"
+                )
+            })?;
+        Ok(Self {
+            access_token,
+            account_endpoint: optional_env("S2_ACCOUNT_ENDPOINT")?
+                .or_else(|| user_config.account_endpoint.clone()),
+            basin_endpoint: optional_env("S2_BASIN_ENDPOINT")?
+                .or_else(|| user_config.basin_endpoint.clone()),
+        })
+    }
+}
+
+fn required_env(key: &str) -> eyre::Result<String> {
+    optional_env(key)?.ok_or_else(|| {
+        eyre!("{key} is not set; export it or run `ob config set access-token <token>`")
+    })
+}
+
+fn optional_env(key: &str) -> eyre::Result<Option<String>> {
+    match std::env::var(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => eyre::bail!("{key} is not valid unicode"),
+    }
+}
+
+pub fn s2_client_from_config(connection: &S2ConnectionConfig) -> eyre::Result<S2> {
+    let mut config = S2Config::new(&connection.access_token)
         .with_retry(RetryConfig::new().with_max_attempts(NonZeroU32::new(1024).unwrap()));
-    if let Ok(endpoints) = S2Endpoints::from_env() {
-        config = config.with_endpoints(endpoints);
+
+    match (&connection.account_endpoint, &connection.basin_endpoint) {
+        (Some(account_endpoint), Some(basin_endpoint)) => {
+            let account_endpoint = AccountEndpoint::new(account_endpoint)?;
+            let basin_endpoint = BasinEndpoint::new(basin_endpoint)?;
+            config = config.with_endpoints(S2Endpoints::new(account_endpoint, basin_endpoint)?);
+        }
+        (Some(_), None) => {
+            warn!(
+                "S2 account endpoint is set but basin endpoint is not; using default S2 endpoints"
+            );
+        }
+        (None, Some(_)) => {
+            warn!(
+                "S2 basin endpoint is set but account endpoint is not; using default S2 endpoints"
+            );
+        }
+        (None, None) => {}
     }
 
     Ok(S2::new(config)?)
 }
 
-pub async fn s2_basin_from_env(basin: BasinName) -> eyre::Result<S2Basin> {
-    let token = std::env::var("S2_ACCESS_TOKEN")
-        .map_err(|_| eyre!("S2_ACCESS_TOKEN is not set; export an s2.dev access token"))?;
-    let s2 = s2_client_from_env(&token)?;
+pub fn s2_client_from_env(access_token: &str) -> eyre::Result<S2> {
+    s2_client_from_config(&S2ConnectionConfig {
+        access_token: access_token.to_string(),
+        account_endpoint: optional_env("S2_ACCOUNT_ENDPOINT")?,
+        basin_endpoint: optional_env("S2_BASIN_ENDPOINT")?,
+    })
+}
+
+pub async fn s2_basin_from_config(
+    basin: BasinName,
+    connection: &S2ConnectionConfig,
+) -> eyre::Result<S2Basin> {
+    let s2 = s2_client_from_config(connection)?;
     Ok(s2.basin(basin))
+}
+
+pub async fn s2_basin_from_env(basin: BasinName) -> eyre::Result<S2Basin> {
+    let connection = S2ConnectionConfig::from_env()?;
+    s2_basin_from_config(basin, &connection).await
 }
 
 pub fn ops_stream_name(workspace_id: &WorkspaceId) -> eyre::Result<StreamName> {
