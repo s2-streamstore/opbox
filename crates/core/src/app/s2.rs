@@ -120,6 +120,7 @@ pub fn s2_client_from_config(connection: &S2ConnectionConfig) -> eyre::Result<S2
     Ok(S2::new(config)?)
 }
 
+#[allow(unreachable_patterns)]
 pub fn s2_error_is_connectivity(error: &S2Error) -> bool {
     match error {
         S2Error::Client(message) => {
@@ -141,6 +142,7 @@ pub fn s2_error_is_connectivity(error: &S2Error) -> bool {
         S2Error::Validation(_) | S2Error::AppendConditionFailed(_) | S2Error::ReadUnwritten(_) => {
             false
         }
+        _ => false,
     }
 }
 
