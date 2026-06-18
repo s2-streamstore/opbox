@@ -146,5 +146,4 @@ impl SharedMessage {
             Self::BinaryObjectPut { blob, .. } => blob.len(),
         }
     }
-
 }
