@@ -12,6 +12,9 @@ Real-time, multiplayer sync for plain text files on disk using CRDTs.
 
 The only external service this relies on is [s2.dev](https://s2.dev). You can sign up for an account and use the cloud version, or run [s2-lite](https://github.com/s2-streamstore/s2#s2-lite) yourself.
 
+> [!TIP] 
+> Head over to the [quickstart](docs/quickstart.md) to get up and running.
+
 ### installation
 
 #### from source

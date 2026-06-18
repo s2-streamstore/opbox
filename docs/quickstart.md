@@ -4,7 +4,7 @@
 
 ### Install opbox
 
-
+TODO
 
 ### S2 configuration
 
@@ -72,7 +72,8 @@ ob start
 
 ## Cloning an existing workspace
 
-> [!NOTE] Make sure your opbox config is correct
+> [!NOTE] 
+> Make sure your opbox config is correct.
 > If you did the S2 setup steps, just make sure to send the access token and basin to anyone you want to share your workspace with. They will also need to configure via `ob config`.
 
 This will likely be done on another computer.
