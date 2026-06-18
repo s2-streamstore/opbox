@@ -29,6 +29,7 @@ rand = "0.10.1"
 s2-lite = "0.29.27"
 s2-sdk = { version = "0.31.2", features = ["_hidden"] }
 slatedb = "0.12.1"
+strum = { features = ["derive"], version = "0.28.0" }
 tokio = { version = "1.52.0", features = ["fs", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7.18"
 time = "0.3.47"

@@ -186,6 +186,8 @@ CREATE TABLE IF NOT EXISTS daemon_state (
     id             INTEGER PRIMARY KEY CHECK (id = 1),
     workspace_id   TEXT NOT NULL,
     s2_basin       TEXT NOT NULL,
+    s2_account_endpoint TEXT,
+    s2_basin_endpoint   TEXT,
     writer_id      BLOB NOT NULL,
     stable_cursor  INTEGER NOT NULL CHECK (stable_cursor >= 0),
     next_outbox_id INTEGER NOT NULL CHECK (next_outbox_id >= 0)

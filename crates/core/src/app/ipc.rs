@@ -416,6 +416,8 @@ mod tests {
         let daemon_row = daemon_state::Row {
             workspace_id: WorkspaceId("0123456789abcdefghijklmnopqrstuv".to_string()),
             s2_basin: "test-basin".parse()?,
+            s2_account_endpoint: None,
+            s2_basin_endpoint: None,
             daemon_writer_id: DaemonWriterId(Bytes::from_static(b"ipc-test-writer-1")),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),

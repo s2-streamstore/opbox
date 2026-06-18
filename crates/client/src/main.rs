@@ -1,15 +1,19 @@
 use clap::builder::styling;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use opbox_core::app::db::{open_database, semantic_pool};
 use opbox_core::app::ipc;
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::app::s2::{
-    create_workspace_stream, ensure_workspace_stream_exists, s2_basin_from_env,
+    S2ConnectionConfig, create_workspace_stream, ensure_workspace_stream_exists,
+    s2_basin_from_config,
+};
+use opbox_core::app::user_config::{
+    UserConfig, UserConfigKey, load_user_config, save_user_config, user_config_path,
 };
 use opbox_core::app::workspace::{
     NotInWorkspace, canonicalize_existing_dir, create_metadata_dir, current_dir, daemon_log_path,
     ensure_clean_clone_root, ensure_sync_root_unconfigured, find_workspace_root,
-    load_configured_daemon_state, remove_socket_pointer, storage_db_path, workspace_env_path,
+    load_configured_daemon_state, remove_socket_pointer, storage_db_path,
 };
 use opbox_core::fs::fio::local::LocalFileIO;
 use opbox_core::fs::ignore::{IGNORE_FILE_NAME, default_ignore_file_contents};
@@ -17,7 +21,10 @@ use opbox_core::semantic::service::SemanticService;
 use opbox_core::semantic::table::daemon_state;
 use opbox_core::spy::{SpyEvent, SpySharedMessageKind};
 use opbox_core::types::{DaemonWriterId, OutboxId, WorkspaceId};
-use s2_sdk::{S2Basin, types::BasinName};
+use s2_sdk::{
+    S2Basin,
+    types::{AccountEndpoint, BasinEndpoint, BasinName},
+};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -33,13 +40,6 @@ const STYLES: styling::Styles = styling::Styles::styled()
     .literal(styling::AnsiColor::Blue.on_default().bold())
     .placeholder(styling::AnsiColor::Cyan.on_default());
 
-// const GENERAL_USAGE: &str = color_print::cstr!(
-//     r#"
-//     <dim>$</dim> <bold>ob init/bold>
-//     <dim>$</dim> <bold>s2 list-basins --prefix "foo" --limit 100</bold>
-//     "#
-// );
-
 #[derive(Parser, Debug)]
 #[command(name = "ob", version, styles = STYLES)]
 struct Args {
@@ -49,37 +49,92 @@ struct Args {
 
 #[derive(Subcommand, Clone, Debug)]
 enum Command {
+    /// Manage user-wide opbox configuration.
+    #[command(subcommand)]
+    Config(ConfigCommand),
+
     /// Initialize a new opbox workspace in the basin named by $S2_BASIN.
     /// Uses the $PWD unless a sync root is specified.
-    Init {
-        sync_root: Option<PathBuf>,
-    },
+    Init { sync_root: Option<PathBuf> },
+
     /// Clone an existing workspace from the basin named by $S2_BASIN.
     Clone {
         #[arg(long)]
         workspace: WorkspaceId,
         sync_root: Option<PathBuf>,
     },
-    Start {
-        sync_root: Option<PathBuf>,
-    },
-    Stop {
-        sync_root: Option<PathBuf>,
-    },
-    Status {
-        sync_root: Option<PathBuf>,
-    },
-    /// Stream real-time sync events from the daemon.
-    Spy {
-        sync_root: Option<PathBuf>,
-    },
-    /// Inspect the daemon for a workspace.
+
+    /// Start the daemon in an existing workspace.
+    Start { sync_root: Option<PathBuf> },
+
+    /// Stop the daemon.
+    Stop { sync_root: Option<PathBuf> },
+
+    /// Get status of current workspace.
+    Status { sync_root: Option<PathBuf> },
+
+    /// Attach to daemon in order to see CRDT ops as they are received.
+    Spy { sync_root: Option<PathBuf> },
+
+    /// Inspect the daemon process logs.
     Logs {
         /// Tail the log (via `tail -f`).
         #[arg(short, long)]
         follow: bool,
         sync_root: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand, Clone, Debug)]
+enum ConfigCommand {
+    /// Print the user config file path.
+    Path,
+
+    /// List configured values.
+    List,
+
+    /// Get one configured value.
+    Get {
+        #[arg(value_enum)]
+        key: ConfigKey,
+    },
+
+    /// Set one configured value.
+    Set {
+        #[arg(value_enum)]
+        key: ConfigKey,
+        value: String,
+    },
+
+    /// Unset one configured value.
+    Unset {
+        #[arg(value_enum)]
+        key: ConfigKey,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum ConfigKey {
+    #[value(alias = "default_basin")]
+    DefaultBasin,
+    #[value(alias = "access_token")]
+    AccessToken,
+    #[value(alias = "account_endpoint")]
+    AccountEndpoint,
+    #[value(alias = "basin_endpoint")]
+    BasinEndpoint,
+}
+
+impl ConfigKey {
+    fn user_config_key(self) -> UserConfigKey {
+        match self {
+            Self::DefaultBasin => UserConfigKey::DefaultBasin,
+            Self::AccessToken => UserConfigKey::AccessToken,
+            Self::AccountEndpoint => UserConfigKey::AccountEndpoint,
+            Self::BasinEndpoint => UserConfigKey::BasinEndpoint,
+        }
+    }
 }
 
 struct Bootstrap {
@@ -108,12 +163,19 @@ fn root_or_current(sync_root: Option<PathBuf>) -> eyre::Result<PathBuf> {
     }
 }
 
-fn fresh_daemon_state_row(workspace_id: WorkspaceId, basin: BasinName) -> daemon_state::Row {
+fn fresh_daemon_state_row(
+    workspace_id: WorkspaceId,
+    basin: BasinName,
+    connection: &S2ConnectionConfig,
+) -> daemon_state::Row {
     let writer_id = rand::random::<[u8; 16]>();
+    let (s2_account_endpoint, s2_basin_endpoint) = connection.endpoint_pair_for_metadata();
 
     daemon_state::Row {
         workspace_id,
         s2_basin: basin,
+        s2_account_endpoint,
+        s2_basin_endpoint,
         daemon_writer_id: DaemonWriterId(bytes::Bytes::copy_from_slice(&writer_id)),
         stable_cursor: ..0,
         next_outbox_id: OutboxId::new(0),
@@ -149,23 +211,41 @@ async fn create_initialized_database(
     Ok(())
 }
 
-fn basin_from_env() -> eyre::Result<BasinName> {
-    let value = std::env::var("S2_BASIN")
-        .map_err(|_| eyre::eyre!("S2_BASIN is not set; export the s2.dev basin name to use"))?;
-    value
-        .parse()
-        .map_err(|err| eyre::eyre!("invalid S2_BASIN {value:?}: {err}"))
+fn optional_env(key: &str) -> eyre::Result<Option<String>> {
+    match std::env::var(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => eyre::bail!("{key} is not valid unicode"),
+    }
 }
 
-async fn bootstrap_init(sync_root: Option<PathBuf>) -> eyre::Result<Bootstrap> {
-    let basin = basin_from_env()?;
+fn basin_from_config(user_config: &UserConfig) -> eyre::Result<BasinName> {
+    let value = optional_env("S2_BASIN")?
+        .or_else(|| user_config.default_basin.clone())
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "S2_BASIN is not set and opbox user config has no default-basin; \
+                 run `ob config set default-basin <basin>` or export S2_BASIN"
+            )
+        })?;
+    value
+        .parse()
+        .map_err(|err| eyre::eyre!("invalid basin {value:?}: {err}"))
+}
+
+async fn bootstrap_init(
+    sync_root: Option<PathBuf>,
+    user_config: &UserConfig,
+) -> eyre::Result<Bootstrap> {
+    let basin = basin_from_config(user_config)?;
+    let s2_connection = S2ConnectionConfig::from_env_or_user_config(user_config)?;
     let sync_root = canonicalize_existing_dir(&root_or_current(sync_root)?)?;
     ensure_sync_root_unconfigured(&sync_root).await?;
-    let s2_basin = s2_basin_from_env(basin.clone()).await?;
+    let s2_basin = s2_basin_from_config(basin.clone(), &s2_connection).await?;
     let workspace_id = WorkspaceId::generate();
     debug!(?workspace_id, "generated workspace id");
     create_workspace_stream(&s2_basin, &workspace_id).await?;
-    let daemon_row = fresh_daemon_state_row(workspace_id, basin);
+    let daemon_row = fresh_daemon_state_row(workspace_id, basin, &s2_connection);
     create_metadata_dir(&sync_root)?;
     create_default_ignore_file(&sync_root)?;
     create_initialized_database(&sync_root, &daemon_row).await?;
@@ -181,17 +261,19 @@ async fn bootstrap_init(sync_root: Option<PathBuf>) -> eyre::Result<Bootstrap> {
 async fn bootstrap_clone(
     workspace: WorkspaceId,
     sync_root: Option<PathBuf>,
+    user_config: &UserConfig,
 ) -> eyre::Result<Bootstrap> {
-    let basin = basin_from_env()?;
+    let basin = basin_from_config(user_config)?;
+    let s2_connection = S2ConnectionConfig::from_env_or_user_config(user_config)?;
     let requested_root = root_or_current(sync_root)?;
     if requested_root.try_exists()? && requested_root.is_dir() {
         ensure_sync_root_unconfigured(&requested_root).await?;
     }
     let sync_root = ensure_clean_clone_root(&requested_root)?;
     ensure_sync_root_unconfigured(&sync_root).await?;
-    let s2_basin = s2_basin_from_env(basin.clone()).await?;
+    let s2_basin = s2_basin_from_config(basin.clone(), &s2_connection).await?;
     ensure_workspace_stream_exists(&s2_basin, &workspace).await?;
-    let daemon_row = fresh_daemon_state_row(workspace, basin);
+    let daemon_row = fresh_daemon_state_row(workspace, basin, &s2_connection);
     create_metadata_dir(&sync_root)?;
     create_initialized_database(&sync_root, &daemon_row).await?;
     Ok(Bootstrap {
@@ -228,7 +310,6 @@ async fn run_bootstrap(bootstrap: Bootstrap) -> eyre::Result<()> {
     if mode == RunMode::Clone {
         create_default_ignore_file(&sync_root)?;
     }
-    let persisted_env = persist_s2_env(&sync_root)?;
 
     let style = CliStyle::for_stdout();
     let title = match mode {
@@ -242,30 +323,11 @@ async fn run_bootstrap(bootstrap: Bootstrap) -> eyre::Result<()> {
     }
     print_status_row("basin", basin.as_ref(), style);
     print_status_row("root", sync_root.display(), style);
-    if !persisted_env.is_empty() {
-        println!(
-            "\nsaved {} to {} for the daemon; delete that file to use the shell environment instead",
-            style.bold(persisted_env.join(", ")),
-            style.bold(".opbox/env"),
-        );
-    }
     if mode == RunMode::Init {
         println!();
         println!(
             "your workspace is: {}",
             style.bold(style.green(&workspace_id.0))
-        );
-        println!();
-        println!("share this with others who want to sync with it:");
-        println!();
-        println!(
-            "  {} {}",
-            style.dim("$"),
-            style.bold(format!(
-                "S2_BASIN={} {CLIENT_COMMAND} clone --workspace {} <dir>",
-                basin.as_ref(),
-                workspace_id.0
-            ))
         );
         println!();
     }
@@ -485,6 +547,84 @@ fn print_status_row(label: &str, value: impl std::fmt::Display, style: CliStyle)
     println!("  {}  {}", style.dim(format!("{label:<13}")), value);
 }
 
+fn validate_config_value(key: ConfigKey, value: &str) -> eyre::Result<()> {
+    if value.is_empty() {
+        eyre::bail!("{} cannot be empty", key.user_config_key().as_str());
+    }
+    if value.contains('\n') {
+        eyre::bail!("{} cannot contain newlines", key.user_config_key().as_str());
+    }
+
+    match key {
+        ConfigKey::DefaultBasin => {
+            value
+                .parse::<BasinName>()
+                .map_err(|err| eyre::eyre!("invalid default-basin {value:?}: {err}"))?;
+        }
+        ConfigKey::AccessToken => {}
+        ConfigKey::AccountEndpoint => {
+            AccountEndpoint::new(value)
+                .map_err(|err| eyre::eyre!("invalid account-endpoint {value:?}: {err}"))?;
+        }
+        ConfigKey::BasinEndpoint => {
+            BasinEndpoint::new(value)
+                .map_err(|err| eyre::eyre!("invalid basin-endpoint {value:?}: {err}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn config_display_value(key: UserConfigKey, value: &str, reveal_secret: bool) -> String {
+    if key == UserConfigKey::AccessToken && !reveal_secret {
+        "<set>".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn run_config(command: ConfigCommand) -> eyre::Result<()> {
+    match command {
+        ConfigCommand::Path => {
+            println!("{}", user_config_path()?.display());
+        }
+        ConfigCommand::List => {
+            let config = load_user_config()?;
+            for (key, value) in config.entries() {
+                println!(
+                    "{} = {}",
+                    key.as_str(),
+                    config_display_value(key, value, false)
+                );
+            }
+        }
+        ConfigCommand::Get { key } => {
+            let config = load_user_config()?;
+            let key = key.user_config_key();
+            if let Some(value) = config.get(key) {
+                println!("{}", config_display_value(key, value, true));
+            }
+        }
+        ConfigCommand::Set { key, value } => {
+            validate_config_value(key, &value)?;
+            let mut config = load_user_config()?;
+            let user_key = key.user_config_key();
+            config.set(user_key, value);
+            let path = save_user_config(&config)?;
+            println!("set {} in {}", user_key.as_str(), path.display());
+        }
+        ConfigCommand::Unset { key } => {
+            let mut config = load_user_config()?;
+            let user_key = key.user_config_key();
+            config.unset(user_key);
+            let path = save_user_config(&config)?;
+            println!("unset {} in {}", user_key.as_str(), path.display());
+        }
+    }
+
+    Ok(())
+}
+
 async fn run_start(sync_root: Option<PathBuf>) -> eyre::Result<()> {
     let root = find_workspace_root(&root_or_current(sync_root)?)?;
     if let Ok(status) = request_valid_status(&root).await {
@@ -599,50 +739,6 @@ fn run_daemon_logs(follow: bool, sync_root: Option<PathBuf>) -> eyre::Result<()>
     Err(eyre::eyre!("failed to exec tail -f: {error}"))
 }
 
-/// Snapshot `S2_*` environment variables into `.opbox/env` so the daemon can
-/// run without the user's shell environment. Returns the persisted names.
-/// Never overwrites an existing env file.
-fn persist_s2_env(sync_root: &Path) -> eyre::Result<Vec<String>> {
-    let mut vars: Vec<(String, String)> = std::env::vars_os()
-        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-        .filter(|(key, value)| key.starts_with("S2_") && !value.contains('\n'))
-        .collect();
-    if vars.is_empty() {
-        return Ok(Vec::new());
-    }
-    vars.sort();
-
-    let mut body = String::from(
-        "# S2_* environment variables captured by `ob init`/`ob clone`.\n\
-         # Loaded by the opbox daemon at startup; the process environment\n\
-         # takes precedence over entries here.\n",
-    );
-    for (key, value) in &vars {
-        body.push_str(key);
-        body.push('=');
-        body.push_str(value);
-        body.push('\n');
-    }
-
-    let path = workspace_env_path(sync_root);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    match options.open(&path) {
-        Ok(mut file) => {
-            use std::io::Write;
-            file.write_all(body.as_bytes())?;
-            Ok(vars.into_iter().map(|(key, _)| key).collect())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(Vec::new()),
-        Err(error) => Err(eyre::eyre!("failed to write {}: {error}", path.display())),
-    }
-}
-
 fn with_failure_banner(command: &'static str, result: eyre::Result<()>) -> eyre::Result<()> {
     if result.is_err() {
         let style = CliStyle::for_stderr();
@@ -733,16 +829,25 @@ async fn main() {
     init_tracing();
 
     let result = match Args::parse().command {
+        Command::Config(command) => run_config(command),
         Command::Init { sync_root } => with_failure_banner(
             "init",
-            async { run_bootstrap(bootstrap_init(sync_root).await?).await }.await,
+            async {
+                let user_config = load_user_config()?;
+                run_bootstrap(bootstrap_init(sync_root, &user_config).await?).await
+            }
+            .await,
         ),
         Command::Clone {
             workspace,
             sync_root,
         } => with_failure_banner(
             "clone",
-            async { run_bootstrap(bootstrap_clone(workspace, sync_root).await?).await }.await,
+            async {
+                let user_config = load_user_config()?;
+                run_bootstrap(bootstrap_clone(workspace, sync_root, &user_config).await?).await
+            }
+            .await,
         ),
         Command::Start { sync_root } => run_start(sync_root).await,
         Command::Stop { sync_root } => run_stop(sync_root).await,
@@ -777,39 +882,21 @@ fn render_error(error: &eyre::Report) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opbox_core::app::workspace::metadata_dir;
 
     #[test]
-    fn persists_s2_vars_to_workspace_env_once() -> eyre::Result<()> {
-        let sync_root =
-            std::env::temp_dir().join(format!("ob-env-persist-test-{}", rand::random::<u64>()));
-        std::fs::create_dir(&sync_root)?;
-        std::fs::create_dir(metadata_dir(&sync_root))?;
+    fn fresh_daemon_state_pins_complete_endpoint_pair() -> eyre::Result<()> {
+        let workspace_id = WorkspaceId("0123456789abcdefghijklmnopqrstuv".to_string());
+        let basin: BasinName = "test-basin".parse()?;
+        let connection = S2ConnectionConfig {
+            access_token: "tok-123".to_string(),
+            account_endpoint: Some("account.s2.test".to_string()),
+            basin_endpoint: Some("{basin}.s2.test".to_string()),
+        };
 
-        let key = format!("S2_PERSIST_TEST_{}", rand::random::<u32>());
-        unsafe { std::env::set_var(&key, "tok-123") };
+        let row = fresh_daemon_state_row(workspace_id, basin, &connection);
+        assert_eq!(row.s2_account_endpoint.as_deref(), Some("account.s2.test"));
+        assert_eq!(row.s2_basin_endpoint.as_deref(), Some("{basin}.s2.test"));
 
-        let persisted = persist_s2_env(&sync_root)?;
-        assert!(persisted.contains(&key));
-        let body = std::fs::read_to_string(workspace_env_path(&sync_root))?;
-        assert!(body.contains(&format!("{key}=tok-123")));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(workspace_env_path(&sync_root))?
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600, "env file must not be world-readable");
-        }
-
-        // A second run must not clobber the existing file.
-        unsafe { std::env::set_var(&key, "tok-456") };
-        assert!(persist_s2_env(&sync_root)?.is_empty());
-        let body = std::fs::read_to_string(workspace_env_path(&sync_root))?;
-        assert!(body.contains("tok-123"));
-
-        unsafe { std::env::remove_var(&key) };
-        let _ = std::fs::remove_dir_all(&sync_root);
         Ok(())
     }
 }

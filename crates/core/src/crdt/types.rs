@@ -146,38 +146,4 @@ impl SharedMessage {
             Self::BinaryObjectPut { blob, .. } => blob.len(),
         }
     }
-
-    // pub fn from_row(row: outbox::Row) -> eyre::Result<(OutboxId, SharedMessage)> {
-    //     let outbox::Row {
-    //         outbox_id,
-    //         kind,
-    //         object_id,
-    //         wall_time,
-    //         writer_id,
-    //         payload,
-    //         created_at: _,
-    //     } = row;
-    //
-    //     let msg = match kind {
-    //         SharedMessageKind::NamespaceUpdate => SharedMessage::NamespaceUpdate {
-    //             yjs_update: payload,
-    //         },
-    //         SharedMessageKind::TextUpdate => SharedMessage::TextObjectUpdate {
-    //             object_id: object_id
-    //                 .ok_or_else(|| eyre::eyre!("text outbox row missing object_id"))?,
-    //             yjs_update: payload,
-    //         },
-    //         SharedMessageKind::BinaryPut => SharedMessage::BinaryObjectPut {
-    //             object_id: object_id
-    //                 .ok_or_else(|| eyre::eyre!("binary outbox row missing object_id"))?,
-    //             wall_time: wall_time
-    //                 .ok_or_else(|| eyre::eyre!("binary outbox row missing wall_time"))?,
-    //             writer_id: writer_id
-    //                 .ok_or_else(|| eyre::eyre!("binary outbox row missing writer_id"))?,
-    //             blob: payload,
-    //         },
-    //     };
-    //
-    //     Ok((outbox_id, msg))
-    // }
 }

@@ -11,7 +11,6 @@ pub const SOCKET_LINK_FILE_NAME: &str = "socket";
 pub const PID_FILE_NAME: &str = "daemon.pid";
 pub const LOCK_FILE_NAME: &str = "daemon.lock";
 pub const DAEMON_LOG_FILE_NAME: &str = "daemon.log";
-pub const ENV_FILE_NAME: &str = "env";
 
 pub fn metadata_dir(sync_root: &Path) -> PathBuf {
     sync_root.join(METADATA_DIR_NAME)
@@ -198,70 +197,6 @@ pub async fn ensure_sync_root_unconfigured(sync_root: &Path) -> eyre::Result<()>
     );
 }
 
-pub fn workspace_env_path(sync_root: &Path) -> PathBuf {
-    metadata_dir(sync_root).join(ENV_FILE_NAME)
-}
-
-/// Load `KEY=VALUE` pairs from `.opbox/env` into the process environment, if
-/// the file exists. Variables already present in the environment win; the
-/// file only fills gaps. Returns the names of the variables that were set.
-///
-/// Must be called during single-threaded startup: `set_var` is unsafe to mix
-/// with concurrent environment reads, so this has to run before the async
-/// runtime (or any other thread) exists.
-pub fn load_workspace_env(sync_root: &Path) -> eyre::Result<Vec<String>> {
-    let path = workspace_env_path(sync_root);
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => eyre::bail!("failed to read {}: {error}", path.display()),
-    };
-
-    let mut applied = Vec::new();
-    for (key, value) in
-        parse_env_file(&contents).map_err(|error| eyre::eyre!("{}: {error}", path.display()))?
-    {
-        if std::env::var_os(&key).is_none() {
-            // SAFETY: callers run this before spawning any threads.
-            unsafe { std::env::set_var(&key, &value) };
-            applied.push(key);
-        }
-    }
-    Ok(applied)
-}
-
-/// Minimal dotenv-style format: one `KEY=VALUE` per line, `#` comments and
-/// blank lines skipped, an optional `export ` prefix tolerated (shell
-/// paste-friendly), and one pair of matching single or double quotes stripped
-/// from the value. No interpolation or escapes.
-fn parse_env_file(contents: &str) -> eyre::Result<Vec<(String, String)>> {
-    let mut pairs = Vec::new();
-    for (index, line) in contents.lines().enumerate() {
-        let line_number = index + 1;
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
-
-        let Some((key, value)) = line.split_once('=') else {
-            eyre::bail!("line {line_number}: expected KEY=VALUE, got {line:?}");
-        };
-        let key = key.trim();
-        if key.is_empty() || key.chars().any(char::is_whitespace) {
-            eyre::bail!("line {line_number}: invalid variable name {key:?}");
-        }
-
-        let value = value.trim();
-        let value = match value.as_bytes() {
-            [b'"', .., b'"'] | [b'\'', .., b'\''] if value.len() >= 2 => &value[1..value.len() - 1],
-            _ => value,
-        };
-        pairs.push((key.to_string(), value.to_string()));
-    }
-    Ok(pairs)
-}
-
 pub fn create_metadata_dir(sync_root: &Path) -> eyre::Result<()> {
     std::fs::create_dir(metadata_dir(sync_root))?;
     Ok(())
@@ -385,6 +320,8 @@ mod tests {
         let daemon_row = crate::semantic::table::daemon_state::Row {
             workspace_id: WorkspaceId("0123456789abcdefghijklmnopqrstuv".to_string()),
             s2_basin: "test-basin".parse()?,
+            s2_account_endpoint: None,
+            s2_basin_endpoint: None,
             daemon_writer_id: DaemonWriterId(Bytes::from_static(b"0123456789abcdef")),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),
@@ -420,65 +357,6 @@ mod tests {
             .await?;
         assert!(!init_appears_incomplete(&db_path).await?);
 
-        let _ = std::fs::remove_dir_all(&sync_root);
-        Ok(())
-    }
-
-    #[test]
-    fn parses_env_file_lines() -> eyre::Result<()> {
-        let pairs = parse_env_file(
-            "# comment\n\
-             \n\
-             S2_ACCESS_TOKEN=abc123\n\
-             export RUST_LOG=debug\n\
-             QUOTED=\"hello world\"\n\
-             SINGLE='x=y'\n\
-             EMPTY=\n",
-        )?;
-        assert_eq!(
-            pairs,
-            vec![
-                ("S2_ACCESS_TOKEN".to_string(), "abc123".to_string()),
-                ("RUST_LOG".to_string(), "debug".to_string()),
-                ("QUOTED".to_string(), "hello world".to_string()),
-                ("SINGLE".to_string(), "x=y".to_string()),
-                ("EMPTY".to_string(), String::new()),
-            ]
-        );
-
-        assert!(parse_env_file("not a pair\n").is_err());
-        assert!(parse_env_file("BAD KEY=x\n").is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn loads_workspace_env_without_overriding_existing_vars() -> eyre::Result<()> {
-        let sync_root =
-            std::env::temp_dir().join(format!("opbox-env-test-{}", rand::random::<u64>()));
-        std::fs::create_dir(&sync_root)?;
-
-        // Missing file and missing metadata dir are both fine.
-        assert!(load_workspace_env(&sync_root)?.is_empty());
-
-        let fresh = format!("OPBOX_ENV_TEST_FRESH_{}", rand::random::<u32>());
-        let taken = format!("OPBOX_ENV_TEST_TAKEN_{}", rand::random::<u32>());
-        unsafe { std::env::set_var(&taken, "from-process") };
-
-        std::fs::create_dir(metadata_dir(&sync_root))?;
-        std::fs::write(
-            workspace_env_path(&sync_root),
-            format!("{fresh}=from-file\n{taken}=from-file\n"),
-        )?;
-
-        let applied = load_workspace_env(&sync_root)?;
-        assert_eq!(applied, vec![fresh.clone()]);
-        assert_eq!(std::env::var(&fresh)?, "from-file");
-        assert_eq!(std::env::var(&taken)?, "from-process");
-
-        unsafe {
-            std::env::remove_var(&fresh);
-            std::env::remove_var(&taken);
-        }
         let _ = std::fs::remove_dir_all(&sync_root);
         Ok(())
     }

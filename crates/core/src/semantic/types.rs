@@ -302,15 +302,19 @@ pub enum ProjectionActionKind {
     },
 }
 
+#[derive(strum::IntoStaticStr)]
 pub enum ProjectionActionResult {
+    #[strum(serialize = "write_file")]
     WriteFile {
         action_id: ProjectionActionId,
         result: GuardedWriteResult,
     },
+    #[strum(serialize = "delete_file")]
     DeleteFile {
         action_id: ProjectionActionId,
         result: GuardedDeleteResult,
     },
+    #[strum(serialize = "failed")]
     Failed {
         action_id: ProjectionActionId,
         error: eyre::Report,
