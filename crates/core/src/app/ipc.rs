@@ -1,10 +1,10 @@
 use crate::app::connectivity::ConnectivitySnapshot;
-use crate::app::db::load_daemon_state;
+use crate::app::db::{load_daemon_state, load_stable_namespace_blob};
 use crate::app::workspace::{real_socket_path, remove_stale_socket_files, socket_link_path};
 use crate::semantic::table::daemon_state;
 use crate::spy::SpyEvent;
 use bytes::Bytes;
-use futures::stream;
+use futures::{StreamExt, stream};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -262,7 +262,10 @@ async fn handle_control_request(
                 text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
             }
         },
-        (&Method::GET, "/spy") => Ok(spy_response(config.spy_tx.subscribe(), token)),
+        (&Method::GET, "/spy") => {
+            let namespace_snapshot = load_stable_namespace_blob(&config.db_path).await.ok();
+            Ok(spy_response(config.spy_tx.subscribe(), token, namespace_snapshot))
+        }
         (&Method::POST, "/stop") => match load_status(&config).await {
             Ok(status) => {
                 let response = json_response(
@@ -312,8 +315,26 @@ async fn load_status(config: &ControlServerConfig) -> eyre::Result<DaemonStatus>
     })
 }
 
-fn spy_response(rx: broadcast::Receiver<SpyEvent>, token: CancellationToken) -> Response<IpcBody> {
-    let event_stream = stream::unfold((rx, token), |(mut rx, token)| async move {
+fn spy_response(
+    rx: broadcast::Receiver<SpyEvent>,
+    token: CancellationToken,
+    namespace_snapshot: Option<bytes::Bytes>,
+) -> Response<IpcBody> {
+    let snapshot_frame = namespace_snapshot.and_then(|blob| {
+        let event = SpyEvent::NamespaceSnapshot {
+            yjs_state_b64: {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(&blob)
+            },
+        };
+        let json = serde_json::to_string(&event).ok()?;
+        Some(Ok::<_, Infallible>(Frame::data(Bytes::from(
+            format!("data: {json}\n\n"),
+        ))))
+    });
+    let snapshot_stream = stream::iter(snapshot_frame);
+
+    let live_stream = stream::unfold((rx, token), |(mut rx, token)| async move {
         let cancel_token = token.clone();
         let event = tokio::select! {
             () = cancel_token.cancelled() => return None,
@@ -334,6 +355,8 @@ fn spy_response(rx: broadcast::Receiver<SpyEvent>, token: CancellationToken) -> 
         };
         Some((Ok::<_, Infallible>(frame), (rx, token)))
     });
+
+    let event_stream = snapshot_stream.chain(live_stream);
 
     Response::builder()
         .status(StatusCode::OK)

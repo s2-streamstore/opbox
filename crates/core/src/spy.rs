@@ -12,6 +12,7 @@ const TEXT_PREVIEW_CHARS: usize = 120;
 pub enum SpyEvent {
     SharedMessage(SpySharedMessage),
     Lagged { skipped: u64 },
+    NamespaceSnapshot { yjs_state_b64: String },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -129,6 +130,27 @@ impl NamespaceSpyTracker {
             doc: NamespaceDoc::new(namespace::read_only_client_id()),
             known_active_ids: HashSet::new(),
             known_removed_ids: HashSet::new(),
+        }
+    }
+
+    /// Seed the tracker with a full namespace doc state (from DB snapshot).
+    /// This brings the tracker up to date without producing a diff.
+    pub fn seed_b64(&mut self, yjs_state_b64: &str) {
+        if let Some(bytes) = base64_decode(yjs_state_b64) {
+            self.seed(&bytes);
+        }
+    }
+
+    /// Seed the tracker with full namespace doc state bytes.
+    pub fn seed(&mut self, state_bytes: &[u8]) {
+        if let Ok(doc) = NamespaceDoc::from_full_state(namespace::read_only_client_id(), state_bytes) {
+            let active = doc.active_claims().ok().unwrap_or_default();
+            self.known_active_ids = active.iter().map(|c| c.claim_id.encode_b64()).collect();
+
+            let removed = doc.removed_claim_ids();
+            self.known_removed_ids = removed.iter().map(|id| id.encode_b64()).collect();
+
+            self.doc = doc;
         }
     }
 

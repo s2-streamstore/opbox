@@ -445,6 +445,9 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, ns_tracker: &mut NamespaceS
                 style.dim("skipped")
             );
         }
+        SpyEvent::NamespaceSnapshot { yjs_state_b64 } => {
+            ns_tracker.seed_b64(&yjs_state_b64);
+        }
         SpyEvent::SharedMessage(message) => match message.message {
             SpySharedMessageKind::NamespaceUpdate { yjs_update_b64 } => {
                 let summary = ns_tracker.apply_b64(&yjs_update_b64);
