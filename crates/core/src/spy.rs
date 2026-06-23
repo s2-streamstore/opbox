@@ -1,5 +1,7 @@
+use crate::crdt::namespace::{self, NamespaceDoc};
 use crate::crdt::types::SharedMessage;
 use crate::log::types::SharedMessageEnvelope;
+use std::collections::HashSet;
 use yrs::Update;
 use yrs::updates::decoder::Decode;
 
@@ -25,7 +27,9 @@ pub struct SpySharedMessage {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SpySharedMessageKind {
-    NamespaceUpdate,
+    NamespaceUpdate {
+        yjs_update_b64: String,
+    },
     TextUpdate {
         object_id_b64: String,
         summary: Option<TextUpdateSummary>,
@@ -35,6 +39,18 @@ pub enum SpySharedMessageKind {
         wall_time_ns: i64,
         writer_id_b64: String,
     },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NamespaceUpdateSummary {
+    pub added_claims: Vec<NamespaceClaimSummary>,
+    pub removed_claims: Vec<NamespaceClaimSummary>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NamespaceClaimSummary {
+    pub path: String,
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -61,7 +77,9 @@ impl SpyEvent {
 impl SpySharedMessageKind {
     fn from_shared_message(message: &SharedMessage) -> Self {
         match message {
-            SharedMessage::NamespaceUpdate { .. } => Self::NamespaceUpdate,
+            SharedMessage::NamespaceUpdate { yjs_update } => Self::NamespaceUpdate {
+                yjs_update_b64: base64_encode(yjs_update.as_ref()),
+            },
             SharedMessage::TextObjectUpdate {
                 object_id,
                 yjs_update,
@@ -79,6 +97,106 @@ impl SpySharedMessageKind {
                 wall_time_ns: nanos_i64(*wall_time),
                 writer_id_b64: writer_id.encode_b64(),
             },
+        }
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
+}
+
+/// Accumulates namespace CRDT state across updates to produce accurate diffs.
+///
+/// A single namespace delta applied to a fresh doc only works for creates
+/// (self-contained). Removals have causal dependencies on prior state and
+/// require the full history to resolve. This tracker maintains a running
+/// doc so both creates and deletes produce meaningful summaries with paths.
+pub struct NamespaceSpyTracker {
+    doc: NamespaceDoc,
+    known_active_ids: HashSet<String>,
+    known_removed_ids: HashSet<String>,
+}
+
+impl NamespaceSpyTracker {
+    pub fn new() -> Self {
+        Self {
+            doc: NamespaceDoc::new(namespace::read_only_client_id()),
+            known_active_ids: HashSet::new(),
+            known_removed_ids: HashSet::new(),
+        }
+    }
+
+    pub fn apply_b64(&mut self, yjs_update_b64: &str) -> Option<NamespaceUpdateSummary> {
+        let bytes = base64_decode(yjs_update_b64)?;
+        self.apply_update(&bytes)
+    }
+
+    pub fn apply_update(&mut self, update_bytes: &[u8]) -> Option<NamespaceUpdateSummary> {
+        self.doc.apply_update(update_bytes).ok()?;
+
+        let current_active = self.doc.active_claims().ok().unwrap_or_default();
+        let current_active_ids: HashSet<String> = current_active
+            .iter()
+            .map(|c| c.claim_id.encode_b64())
+            .collect();
+
+        let added_claims: Vec<_> = current_active
+            .iter()
+            .filter(|c| !self.known_active_ids.contains(&c.claim_id.encode_b64()))
+            .map(|claim| self.claim_summary(claim))
+            .collect();
+
+        let current_removed = self.doc.removed_claim_ids();
+        let current_removed_ids: HashSet<String> =
+            current_removed.iter().map(|id| id.encode_b64()).collect();
+
+        let removed_claims: Vec<_> = current_removed
+            .iter()
+            .filter(|id| !self.known_removed_ids.contains(&id.encode_b64()))
+            .filter_map(|id| {
+                let record = self.doc.get_claim(id)?;
+                let kind = self
+                    .doc
+                    .get_object(&record.object_id)
+                    .map(|meta| {
+                        let s: &'static str = meta.kind.into();
+                        s.to_string()
+                    })
+                    .unwrap_or_default();
+                Some(NamespaceClaimSummary {
+                    path: record.path.to_string(),
+                    kind,
+                })
+            })
+            .collect();
+
+        self.known_active_ids = current_active_ids;
+        self.known_removed_ids = current_removed_ids;
+
+        Some(NamespaceUpdateSummary {
+            added_claims,
+            removed_claims,
+        })
+    }
+
+    fn claim_summary(&self, claim: &crate::crdt::namespace::ActiveClaim) -> NamespaceClaimSummary {
+        let kind = self
+            .doc
+            .get_object(&claim.record.object_id)
+            .map(|meta| {
+                let s: &'static str = meta.kind.into();
+                s.to_string()
+            })
+            .unwrap_or_default();
+        NamespaceClaimSummary {
+            path: claim.record.path.to_string(),
+            kind,
         }
     }
 }
@@ -192,6 +310,79 @@ mod tests {
         assert_eq!(summary.inserted_chars, 0);
         assert_eq!(summary.deleted_items, " world".chars().count() as u64);
         assert_eq!(summary.inserted_preview, None);
+        Ok(())
+    }
+
+    #[test]
+    fn namespace_tracker_reports_new_claims() -> eyre::Result<()> {
+        use crate::crdt::namespace;
+        use crate::crdt::types::{NamespaceClaimId, ObjectId, ObjectKind};
+        use crate::fs::types::RelativePath;
+        use crate::types::DaemonWriterId;
+        use bytes::Bytes;
+
+        let doc = namespace::NamespaceDoc::new(1);
+        let sv = doc.state_vector();
+
+        let object_id = ObjectId(Bytes::from(vec![42u8; 16]));
+        let claim_id = NamespaceClaimId(Bytes::from(vec![43u8; 16]));
+        let writer_id = DaemonWriterId(Bytes::from(vec![7u8; 16]));
+        let path = RelativePath::parse("src/main.rs")?;
+
+        doc.add_new_object(&object_id, ObjectKind::Text, &writer_id);
+        doc.add_new_claim(&claim_id, &object_id, &path);
+        let update = doc.encode_update_since(&sv);
+
+        let mut tracker = NamespaceSpyTracker::new();
+        let summary = tracker
+            .apply_update(update.as_ref())
+            .expect("decoded namespace summary");
+
+        assert_eq!(summary.added_claims.len(), 1);
+        assert_eq!(summary.added_claims[0].path, "src/main.rs");
+        assert_eq!(summary.added_claims[0].kind, "text");
+        assert_eq!(summary.removed_claims.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn namespace_tracker_reports_removed_claims() -> eyre::Result<()> {
+        use crate::crdt::namespace;
+        use crate::crdt::types::{NamespaceClaimId, ObjectId, ObjectKind};
+        use crate::fs::types::RelativePath;
+        use crate::types::DaemonWriterId;
+        use bytes::Bytes;
+
+        let doc = namespace::NamespaceDoc::new(1);
+        let object_id = ObjectId(Bytes::from(vec![42u8; 16]));
+        let claim_id = NamespaceClaimId(Bytes::from(vec![43u8; 16]));
+        let writer_id = DaemonWriterId(Bytes::from(vec![7u8; 16]));
+        let path = RelativePath::parse("old.txt")?;
+
+        doc.add_new_object(&object_id, ObjectKind::Text, &writer_id);
+        doc.add_new_claim(&claim_id, &object_id, &path);
+
+        // Feed the create update first so the tracker has context.
+        let create_update = doc.encode_update_since(&yrs::StateVector::default());
+        let mut tracker = NamespaceSpyTracker::new();
+        let create_summary = tracker
+            .apply_update(create_update.as_ref())
+            .expect("create summary");
+        assert_eq!(create_summary.added_claims.len(), 1);
+
+        // Now remove the claim and feed the delta.
+        let sv = doc.state_vector();
+        doc.remove_claim(&claim_id);
+        let remove_update = doc.encode_update_since(&sv);
+
+        let summary = tracker
+            .apply_update(remove_update.as_ref())
+            .expect("remove summary");
+
+        assert_eq!(summary.added_claims.len(), 0);
+        assert_eq!(summary.removed_claims.len(), 1);
+        assert_eq!(summary.removed_claims[0].path, "old.txt");
+        assert_eq!(summary.removed_claims[0].kind, "text");
         Ok(())
     }
 }

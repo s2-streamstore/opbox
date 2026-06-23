@@ -21,7 +21,7 @@ use opbox_core::fs::ignore::{IGNORE_FILE_NAME, default_ignore_file_contents};
 use opbox_core::log::types::LogReadStop;
 use opbox_core::semantic::service::SemanticService;
 use opbox_core::semantic::table::daemon_state;
-use opbox_core::spy::{SpyEvent, SpySharedMessageKind};
+use opbox_core::spy::{NamespaceSpyTracker, SpyEvent, SpySharedMessageKind};
 use opbox_core::types::{DaemonWriterId, OutboxId, WorkspaceId};
 use s2_sdk::{
     S2Basin,
@@ -419,6 +419,7 @@ async fn run_spy(sync_root: Option<PathBuf>) -> eyre::Result<()> {
 
     let mut stream = ipc::open_spy_stream(&root).await?;
     let style = CliStyle::for_stdout();
+    let mut ns_tracker = NamespaceSpyTracker::new();
     loop {
         tokio::select! {
             ctrl_c = tokio::signal::ctrl_c() => {
@@ -427,7 +428,7 @@ async fn run_spy(sync_root: Option<PathBuf>) -> eyre::Result<()> {
             }
             event = stream.next_event() => {
                 match event? {
-                    Some(event) => print_spy_event(event, style),
+                    Some(event) => print_spy_event(event, style, &mut ns_tracker),
                     None => return Ok(()),
                 }
             }
@@ -435,7 +436,7 @@ async fn run_spy(sync_root: Option<PathBuf>) -> eyre::Result<()> {
     }
 }
 
-fn print_spy_event(event: SpyEvent, style: CliStyle) {
+fn print_spy_event(event: SpyEvent, style: CliStyle, ns_tracker: &mut NamespaceSpyTracker) {
     match event {
         SpyEvent::Lagged { skipped } => {
             println!(
@@ -445,15 +446,17 @@ fn print_spy_event(event: SpyEvent, style: CliStyle) {
             );
         }
         SpyEvent::SharedMessage(message) => match message.message {
-            SpySharedMessageKind::NamespaceUpdate => {
+            SpySharedMessageKind::NamespaceUpdate { yjs_update_b64 } => {
+                let summary = ns_tracker.apply_b64(&yjs_update_b64);
                 println!(
-                    "{}  {}  {}  {}  {}  {}",
+                    "{}  {}  {}  {}  {}  {}{}",
                     style.seq(message.sequence_number),
                     style.yellow(format!("{:<10}", "namespace")),
                     format_kv("from", short_id(&message.origin_writer_id_b64), style),
                     format_kv("outbox", message.origin_outbox_id, style),
                     style.bytes(message.payload_size_bytes),
                     format_kv("ts", message.timestamp_ns, style),
+                    format_namespace_summary(summary.as_ref(), style),
                 );
             }
             SpySharedMessageKind::TextUpdate {
@@ -492,6 +495,34 @@ fn print_spy_event(event: SpyEvent, style: CliStyle) {
             }
         },
     }
+}
+
+fn format_namespace_summary(
+    summary: Option<&opbox_core::spy::NamespaceUpdateSummary>,
+    style: CliStyle,
+) -> String {
+    let Some(summary) = summary else {
+        return String::new();
+    };
+
+    let mut out = String::new();
+    for claim in &summary.added_claims {
+        out.push_str(&format!(
+            "  {}{}={}",
+            style.green("+"),
+            style.green("claim"),
+            style.green(format!("\"{}\" ({})", claim.path, claim.kind))
+        ));
+    }
+    for claim in &summary.removed_claims {
+        out.push_str(&format!(
+            "  {}{}={}",
+            style.red("-"),
+            style.red("claim"),
+            style.red(format!("\"{}\" ({})", claim.path, claim.kind))
+        ));
+    }
+    out
 }
 
 fn format_text_summary(
