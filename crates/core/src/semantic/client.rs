@@ -9,7 +9,7 @@ use crate::types::{OutboxId, SharedMessageBatch};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use std::ops::{RangeTo, RangeToInclusive};
+use std::ops::{RangeInclusive, RangeTo, RangeToInclusive};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tracing::instrument;
@@ -25,7 +25,10 @@ pub enum SemanticClientResponse {
         boundary: u64,
         result: eyre::Result<NextWork>,
     },
-    ApplySharedMessageBatch(eyre::Result<()>),
+    ApplySharedMessageBatch {
+        sequence_range: RangeInclusive<SequenceNumber>,
+        result: eyre::Result<()>,
+    },
     ReadOutbox(eyre::Result<Vec<(OutboxId, SharedMessage)>>),
     ReleaseOutbox(eyre::Result<u64>),
     ReadStableCursor(eyre::Result<RangeTo<SequenceNumber>>),
@@ -72,7 +75,7 @@ impl SemanticClient {
 
     pub async fn next(&mut self) -> Option<SemanticClientResponse> {
         match self.pending.next().await {
-            Some(resp @ SemanticClientResponse::ApplySharedMessageBatch(_)) => {
+            Some(resp @ SemanticClientResponse::ApplySharedMessageBatch { .. }) => {
                 self.in_flight_apply_shared_message_batch = self
                     .in_flight_apply_shared_message_batch
                     .checked_sub(1)
@@ -189,9 +192,13 @@ impl SemanticClient {
 
     pub fn apply_shared_message_batch(&mut self, batch: SharedMessageBatch) -> eyre::Result<()> {
         assert!(self.can_accept_apply_shared_message_batch());
+        let sequence_range = batch.sequence_range.clone();
         self.enqueue(
             |reply| SemanticRequest::ApplySharedMessageBatch { batch, reply },
-            SemanticClientResponse::ApplySharedMessageBatch,
+            move |result| SemanticClientResponse::ApplySharedMessageBatch {
+                sequence_range,
+                result,
+            },
         )?;
 
         self.in_flight_apply_shared_message_batch += 1;

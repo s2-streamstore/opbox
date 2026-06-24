@@ -287,7 +287,7 @@ async fn await_apply_shared_message_batch(semantic: &mut SemanticClient) -> eyre
         .await
         .ok_or_else(|| eyre!("semantic actor stopped while clone waited for shared log apply"))?
     {
-        SemanticClientResponse::ApplySharedMessageBatch(result) => result,
+        SemanticClientResponse::ApplySharedMessageBatch { result, .. } => result,
         _ => Err(eyre!(
             "unexpected semantic response while clone waited for shared log apply"
         )),

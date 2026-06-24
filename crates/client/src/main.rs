@@ -357,8 +357,8 @@ async fn run_bootstrap(bootstrap: Bootstrap) -> eyre::Result<()> {
         daemon_row: bootstrap.daemon_row,
         s2_basin: bootstrap.s2_basin,
         clone_log_read_stop: bootstrap.clone_log_read_stop,
+        engine_status: None,
         spy_tx: None,
-        connectivity_status_tx: None,
     })
     .run_until_shutdown()
     .await?;
@@ -630,6 +630,7 @@ fn print_daemon_status(title: &str, status: &ipc::DaemonStatus, style: CliStyle)
     print_status_row("workspace", &status.workspace_id, style);
     print_status_row("root", &status.root, style);
     print_status_row("pid", status.pid, style);
+    print_status_row("engine phase", status.engine_phase, style);
     print_status_row("stable cursor", status.stable_cursor_end, style);
     print_status_row("connectivity", connectivity_status_text(status), style);
 }
