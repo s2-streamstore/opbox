@@ -549,38 +549,32 @@ fn format_namespace_summary(
 
     let mut out = String::new();
     for claim in &summary.added_claims {
-        out.push_str(&format!(
-            "  {}{}={}",
-            style.green("+"),
-            style.green("claim"),
-            style.green(format!("\"{}\"", claim.path))
-        ));
-        if shared_object_id != Some(claim.object_id_b64.as_str()) {
-            out.push(' ');
-            out.push_str(&format_kv(
-                "obj",
-                style.green(short_id(&claim.object_id_b64)),
-                style,
-            ));
+        out.push_str(&format!("  {}{}", style.green("+"), style.green("claim")));
+        if shared_object_id == Some(claim.object_id_b64.as_str()) {
+            out.push('=');
+            out.push_str(&style.green(format!("\"{}\" ({})", claim.path, claim.kind)));
+        } else {
+            out.push_str(&style.green(format!(
+                "=(\"{}\", obj={}, {})",
+                claim.path,
+                short_id(&claim.object_id_b64),
+                claim.kind
+            )));
         }
-        out.push_str(&style.green(format!(" ({})", claim.kind)));
     }
     for claim in &summary.removed_claims {
-        out.push_str(&format!(
-            "  {}{}={}",
-            style.red("-"),
-            style.red("claim"),
-            style.red(format!("\"{}\"", claim.path))
-        ));
-        if shared_object_id != Some(claim.object_id_b64.as_str()) {
-            out.push(' ');
-            out.push_str(&format_kv(
-                "obj",
-                style.red(short_id(&claim.object_id_b64)),
-                style,
-            ));
+        out.push_str(&format!("  {}{}", style.red("-"), style.red("claim")));
+        if shared_object_id == Some(claim.object_id_b64.as_str()) {
+            out.push('=');
+            out.push_str(&style.red(format!("\"{}\" ({})", claim.path, claim.kind)));
+        } else {
+            out.push_str(&style.red(format!(
+                "=(\"{}\", obj={}, {})",
+                claim.path,
+                short_id(&claim.object_id_b64),
+                claim.kind
+            )));
         }
-        out.push_str(&style.red(format!(" ({})", claim.kind)));
     }
     out
 }
