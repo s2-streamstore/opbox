@@ -15,7 +15,6 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -188,7 +187,6 @@ fn resolve_socket_path(sync_root: &Path) -> eyre::Result<PathBuf> {
 pub async fn serve_control(
     config: ControlServerConfig,
     token: CancellationToken,
-    stop_tx: mpsc::UnboundedSender<()>,
 ) -> eyre::Result<()> {
     let socket_path = real_socket_path(
         &config.daemon_state.workspace_id,
@@ -211,14 +209,12 @@ pub async fn serve_control(
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let config = config.clone();
-                let stop_tx = stop_tx.clone();
                 let token = token.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |request| {
                         handle_control_request(
                             request,
                             config.clone(),
-                            stop_tx.clone(),
                             token.clone(),
                         )
                     });
@@ -237,7 +233,6 @@ pub async fn serve_control(
 async fn handle_control_request(
     request: Request<Incoming>,
     config: ControlServerConfig,
-    stop_tx: mpsc::UnboundedSender<()>,
     token: CancellationToken,
 ) -> Result<Response<IpcBody>, Infallible> {
     let response = match (request.method(), request.uri().path()) {
@@ -255,21 +250,14 @@ async fn handle_control_request(
                 text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
             }
         },
-        (&Method::POST, "/stop") => match request_engine_status(&config).await {
-            Ok(status) => {
-                let response = json_response(
-                    StatusCode::OK,
-                    &StopResponse {
-                        workspace_id: status.workspace_id,
-                        pid: status.pid,
-                    },
-                );
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    let _ = stop_tx.send(());
-                });
-                response
-            }
+        (&Method::POST, "/stop") => match request_engine_stop(&config).await {
+            Ok(status) => json_response(
+                StatusCode::OK,
+                &StopResponse {
+                    workspace_id: status.workspace_id,
+                    pid: status.pid,
+                },
+            ),
             Err(error) => {
                 warn!(?error, "stop request failed");
                 text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
@@ -305,6 +293,12 @@ async fn request_engine_spy(
         Ok(rx) => Ok(rx),
         Err(error) => eyre::bail!(error),
     }
+}
+
+async fn request_engine_stop(config: &ControlServerConfig) -> eyre::Result<DaemonStatus> {
+    let (reply, rx) = oneshot::channel();
+    config.engine_tx.send(EngineCommand::Stop { reply })?;
+    Ok(rx.await?)
 }
 
 fn spy_response(rx: broadcast::Receiver<SpyEvent>, token: CancellationToken) -> Response<IpcBody> {
@@ -406,6 +400,7 @@ mod tests {
     use crate::app::workspace::metadata_dir;
     use crate::engine::actor::EngineCommand;
     use crate::types::{DaemonWriterId, OutboxId, WorkspaceId};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn status_round_trips_through_engine_mailbox() -> eyre::Result<()> {
@@ -445,12 +440,12 @@ mod tests {
                     }
                     Some(EngineCommand::Scan(_)) => panic!("unexpected scan command"),
                     Some(EngineCommand::OpenSpy { .. }) => panic!("unexpected open-spy command"),
+                    Some(EngineCommand::Stop { .. }) => panic!("unexpected stop command"),
                     None => panic!("engine command channel closed"),
                 }
             }
         });
         let token = CancellationToken::new();
-        let (stop_tx, _stop_rx) = mpsc::unbounded_channel();
         let server = tokio::spawn({
             let token = token.clone();
             let config = ControlServerConfig {
@@ -458,7 +453,7 @@ mod tests {
                 daemon_state: daemon_row,
                 engine_tx,
             };
-            async move { serve_control(config, token, stop_tx).await }
+            async move { serve_control(config, token).await }
         });
 
         wait_for_socket(&sync_root).await?;
@@ -506,11 +501,11 @@ mod tests {
                 }
                 Some(EngineCommand::Status { .. }) => panic!("unexpected status command"),
                 Some(EngineCommand::Scan(_)) => panic!("unexpected scan command"),
+                Some(EngineCommand::Stop { .. }) => panic!("unexpected stop command"),
                 None => panic!("engine command channel closed"),
             }
         });
         let token = CancellationToken::new();
-        let (stop_tx, _stop_rx) = mpsc::unbounded_channel();
         let server = tokio::spawn({
             let token = token.clone();
             let config = ControlServerConfig {
@@ -518,7 +513,7 @@ mod tests {
                 daemon_state: daemon_row,
                 engine_tx,
             };
-            async move { serve_control(config, token, stop_tx).await }
+            async move { serve_control(config, token).await }
         });
 
         wait_for_socket(&sync_root).await?;
@@ -530,6 +525,73 @@ mod tests {
 
         token.cancel();
         drop(stream);
+        server.await??;
+        engine.await?;
+        let _ = std::fs::remove_dir_all(&sync_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_round_trips_through_engine_mailbox() -> eyre::Result<()> {
+        let sync_root =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&sync_root)?;
+        std::fs::create_dir(metadata_dir(&sync_root))?;
+        let writer_bytes = rand::random::<[u8; 16]>();
+
+        let daemon_row = daemon_state::Row {
+            workspace_id: WorkspaceId("0123456789abcdefghijklmnopqrstuv".to_string()),
+            s2_basin: "test-basin".parse()?,
+            s2_account_endpoint: None,
+            s2_basin_endpoint: None,
+            daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
+            stable_cursor: ..0,
+            next_outbox_id: OutboxId::new(0),
+        };
+
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+        let expected_status = DaemonStatus {
+            workspace_id: daemon_row.workspace_id.0.clone(),
+            root: sync_root.display().to_string(),
+            pid: 123,
+            stable_cursor_end: 42,
+            daemon_writer_id_b64: daemon_row.daemon_writer_id.encode_b64(),
+            started_at_ns: 0,
+            engine_phase: EnginePhaseStatus::Scanning,
+            connectivity: ConnectivitySnapshot::starting(),
+        };
+        let engine = tokio::spawn({
+            let expected_status = expected_status.clone();
+            async move {
+                match engine_rx.recv().await {
+                    Some(EngineCommand::Stop { reply }) => {
+                        let _ = reply.send(expected_status);
+                    }
+                    Some(EngineCommand::Status { .. }) => panic!("unexpected status command"),
+                    Some(EngineCommand::Scan(_)) => panic!("unexpected scan command"),
+                    Some(EngineCommand::OpenSpy { .. }) => panic!("unexpected open-spy command"),
+                    None => panic!("engine command channel closed"),
+                }
+            }
+        });
+        let token = CancellationToken::new();
+        let server = tokio::spawn({
+            let token = token.clone();
+            let config = ControlServerConfig {
+                sync_root: sync_root.clone(),
+                daemon_state: daemon_row,
+                engine_tx,
+            };
+            async move { serve_control(config, token).await }
+        });
+
+        wait_for_socket(&sync_root).await?;
+
+        let response = request_stop(&sync_root).await?;
+        assert_eq!(response.workspace_id, expected_status.workspace_id);
+        assert_eq!(response.pid, expected_status.pid);
+
+        token.cancel();
         server.await??;
         engine.await?;
         let _ = std::fs::remove_dir_all(&sync_root);

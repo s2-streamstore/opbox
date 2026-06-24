@@ -18,7 +18,7 @@ use opbox_core::semantic::service::SemanticService;
 use std::path::PathBuf;
 use std::time::Duration;
 use time::OffsetDateTime;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
@@ -126,10 +126,9 @@ async fn run(
         daemon_state: daemon_row.clone(),
         engine_tx,
     };
-    let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
     let mut control_task = tokio::spawn({
         let token = token.clone();
-        async move { ipc::serve_control(control_config, token, stop_tx).await }
+        async move { ipc::serve_control(control_config, token).await }
     });
 
     info!(root = %sync_root.display(), "opbox daemon started");
@@ -141,10 +140,6 @@ async fn run(
             None
         }
         actor_error = actors.wait_for_actor_stop() => actor_error,
-        Some(()) = stop_rx.recv() => {
-            info!("stop requested");
-            None
-        }
         control_result = &mut control_task => {
             match control_result {
                 Ok(Ok(())) => None,

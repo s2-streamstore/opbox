@@ -32,6 +32,7 @@ const MAX_SHARED_MESSAGE_BUFFER_MS: Duration = Duration::from_millis(10);
 const FULL_SCAN_INTERVAL: Duration = Duration::from_millis(120000);
 const READ_OUTBOX_BATCH_SIZE: u64 = 1024;
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+const STOP_RESPONSE_GRACE: Duration = Duration::from_millis(50);
 
 #[derive(Ordinalize, Debug, Clone, Copy, PartialEq, Eq)]
 enum TimerEvent {
@@ -39,6 +40,7 @@ enum TimerEvent {
     FullScan,
     ReaderReconnect,
     WriterReconnect,
+    Stop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,6 +261,9 @@ pub enum EngineCommand {
     },
     OpenSpy {
         reply: oneshot::Sender<Result<broadcast::Receiver<SpyEvent>, String>>,
+    },
+    Stop {
+        reply: oneshot::Sender<DaemonStatus>,
     },
 }
 
@@ -922,6 +927,10 @@ impl Engine {
                                 self.log_writer_tx.send(LogWriterRequest::Reconnect)?;
                             }
                         }
+                        TimerEvent::Stop => {
+                            info!("stop requested; engine exiting");
+                            return Ok(());
+                        }
                     }
                 }
 
@@ -1112,6 +1121,14 @@ impl Engine {
                                 .map(|spy_tx| spy_tx.subscribe())
                                 .ok_or_else(|| "spy stream is not enabled".to_string());
                             let _ = reply.send(result);
+                        }
+                        EngineCommand::Stop { reply } => {
+                            let _ = reply.send(self.daemon_status());
+                            Self::coalescing_arm_at(
+                                &mut timer,
+                                TimerEvent::Stop,
+                                Instant::now() + STOP_RESPONSE_GRACE,
+                            );
                         }
                     }
                 }
