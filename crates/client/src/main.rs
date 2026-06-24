@@ -455,6 +455,11 @@ impl SpyPrintState {
             Some(daemon_writer_id_b64) if daemon_writer_id_b64 == origin_writer_id_b64 => {
                 format_kv("from", format!("{short}{}", style.green("(you)")), style)
             }
+            Some(_) => format_kv(
+                "from",
+                format!("{short}{}", style.magenta("(remote)")),
+                style,
+            ),
             _ => format_kv("from", short, style),
         }
     }
