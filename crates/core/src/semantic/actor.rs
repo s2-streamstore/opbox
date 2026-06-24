@@ -263,6 +263,20 @@ impl SemanticActor {
                     }
                 }));
             }
+            SemanticRequest::ReadStableNamespace { reply } => {
+                let op_id = self.next_op_id();
+                self.pending_ops.insert(
+                    op_id,
+                    PendingSemanticOp::new(PendingSemanticOpKind::ReadStableNamespace { reply }),
+                );
+                let service = self.service.clone();
+                self.running_ops.push(Box::pin(async move {
+                    SemanticTaskResult::ReadStableNamespace {
+                        op_id,
+                        result: service.read_stable_namespace().await,
+                    }
+                }));
+            }
             SemanticRequest::ApplySharedMessageBatch { batch, reply } => {
                 let op_id = self.next_op_id();
                 self.pending_ops.insert(
@@ -382,6 +396,12 @@ impl SemanticActor {
             (
                 SemanticTaskResult::ReadStableCursor { result, .. },
                 PendingSemanticOpKind::ReadStableCursor { reply },
+            ) => {
+                let _ = reply.send(result);
+            }
+            (
+                SemanticTaskResult::ReadStableNamespace { result, .. },
+                PendingSemanticOpKind::ReadStableNamespace { reply },
             ) => {
                 let _ = reply.send(result);
             }
@@ -967,6 +987,10 @@ enum PendingSemanticOpKind {
     ReadStableCursor {
         reply: oneshot::Sender<eyre::Result<std::ops::RangeTo<crate::log::types::SequenceNumber>>>,
     },
+    #[strum(serialize = "read_stable_namespace")]
+    ReadStableNamespace {
+        reply: oneshot::Sender<eyre::Result<bytes::Bytes>>,
+    },
     #[strum(serialize = "apply_shared_message_batch")]
     ApplySharedMessageBatch {
         reply: oneshot::Sender<eyre::Result<()>>,
@@ -1035,6 +1059,11 @@ enum SemanticTaskResult {
         op_id: SemanticOpId,
         result: eyre::Result<std::ops::RangeTo<crate::log::types::SequenceNumber>>,
     },
+    #[strum(serialize = "read_stable_namespace")]
+    ReadStableNamespace {
+        op_id: SemanticOpId,
+        result: eyre::Result<bytes::Bytes>,
+    },
 }
 
 impl SemanticTaskResult {
@@ -1051,7 +1080,8 @@ impl SemanticTaskResult {
             | Self::ReleaseOutbox { op_id, .. }
             | Self::ApplySharedMessageBatch { op_id, .. }
             | Self::TrimOutbox { op_id, .. }
-            | Self::ReadStableCursor { op_id, .. } => *op_id,
+            | Self::ReadStableCursor { op_id, .. }
+            | Self::ReadStableNamespace { op_id, .. } => *op_id,
         }
     }
 

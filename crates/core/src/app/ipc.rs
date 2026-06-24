@@ -1,9 +1,9 @@
 use crate::app::workspace::{real_socket_path, remove_stale_socket_files, socket_link_path};
 use crate::engine::actor::EngineCommand;
 use crate::semantic::table::daemon_state;
-use crate::spy::SpyEvent;
+use crate::spy::{SpyEvent, SpyOpen};
 use bytes::Bytes;
-use futures::stream;
+use futures::{StreamExt, stream};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -244,7 +244,7 @@ async fn handle_control_request(
             }
         },
         (&Method::GET, "/spy") => match request_engine_spy(&config).await {
-            Ok(rx) => Ok(spy_response(rx, token)),
+            Ok(open) => Ok(spy_response(open, token)),
             Err(error) => {
                 warn!(?error, "spy request failed");
                 text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
@@ -284,13 +284,11 @@ async fn request_engine_status(config: &ControlServerConfig) -> eyre::Result<Dae
     Ok(rx.await?)
 }
 
-async fn request_engine_spy(
-    config: &ControlServerConfig,
-) -> eyre::Result<broadcast::Receiver<SpyEvent>> {
+async fn request_engine_spy(config: &ControlServerConfig) -> eyre::Result<SpyOpen> {
     let (reply, rx) = oneshot::channel();
     config.engine_tx.send(EngineCommand::OpenSpy { reply })?;
     match rx.await? {
-        Ok(rx) => Ok(rx),
+        Ok(open) => Ok(open),
         Err(error) => eyre::bail!(error),
     }
 }
@@ -301,8 +299,15 @@ async fn request_engine_stop(config: &ControlServerConfig) -> eyre::Result<Daemo
     Ok(rx.await?)
 }
 
-fn spy_response(rx: broadcast::Receiver<SpyEvent>, token: CancellationToken) -> Response<IpcBody> {
-    let live_stream = stream::unfold((rx, token), |(mut rx, token)| async move {
+fn spy_response(open: SpyOpen, token: CancellationToken) -> Response<IpcBody> {
+    let snapshot = SpyEvent::NamespaceSnapshot {
+        yjs_state_b64: open.namespace_snapshot_b64,
+    };
+    let snapshot_frame =
+        spy_sse_frame(&snapshot).expect("namespace snapshot spy event is serializable");
+    let snapshot_stream = stream::iter([Ok::<_, Infallible>(snapshot_frame)]);
+
+    let live_stream = stream::unfold((open.events, token), |(mut rx, token)| async move {
         let cancel_token = token.clone();
         let event = tokio::select! {
             () = cancel_token.cancelled() => return None,
@@ -314,8 +319,8 @@ fn spy_response(rx: broadcast::Receiver<SpyEvent>, token: CancellationToken) -> 
             Err(broadcast::error::RecvError::Lagged(skipped)) => SpyEvent::Lagged { skipped },
             Err(broadcast::error::RecvError::Closed) => return None,
         };
-        let frame = match serde_json::to_string(&event) {
-            Ok(json) => Frame::data(Bytes::from(format!("data: {json}\n\n"))),
+        let frame = match spy_sse_frame(&event) {
+            Ok(frame) => frame,
             Err(error) => {
                 warn!(?error, "failed to serialize spy event");
                 return None;
@@ -323,13 +328,18 @@ fn spy_response(rx: broadcast::Receiver<SpyEvent>, token: CancellationToken) -> 
         };
         Some((Ok::<_, Infallible>(frame), (rx, token)))
     });
+    let event_stream = snapshot_stream.chain(live_stream);
 
     Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "text/event-stream")
         .header(hyper::header::CACHE_CONTROL, "no-cache")
-        .body(StreamBody::new(live_stream).boxed_unsync())
+        .body(StreamBody::new(event_stream).boxed_unsync())
         .expect("spy response is valid")
+}
+
+fn spy_sse_frame(event: &SpyEvent) -> Result<Frame<Bytes>, serde_json::Error> {
+    serde_json::to_string(event).map(|json| Frame::data(Bytes::from(format!("data: {json}\n\n"))))
 }
 
 fn json_response<T>(status: StatusCode, body: &T) -> eyre::Result<Response<IpcBody>>
@@ -497,7 +507,10 @@ mod tests {
         let engine = tokio::spawn(async move {
             match engine_rx.recv().await {
                 Some(EngineCommand::OpenSpy { reply }) => {
-                    let _ = reply.send(Ok(spy_tx.subscribe()));
+                    let _ = reply.send(Ok(SpyOpen {
+                        namespace_snapshot_b64: "dGVzdA==".to_string(),
+                        events: spy_tx.subscribe(),
+                    }));
                 }
                 Some(EngineCommand::Status { .. }) => panic!("unexpected status command"),
                 Some(EngineCommand::Scan(_)) => panic!("unexpected scan command"),
@@ -519,6 +532,11 @@ mod tests {
         wait_for_socket(&sync_root).await?;
 
         let mut stream = open_spy_stream(&sync_root).await?;
+        let event = stream.next_event().await?;
+        assert!(matches!(
+            event,
+            Some(SpyEvent::NamespaceSnapshot { yjs_state_b64 }) if yjs_state_b64 == "dGVzdA=="
+        ));
         spy_tx_for_test.send(SpyEvent::Lagged { skipped: 9 })?;
         let event = stream.next_event().await?;
         assert!(matches!(event, Some(SpyEvent::Lagged { skipped: 9 })));

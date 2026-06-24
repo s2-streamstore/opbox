@@ -1,6 +1,7 @@
 use super::shared_message_buffer::SharedMessageBuffer;
 use crate::app::connectivity::{ConnectivityRole, ConnectivitySnapshot, LinkStatus};
 use crate::app::control::{DaemonStatus, EnginePhaseStatus};
+use crate::crdt::types::SharedMessage;
 use crate::fs::client::{FsClient, FsClientResponse};
 use crate::fs::types::{GuardedWriteResult, RelativePath, ScanScope};
 use crate::log::types::{
@@ -12,7 +13,7 @@ use crate::semantic::types::{
     ProjectionActionResult, ProjectionEpoch, ProjectionEpochEndReason, ProjectionGeneration,
     SemanticEvent,
 };
-use crate::spy::SpyEvent;
+use crate::spy::{NamespaceSpyTracker, NamespaceUpdateSummary, SpyEvent, SpyOpen};
 use crate::types::{DaemonWriterId, SharedMessageBatch, WorkspaceId};
 use enum_ordinalize::Ordinalize;
 use eyre::eyre;
@@ -164,6 +165,21 @@ fn subtree_contains_scope(subtree: &RelativePath, scope: &ScanScope) -> bool {
     }
 }
 
+fn semantic_response_kind(response: &SemanticClientResponse) -> &'static str {
+    match response {
+        SemanticClientResponse::ApplyInitScan(_) => "apply_init_scan",
+        SemanticClientResponse::ApplyScan(_) => "apply_scan",
+        SemanticClientResponse::CommitImportEpoch(_) => "commit_import_epoch",
+        SemanticClientResponse::CommitProjectionEpoch(_) => "commit_projection_epoch",
+        SemanticClientResponse::GetNextWork { .. } => "get_next_work",
+        SemanticClientResponse::ApplySharedMessageBatch { .. } => "apply_shared_message_batch",
+        SemanticClientResponse::ReadOutbox(_) => "read_outbox",
+        SemanticClientResponse::ReleaseOutbox(_) => "release_outbox",
+        SemanticClientResponse::ReadStableCursor(_) => "read_stable_cursor",
+        SemanticClientResponse::ReadStableNamespace(_) => "read_stable_namespace",
+    }
+}
+
 /// Monotone id stamped on each `get_next_work` request so its response can be
 /// bound to the boundary that issued it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,7 +276,7 @@ pub enum EngineCommand {
         reply: oneshot::Sender<DaemonStatus>,
     },
     OpenSpy {
-        reply: oneshot::Sender<Result<broadcast::Receiver<SpyEvent>, String>>,
+        reply: oneshot::Sender<Result<SpyOpen, String>>,
     },
     Stop {
         reply: oneshot::Sender<DaemonStatus>,
@@ -322,6 +338,7 @@ pub struct Engine {
     semantic_event_rx: mpsc::UnboundedReceiver<SemanticEvent>,
     command_rx: mpsc::UnboundedReceiver<EngineCommand>,
     spy_tx: Option<broadcast::Sender<SpyEvent>>,
+    spy_namespace: NamespaceSpyTracker,
 
     status: EngineStatusState,
     phase: EnginePhase,
@@ -388,6 +405,7 @@ impl Engine {
             semantic_event_rx: events.semantic,
             command_rx: events.commands,
             spy_tx: events.spy,
+            spy_namespace: NamespaceSpyTracker::new(),
             status: EngineStatusState::new(status),
             phase: EnginePhase::Idle,
             cleanup_queue: VecDeque::new(),
@@ -431,6 +449,25 @@ impl Engine {
                 .expect("started_at timestamp nanos fit in i64"),
             engine_phase: self.phase.status(),
             connectivity: self.connectivity.snapshot(),
+        }
+    }
+
+    async fn initialize_spy_namespace(&mut self) -> eyre::Result<()> {
+        self.semantic_client.read_stable_namespace()?;
+        match self
+            .semantic_client
+            .next()
+            .await
+            .ok_or_else(|| eyre!("semantic actor stopped while reading stable namespace"))?
+        {
+            SemanticClientResponse::ReadStableNamespace(result) => {
+                self.spy_namespace.seed(result?.as_ref())?;
+                Ok(())
+            }
+            response => eyre::bail!(
+                "unexpected semantic response while initializing spy namespace: {}",
+                semantic_response_kind(&response)
+            ),
         }
     }
 
@@ -864,10 +901,28 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_spy_namespace_update(
+        &mut self,
+        message: &SharedMessage,
+    ) -> Option<NamespaceUpdateSummary> {
+        let SharedMessage::NamespaceUpdate { yjs_update } = message else {
+            return None;
+        };
+
+        match self.spy_namespace.try_apply_update(yjs_update.as_ref()) {
+            Ok(summary) => Some(summary),
+            Err(error) => {
+                warn!(?error, "failed to update in-memory spy namespace");
+                None
+            }
+        }
+    }
+
     pub async fn run(mut self, token: CancellationToken) -> eyre::Result<()> {
         let timer = MuxTimer::<{ TimerEvent::VARIANT_COUNT }>::default();
         tokio::pin!(timer);
 
+        self.initialize_spy_namespace().await?;
         self.request_scan(ScanScope::Full)?;
         self.request_outbox_read()?;
         Self::coalescing_arm_at(
@@ -945,8 +1000,12 @@ impl Engine {
                         }
                         LogReaderEvent::Status{ .. } => {}
                         LogReaderEvent::Read(envelope) => {
+                            let namespace_summary = self.apply_spy_namespace_update(&envelope.shared_message);
                             if let Some(spy_tx) = &self.spy_tx {
-                                let _ = spy_tx.send(SpyEvent::shared_message(&envelope));
+                                let _ = spy_tx.send(SpyEvent::shared_message_with_namespace_summary(
+                                    &envelope,
+                                    namespace_summary,
+                                ));
                             }
                             self.shared_message_buffer.insert(envelope);
                             if self.semantic_client.can_accept_apply_shared_message_batch() {
@@ -1085,6 +1144,9 @@ impl Engine {
                                 })?;
                             }
                         }
+                        SemanticClientResponse::ReadStableNamespace(_) => {
+                            eyre::bail!("sync engine received startup-only stable namespace response");
+                        }
                     }
                 }
 
@@ -1118,7 +1180,10 @@ impl Engine {
                             let result = self
                                 .spy_tx
                                 .as_ref()
-                                .map(|spy_tx| spy_tx.subscribe())
+                                .map(|spy_tx| SpyOpen {
+                                    namespace_snapshot_b64: self.spy_namespace.snapshot_b64(),
+                                    events: spy_tx.subscribe(),
+                                })
                                 .ok_or_else(|| "spy stream is not enabled".to_string());
                             let _ = reply.send(result);
                         }

@@ -6,6 +6,7 @@ use crate::semantic::types::{
     ProjectionEpochEndReason, SemanticRequest,
 };
 use crate::types::{OutboxId, SharedMessageBatch};
+use bytes::Bytes;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
@@ -32,6 +33,7 @@ pub enum SemanticClientResponse {
     ReadOutbox(eyre::Result<Vec<(OutboxId, SharedMessage)>>),
     ReleaseOutbox(eyre::Result<u64>),
     ReadStableCursor(eyre::Result<RangeTo<SequenceNumber>>),
+    ReadStableNamespace(eyre::Result<Bytes>),
 }
 
 pub struct SemanticClient {
@@ -183,6 +185,13 @@ impl SemanticClient {
         self.enqueue(
             |reply| SemanticRequest::ReadStableCursor { reply },
             SemanticClientResponse::ReadStableCursor,
+        )
+    }
+
+    pub fn read_stable_namespace(&mut self) -> eyre::Result<()> {
+        self.enqueue(
+            |reply| SemanticRequest::ReadStableNamespace { reply },
+            SemanticClientResponse::ReadStableNamespace,
         )
     }
 

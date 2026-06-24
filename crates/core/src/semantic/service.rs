@@ -400,6 +400,20 @@ impl SemanticService {
         .await
     }
 
+    pub(crate) async fn read_stable_namespace(&self) -> eyre::Result<Bytes> {
+        self.exec_tx("read_stable_namespace", move |tx| {
+            Box::pin(async move {
+                let stable_namespace = tx.select_stable_namespace().await?.ok_or_else(|| {
+                    SemanticTransactionError::InvariantViolation(
+                        "missing stable_namespace".to_string(),
+                    )
+                })?;
+                Ok(stable_namespace.doc_blob)
+            })
+        })
+        .await
+    }
+
     async fn exec_tx<T, F>(&self, label: &'static str, mut body: F) -> eyre::Result<T>
     where
         F: for<'tx> FnMut(

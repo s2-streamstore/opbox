@@ -449,8 +449,11 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, ns_tracker: &mut NamespaceS
             ns_tracker.seed_b64(&yjs_state_b64);
         }
         SpyEvent::SharedMessage(message) => match message.message {
-            SpySharedMessageKind::NamespaceUpdate { yjs_update_b64 } => {
-                let summary = ns_tracker.apply_b64(&yjs_update_b64);
+            SpySharedMessageKind::NamespaceUpdate {
+                yjs_update_b64,
+                summary,
+            } => {
+                let local_summary = ns_tracker.apply_b64(&yjs_update_b64);
                 println!(
                     "{}  {}  {}  {}  {}  {}{}",
                     style.seq(message.sequence_number),
@@ -459,7 +462,7 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, ns_tracker: &mut NamespaceS
                     format_kv("outbox", message.origin_outbox_id, style),
                     style.bytes(message.payload_size_bytes),
                     format_kv("ts", message.timestamp_ns, style),
-                    format_namespace_summary(summary.as_ref(), style),
+                    format_namespace_summary(summary.as_ref().or(local_summary.as_ref()), style),
                 );
             }
             SpySharedMessageKind::TextUpdate {

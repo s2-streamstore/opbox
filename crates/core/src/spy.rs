@@ -1,7 +1,9 @@
 use crate::crdt::namespace::{self, NamespaceDoc};
 use crate::crdt::types::SharedMessage;
 use crate::log::types::SharedMessageEnvelope;
+use eyre::WrapErr;
 use std::collections::HashSet;
+use tokio::sync::broadcast;
 use yrs::Update;
 use yrs::updates::decoder::Decode;
 
@@ -30,6 +32,7 @@ pub struct SpySharedMessage {
 pub enum SpySharedMessageKind {
     NamespaceUpdate {
         yjs_update_b64: String,
+        summary: Option<NamespaceUpdateSummary>,
     },
     TextUpdate {
         object_id_b64: String,
@@ -62,24 +65,44 @@ pub struct TextUpdateSummary {
     pub preview_truncated: bool,
 }
 
+#[derive(Debug)]
+pub struct SpyOpen {
+    pub namespace_snapshot_b64: String,
+    pub events: broadcast::Receiver<SpyEvent>,
+}
+
 impl SpyEvent {
     pub fn shared_message(envelope: &SharedMessageEnvelope) -> Self {
+        Self::shared_message_with_namespace_summary(envelope, None)
+    }
+
+    pub fn shared_message_with_namespace_summary(
+        envelope: &SharedMessageEnvelope,
+        namespace_summary: Option<NamespaceUpdateSummary>,
+    ) -> Self {
         Self::SharedMessage(SpySharedMessage {
             sequence_number: envelope.sequence_number,
             timestamp_ns: nanos_i64(envelope.timestamp),
             origin_writer_id_b64: envelope.origin.daemon_writer_id.encode_b64(),
             origin_outbox_id: envelope.origin.outbox_id.get(),
-            message: SpySharedMessageKind::from_shared_message(&envelope.shared_message),
+            message: SpySharedMessageKind::from_shared_message(
+                &envelope.shared_message,
+                namespace_summary,
+            ),
             payload_size_bytes: envelope.shared_message.approximate_size_bytes(),
         })
     }
 }
 
 impl SpySharedMessageKind {
-    fn from_shared_message(message: &SharedMessage) -> Self {
+    fn from_shared_message(
+        message: &SharedMessage,
+        namespace_summary: Option<NamespaceUpdateSummary>,
+    ) -> Self {
         match message {
             SharedMessage::NamespaceUpdate { yjs_update } => Self::NamespaceUpdate {
                 yjs_update_b64: base64_encode(yjs_update.as_ref()),
+                summary: namespace_summary,
             },
             SharedMessage::TextObjectUpdate {
                 object_id,
@@ -137,21 +160,28 @@ impl NamespaceSpyTracker {
     /// This brings the tracker up to date without producing a diff.
     pub fn seed_b64(&mut self, yjs_state_b64: &str) {
         if let Some(bytes) = base64_decode(yjs_state_b64) {
-            self.seed(&bytes);
+            let _ = self.seed(&bytes);
         }
     }
 
     /// Seed the tracker with full namespace doc state bytes.
-    pub fn seed(&mut self, state_bytes: &[u8]) {
-        if let Ok(doc) = NamespaceDoc::from_full_state(namespace::read_only_client_id(), state_bytes) {
-            let active = doc.active_claims().ok().unwrap_or_default();
-            self.known_active_ids = active.iter().map(|c| c.claim_id.encode_b64()).collect();
+    pub fn seed(&mut self, state_bytes: &[u8]) -> eyre::Result<()> {
+        let doc = NamespaceDoc::from_full_state(namespace::read_only_client_id(), state_bytes)
+            .wrap_err("seed namespace spy tracker")?;
+        let active = doc
+            .active_claims()
+            .wrap_err("read active namespace claims")?;
+        self.known_active_ids = active.iter().map(|c| c.claim_id.encode_b64()).collect();
 
-            let removed = doc.removed_claim_ids();
-            self.known_removed_ids = removed.iter().map(|id| id.encode_b64()).collect();
+        let removed = doc.removed_claim_ids();
+        self.known_removed_ids = removed.iter().map(|id| id.encode_b64()).collect();
 
-            self.doc = doc;
-        }
+        self.doc = doc;
+        Ok(())
+    }
+
+    pub fn snapshot_b64(&self) -> String {
+        base64_encode(self.doc.encode_full_state().as_ref())
     }
 
     pub fn apply_b64(&mut self, yjs_update_b64: &str) -> Option<NamespaceUpdateSummary> {
@@ -160,9 +190,21 @@ impl NamespaceSpyTracker {
     }
 
     pub fn apply_update(&mut self, update_bytes: &[u8]) -> Option<NamespaceUpdateSummary> {
-        self.doc.apply_update(update_bytes).ok()?;
+        self.try_apply_update(update_bytes).ok()
+    }
 
-        let current_active = self.doc.active_claims().ok().unwrap_or_default();
+    pub fn try_apply_update(
+        &mut self,
+        update_bytes: &[u8],
+    ) -> eyre::Result<NamespaceUpdateSummary> {
+        self.doc
+            .apply_update(update_bytes)
+            .wrap_err("apply namespace update to spy tracker")?;
+
+        let current_active = self
+            .doc
+            .active_claims()
+            .wrap_err("read active namespace claims")?;
         let current_active_ids: HashSet<String> = current_active
             .iter()
             .map(|c| c.claim_id.encode_b64())
@@ -201,7 +243,7 @@ impl NamespaceSpyTracker {
         self.known_active_ids = current_active_ids;
         self.known_removed_ids = current_removed_ids;
 
-        Some(NamespaceUpdateSummary {
+        Ok(NamespaceUpdateSummary {
             added_claims,
             removed_claims,
         })
