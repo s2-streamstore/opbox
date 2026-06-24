@@ -300,12 +300,17 @@ async fn request_engine_stop(config: &ControlServerConfig) -> eyre::Result<Daemo
 }
 
 fn spy_response(open: SpyOpen, token: CancellationToken) -> Response<IpcBody> {
+    let session_started = SpyEvent::SessionStarted {
+        daemon_writer_id_b64: open.daemon_writer_id_b64,
+    };
     let snapshot = SpyEvent::NamespaceSnapshot {
         yjs_state_b64: open.namespace_snapshot_b64,
     };
+    let session_frame =
+        spy_sse_frame(&session_started).expect("session-started spy event is serializable");
     let snapshot_frame =
         spy_sse_frame(&snapshot).expect("namespace snapshot spy event is serializable");
-    let snapshot_stream = stream::iter([Ok::<_, Infallible>(snapshot_frame)]);
+    let startup_stream = stream::iter([Ok::<_, Infallible>(session_frame), Ok(snapshot_frame)]);
 
     let live_stream = stream::unfold((open.events, token), |(mut rx, token)| async move {
         let cancel_token = token.clone();
@@ -328,7 +333,7 @@ fn spy_response(open: SpyOpen, token: CancellationToken) -> Response<IpcBody> {
         };
         Some((Ok::<_, Infallible>(frame), (rx, token)))
     });
-    let event_stream = snapshot_stream.chain(live_stream);
+    let event_stream = startup_stream.chain(live_stream);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -504,10 +509,13 @@ mod tests {
         let (spy_tx, _) = broadcast::channel(8);
         let spy_tx_for_test = spy_tx.clone();
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+        let daemon_writer_id_b64 = daemon_row.daemon_writer_id.encode_b64();
+        let expected_daemon_writer_id_b64 = daemon_writer_id_b64.clone();
         let engine = tokio::spawn(async move {
             match engine_rx.recv().await {
                 Some(EngineCommand::OpenSpy { reply }) => {
                     let _ = reply.send(Ok(SpyOpen {
+                        daemon_writer_id_b64: daemon_writer_id_b64,
                         namespace_snapshot_b64: "dGVzdA==".to_string(),
                         events: spy_tx.subscribe(),
                     }));
@@ -532,6 +540,13 @@ mod tests {
         wait_for_socket(&sync_root).await?;
 
         let mut stream = open_spy_stream(&sync_root).await?;
+        let event = stream.next_event().await?;
+        assert!(matches!(
+            event,
+            Some(SpyEvent::SessionStarted {
+                daemon_writer_id_b64
+            }) if daemon_writer_id_b64 == expected_daemon_writer_id_b64
+        ));
         let event = stream.next_event().await?;
         assert!(matches!(
             event,

@@ -1181,6 +1181,7 @@ impl Engine {
                                 .spy_tx
                                 .as_ref()
                                 .map(|spy_tx| SpyOpen {
+                                    daemon_writer_id_b64: self.status.daemon_writer_id.encode_b64(),
                                     namespace_snapshot_b64: self.spy_namespace.snapshot_b64(),
                                     events: spy_tx.subscribe(),
                                 })

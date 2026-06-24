@@ -419,7 +419,7 @@ async fn run_spy(sync_root: Option<PathBuf>) -> eyre::Result<()> {
 
     let mut stream = ipc::open_spy_stream(&root).await?;
     let style = CliStyle::for_stdout();
-    let mut ns_tracker = NamespaceSpyTracker::new();
+    let mut spy_state = SpyPrintState::new();
     loop {
         tokio::select! {
             ctrl_c = tokio::signal::ctrl_c() => {
@@ -428,7 +428,7 @@ async fn run_spy(sync_root: Option<PathBuf>) -> eyre::Result<()> {
             }
             event = stream.next_event() => {
                 match event? {
-                    Some(event) => print_spy_event(event, style, &mut ns_tracker),
+                    Some(event) => print_spy_event(event, style, &mut spy_state),
                     None => return Ok(()),
                 }
             }
@@ -436,8 +436,42 @@ async fn run_spy(sync_root: Option<PathBuf>) -> eyre::Result<()> {
     }
 }
 
-fn print_spy_event(event: SpyEvent, style: CliStyle, ns_tracker: &mut NamespaceSpyTracker) {
+struct SpyPrintState {
+    ns_tracker: NamespaceSpyTracker,
+    daemon_writer_id_b64: Option<String>,
+}
+
+impl SpyPrintState {
+    fn new() -> Self {
+        Self {
+            ns_tracker: NamespaceSpyTracker::new(),
+            daemon_writer_id_b64: None,
+        }
+    }
+
+    fn format_origin_writer(&self, origin_writer_id_b64: &str, style: CliStyle) -> String {
+        let short = short_id(origin_writer_id_b64);
+        match &self.daemon_writer_id_b64 {
+            Some(daemon_writer_id_b64) if daemon_writer_id_b64 == origin_writer_id_b64 => {
+                format_kv("from", format!("{short}{}", style.green("(you)")), style)
+            }
+            _ => format_kv("from", short, style),
+        }
+    }
+}
+
+fn print_spy_event(event: SpyEvent, style: CliStyle, state: &mut SpyPrintState) {
     match event {
+        SpyEvent::SessionStarted {
+            daemon_writer_id_b64,
+        } => {
+            println!(
+                "{}  {}",
+                style.dim("session"),
+                format_kv("daemon", short_id(&daemon_writer_id_b64), style),
+            );
+            state.daemon_writer_id_b64 = Some(daemon_writer_id_b64);
+        }
         SpyEvent::Lagged { skipped } => {
             println!(
                 "{} {}={skipped}",
@@ -446,23 +480,28 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, ns_tracker: &mut NamespaceS
             );
         }
         SpyEvent::NamespaceSnapshot { yjs_state_b64 } => {
-            ns_tracker.seed_b64(&yjs_state_b64);
+            state.ns_tracker.seed_b64(&yjs_state_b64);
         }
         SpyEvent::SharedMessage(message) => match message.message {
             SpySharedMessageKind::NamespaceUpdate {
                 yjs_update_b64,
                 summary,
             } => {
-                let local_summary = ns_tracker.apply_b64(&yjs_update_b64);
+                let local_summary = state.ns_tracker.apply_b64(&yjs_update_b64);
+                let summary = summary.as_ref().or(local_summary.as_ref());
+                let shared_object_id = summary.and_then(namespace_summary_single_object_id);
+                let shared_object_field = shared_object_id
+                    .map(|object_id| format!("  {}", format_kv("obj", short_id(object_id), style)))
+                    .unwrap_or_default();
+                let summary_field = format_namespace_summary(summary, shared_object_id, style);
                 println!(
-                    "{}  {}  {}  {}  {}  {}{}",
-                    style.seq(message.sequence_number),
+                    "{}  {}  {}  {}{}{}",
+                    style.spy_position(message.sequence_number, message.timestamp_ns),
+                    style.spy_bytes(message.payload_size_bytes),
                     style.yellow(format!("{:<10}", "namespace")),
-                    format_kv("from", short_id(&message.origin_writer_id_b64), style),
-                    format_kv("outbox", message.origin_outbox_id, style),
-                    style.bytes(message.payload_size_bytes),
-                    format_kv("ts", message.timestamp_ns, style),
-                    format_namespace_summary(summary.as_ref().or(local_summary.as_ref()), style),
+                    state.format_origin_writer(&message.origin_writer_id_b64, style),
+                    shared_object_field,
+                    summary_field,
                 );
             }
             SpySharedMessageKind::TextUpdate {
@@ -470,14 +509,12 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, ns_tracker: &mut NamespaceS
                 summary,
             } => {
                 println!(
-                    "{}  {}  {}  {}  {}  {}  {}{}",
-                    style.seq(message.sequence_number),
+                    "{}  {}  {}  {}  {}{}",
+                    style.spy_position(message.sequence_number, message.timestamp_ns),
+                    style.spy_bytes(message.payload_size_bytes),
                     style.cyan(format!("{:<10}", "text")),
+                    state.format_origin_writer(&message.origin_writer_id_b64, style),
                     format_kv("obj", short_id(&object_id_b64), style),
-                    format_kv("from", short_id(&message.origin_writer_id_b64), style),
-                    format_kv("outbox", message.origin_outbox_id, style),
-                    style.bytes(message.payload_size_bytes),
-                    format_kv("ts", message.timestamp_ns, style),
                     format_text_summary(summary.as_ref(), style),
                 );
             }
@@ -487,16 +524,14 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, ns_tracker: &mut NamespaceS
                 writer_id_b64,
             } => {
                 println!(
-                    "{}  {}  {}  {}  {}  {}  {}  {}  {}",
-                    style.seq(message.sequence_number),
+                    "{}  {}  {}  {}  {}  {}  {}",
+                    style.spy_position(message.sequence_number, message.timestamp_ns),
+                    style.spy_bytes(message.payload_size_bytes),
                     style.magenta(format!("{:<10}", "binary")),
+                    state.format_origin_writer(&message.origin_writer_id_b64, style),
                     format_kv("obj", short_id(&object_id_b64), style),
-                    format_kv("from", short_id(&message.origin_writer_id_b64), style),
-                    format_kv("outbox", message.origin_outbox_id, style),
                     format_kv("writer", short_id(&writer_id_b64), style),
                     format_kv("wall", wall_time_ns, style),
-                    style.bytes(message.payload_size_bytes),
-                    format_kv("ts", message.timestamp_ns, style),
                 );
             }
         },
@@ -505,6 +540,7 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, ns_tracker: &mut NamespaceS
 
 fn format_namespace_summary(
     summary: Option<&opbox_core::spy::NamespaceUpdateSummary>,
+    shared_object_id: Option<&str>,
     style: CliStyle,
 ) -> String {
     let Some(summary) = summary else {
@@ -514,25 +550,53 @@ fn format_namespace_summary(
     let mut out = String::new();
     for claim in &summary.added_claims {
         out.push_str(&format!(
-            "  {}{}={} {}",
+            "  {}{}={}",
             style.green("+"),
             style.green("claim"),
-            style.green(format!("\"{}\"", claim.path)),
-            format_kv("obj", style.green(short_id(&claim.object_id_b64)), style),
+            style.green(format!("\"{}\"", claim.path))
         ));
+        if shared_object_id != Some(claim.object_id_b64.as_str()) {
+            out.push(' ');
+            out.push_str(&format_kv(
+                "obj",
+                style.green(short_id(&claim.object_id_b64)),
+                style,
+            ));
+        }
         out.push_str(&style.green(format!(" ({})", claim.kind)));
     }
     for claim in &summary.removed_claims {
         out.push_str(&format!(
-            "  {}{}={} {}",
+            "  {}{}={}",
             style.red("-"),
             style.red("claim"),
-            style.red(format!("\"{}\"", claim.path)),
-            format_kv("obj", style.red(short_id(&claim.object_id_b64)), style),
+            style.red(format!("\"{}\"", claim.path))
         ));
+        if shared_object_id != Some(claim.object_id_b64.as_str()) {
+            out.push(' ');
+            out.push_str(&format_kv(
+                "obj",
+                style.red(short_id(&claim.object_id_b64)),
+                style,
+            ));
+        }
         out.push_str(&style.red(format!(" ({})", claim.kind)));
     }
     out
+}
+
+fn namespace_summary_single_object_id(
+    summary: &opbox_core::spy::NamespaceUpdateSummary,
+) -> Option<&str> {
+    let mut object_ids = summary
+        .added_claims
+        .iter()
+        .chain(summary.removed_claims.iter())
+        .map(|claim| claim.object_id_b64.as_str());
+    let first = object_ids.next()?;
+    object_ids
+        .all(|object_id| object_id == first)
+        .then_some(first)
 }
 
 fn format_text_summary(
@@ -587,12 +651,14 @@ impl CliStyle {
         }
     }
 
-    fn seq(self, sequence_number: u64) -> String {
-        self.dim(format!("..{sequence_number:<6}"))
+    fn spy_position(self, sequence_number: u64, timestamp_ns: i64) -> String {
+        let timestamp_ms = timestamp_ns / 1_000_000;
+        let position = format!("#{sequence_number}/{timestamp_ms}");
+        self.dim(format!("{position:<24}"))
     }
 
-    fn bytes(self, bytes: usize) -> String {
-        self.dim(format!("{bytes}B"))
+    fn spy_bytes(self, bytes: usize) -> String {
+        self.dim(format!("{bytes:>7}B"))
     }
 
     fn dim(self, value: impl std::fmt::Display) -> String {

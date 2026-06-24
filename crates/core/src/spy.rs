@@ -12,6 +12,7 @@ const TEXT_PREVIEW_CHARS: usize = 120;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SpyEvent {
+    SessionStarted { daemon_writer_id_b64: String },
     SharedMessage(SpySharedMessage),
     Lagged { skipped: u64 },
     NamespaceSnapshot { yjs_state_b64: String },
@@ -68,6 +69,7 @@ pub struct TextUpdateSummary {
 
 #[derive(Debug)]
 pub struct SpyOpen {
+    pub daemon_writer_id_b64: String,
     pub namespace_snapshot_b64: String,
     pub events: broadcast::Receiver<SpyEvent>,
 }
