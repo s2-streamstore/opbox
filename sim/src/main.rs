@@ -15,6 +15,7 @@ use opbox_core::app::connectivity::{ConnectivitySnapshot, LinkState};
 use opbox_core::app::db::{initialize_database, open_memory_database, semantic_pool};
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::crdt::types::ObjectId;
+use opbox_core::engine::actor::{EngineCommand, EngineStatusConfig};
 use opbox_core::fs::types::{RelativePath, ScanScope};
 use opbox_core::notify::nio::channel_notify_io;
 use opbox_core::semantic::service::{SemanticDebugSnapshot, SemanticService};
@@ -31,7 +32,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::time::{Duration, SystemTime};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -2900,8 +2901,13 @@ async fn run_daemon_client(
         .map_err(io_err)?
         .basin(daemon_row.s2_basin.clone());
     let (notify_io, notify_handle) = channel_notify_io();
-    let (connectivity_status_tx, connectivity_status_rx) =
-        watch::channel(ConnectivitySnapshot::starting());
+    let engine_status = EngineStatusConfig {
+        sync_root: PathBuf::from(format!("/sim/{name}")),
+        workspace_id: daemon_row.workspace_id.clone(),
+        daemon_writer_id: daemon_row.daemon_writer_id.clone(),
+        stable_cursor: daemon_row.stable_cursor.clone(),
+        started_at: time::OffsetDateTime::now_utc(),
+    };
     let cancellation_token = CancellationToken::new();
     let runtime = AppRuntime::new(AppRuntimeConfig {
         mode: RunMode::Sync,
@@ -2911,10 +2917,13 @@ async fn run_daemon_client(
         daemon_row,
         s2_basin,
         clone_log_read_stop: None,
+        engine_status: Some(engine_status),
         spy_tx: None,
-        connectivity_status_tx: Some(connectivity_status_tx),
     });
     let mut actors = runtime.spawn(cancellation_token.clone());
+    let engine_tx = actors
+        .engine_command_tx()
+        .ok_or_else(|| io_err("sync runtime did not expose engine command mailbox"))?;
 
     loop {
         tokio::select! {
@@ -2964,7 +2973,17 @@ async fn run_daemon_client(
                         let _ = reply.send(result);
                     }
                     SimDaemonCommand::ConnectivityStatus { reply } => {
-                        let _ = reply.send(connectivity_status_rx.borrow().clone());
+                        let (status_reply, status_rx) = oneshot::channel();
+                        let result = match engine_tx.send(EngineCommand::Status {
+                            reply: status_reply,
+                        }) {
+                            Ok(()) => status_rx
+                                .await
+                                .map_err(|err| err.to_string())
+                                .map(|status| status.connectivity),
+                            Err(err) => Err(err.to_string()),
+                        };
+                        let _ = reply.send(result);
                     }
                     SimDaemonCommand::RequestScan { scope, reply } => {
                         let result = notify_handle.send_scope(scope).map_err(|err| err.to_string());
@@ -3154,7 +3173,7 @@ impl SimDaemonHandle {
             .send(SimDaemonCommand::ConnectivityStatus { reply })
             .await
             .map_err(io_err)?;
-        recv.await.map_err(io_err)
+        recv.await.map_err(io_err)?.map_err(io_err)
     }
 
     async fn request_single_file_scan(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -3318,7 +3337,7 @@ enum SimDaemonCommand {
         reply: oneshot::Sender<Result<SemanticDebugSnapshot, String>>,
     },
     ConnectivityStatus {
-        reply: oneshot::Sender<ConnectivitySnapshot>,
+        reply: oneshot::Sender<Result<ConnectivitySnapshot, String>>,
     },
     RequestScan {
         scope: ScanScope,

@@ -1,23 +1,29 @@
 use super::shared_message_buffer::SharedMessageBuffer;
 use crate::app::connectivity::{ConnectivityRole, ConnectivitySnapshot, LinkStatus};
+use crate::app::control::{DaemonStatus, EnginePhaseStatus};
+use crate::crdt::types::SharedMessage;
 use crate::fs::client::{FsClient, FsClientResponse};
 use crate::fs::types::{GuardedWriteResult, RelativePath, ScanScope};
-use crate::log::types::{LogReaderEvent, LogReaderRequest, LogWriterRequest, LogWriterResponse};
+use crate::log::types::{
+    LogReaderEvent, LogReaderRequest, LogWriterRequest, LogWriterResponse, SequenceNumber,
+};
 use crate::semantic::client::{SemanticClient, SemanticClientResponse};
 use crate::semantic::types::{
     ImportAction, ImportActionId, ImportEpoch, NextWork, ProjectionAction, ProjectionActionId,
     ProjectionActionResult, ProjectionEpoch, ProjectionEpochEndReason, ProjectionGeneration,
     SemanticEvent,
 };
-use crate::spy::SpyEvent;
-use crate::types::SharedMessageBatch;
+use crate::spy::{NamespaceSpyTracker, NamespaceUpdateSummary, SpyEvent, SpyOpen};
+use crate::types::{DaemonWriterId, SharedMessageBatch, WorkspaceId};
 use enum_ordinalize::Ordinalize;
 use eyre::eyre;
 use std::collections::{BTreeSet, VecDeque};
+use std::ops::{RangeInclusive, RangeTo};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
 use time::OffsetDateTime;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_muxt::{CoalesceMode, MuxTimer};
 use tokio_util::sync::CancellationToken;
@@ -27,6 +33,7 @@ const MAX_SHARED_MESSAGE_BUFFER_MS: Duration = Duration::from_millis(10);
 const FULL_SCAN_INTERVAL: Duration = Duration::from_millis(120000);
 const READ_OUTBOX_BATCH_SIZE: u64 = 1024;
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+const STOP_RESPONSE_GRACE: Duration = Duration::from_millis(50);
 
 #[derive(Ordinalize, Debug, Clone, Copy, PartialEq, Eq)]
 enum TimerEvent {
@@ -34,6 +41,7 @@ enum TimerEvent {
     FullScan,
     ReaderReconnect,
     WriterReconnect,
+    Stop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +201,19 @@ enum EnginePhase {
     Projecting(ProjectionPhase),
 }
 
+impl EnginePhase {
+    fn status(&self) -> EnginePhaseStatus {
+        match self {
+            Self::Idle => EnginePhaseStatus::Idle,
+            Self::AwaitingNextWork { .. } => EnginePhaseStatus::AwaitingNextWork,
+            Self::Scanning { .. } => EnginePhaseStatus::Scanning,
+            Self::PlanningImport => EnginePhaseStatus::PlanningImport,
+            Self::Importing(_) => EnginePhaseStatus::Importing,
+            Self::Projecting(_) => EnginePhaseStatus::Projecting,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ImportPhase {
     Dispatching {
@@ -236,6 +257,57 @@ enum ProjectionPhase {
 #[derive(Debug)]
 pub enum EngineCommand {
     Scan(ScanScope),
+    Status {
+        reply: oneshot::Sender<DaemonStatus>,
+    },
+    OpenSpy {
+        reply: oneshot::Sender<Result<SpyOpen, String>>,
+    },
+    Stop {
+        reply: oneshot::Sender<DaemonStatus>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineStatusConfig {
+    pub sync_root: PathBuf,
+    pub workspace_id: WorkspaceId,
+    pub daemon_writer_id: DaemonWriterId,
+    pub stable_cursor: RangeTo<SequenceNumber>,
+    pub started_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
+struct EngineStatusState {
+    sync_root: PathBuf,
+    workspace_id: WorkspaceId,
+    daemon_writer_id: DaemonWriterId,
+    denormalized_stable_cursor: RangeTo<SequenceNumber>,
+    started_at: OffsetDateTime,
+}
+
+impl EngineStatusState {
+    fn new(config: EngineStatusConfig) -> Self {
+        Self {
+            sync_root: config.sync_root,
+            workspace_id: config.workspace_id,
+            daemon_writer_id: config.daemon_writer_id,
+            denormalized_stable_cursor: config.stable_cursor,
+            started_at: config.started_at,
+        }
+    }
+
+    fn update_stable_cursor_after_batch(
+        &mut self,
+        sequence_range: &RangeInclusive<SequenceNumber>,
+    ) -> eyre::Result<()> {
+        let stable_cursor_end = sequence_range
+            .end()
+            .checked_add(1)
+            .ok_or_else(|| eyre!("shared message sequence number overflow"))?;
+        self.denormalized_stable_cursor = ..stable_cursor_end;
+        Ok(())
+    }
 }
 
 pub struct Engine {
@@ -251,8 +323,9 @@ pub struct Engine {
     semantic_event_rx: mpsc::UnboundedReceiver<SemanticEvent>,
     command_rx: mpsc::UnboundedReceiver<EngineCommand>,
     spy_tx: Option<broadcast::Sender<SpyEvent>>,
-    connectivity_status_tx: Option<watch::Sender<ConnectivitySnapshot>>,
+    spy_namespace: NamespaceSpyTracker,
 
+    status: EngineStatusState,
     phase: EnginePhase,
     /// Daemon-owned temp files left by failed guarded writes. These are GC-only:
     /// Semantic still receives the original projection conflict result.
@@ -291,17 +364,21 @@ pub struct EngineEvents {
     pub semantic: mpsc::UnboundedReceiver<SemanticEvent>,
     pub commands: mpsc::UnboundedReceiver<EngineCommand>,
     pub spy: Option<broadcast::Sender<SpyEvent>>,
-    pub connectivity_status: Option<watch::Sender<ConnectivitySnapshot>>,
 }
 
 pub struct EngineConfig {
     pub clients: EngineClients,
     pub events: EngineEvents,
+    pub status: EngineStatusConfig,
 }
 
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
-        let EngineConfig { clients, events } = config;
+        let EngineConfig {
+            clients,
+            events,
+            status,
+        } = config;
 
         Self {
             fs_client: clients.fs,
@@ -313,7 +390,8 @@ impl Engine {
             semantic_event_rx: events.semantic,
             command_rx: events.commands,
             spy_tx: events.spy,
-            connectivity_status_tx: events.connectivity_status,
+            spy_namespace: NamespaceSpyTracker::new(),
+            status: EngineStatusState::new(status),
             phase: EnginePhase::Idle,
             cleanup_queue: VecDeque::new(),
             shared_message_buffer: SharedMessageBuffer::new(MAX_SHARED_MESSAGE_BUFFER_MS),
@@ -345,9 +423,36 @@ impl Engine {
         (*timer).as_mut().cancel(event as usize);
     }
 
-    fn publish_connectivity_status(&self) {
-        if let Some(tx) = &self.connectivity_status_tx {
-            let _ = tx.send(self.connectivity.snapshot());
+    fn daemon_status(&self) -> DaemonStatus {
+        DaemonStatus {
+            workspace_id: self.status.workspace_id.0.clone(),
+            root: self.status.sync_root.display().to_string(),
+            pid: std::process::id(),
+            stable_cursor_end: self.status.denormalized_stable_cursor.end,
+            daemon_writer_id_b64: self.status.daemon_writer_id.encode_b64(),
+            started_at_ns: i64::try_from(self.status.started_at.unix_timestamp_nanos())
+                .expect("started_at timestamp nanos fit in i64"),
+            engine_phase: self.phase.status(),
+            connectivity: self.connectivity.snapshot(),
+        }
+    }
+
+    async fn initialize_spy_namespace(&mut self) -> eyre::Result<()> {
+        self.semantic_client.read_stable_namespace()?;
+        match self
+            .semantic_client
+            .next()
+            .await
+            .ok_or_else(|| eyre!("semantic actor stopped while reading stable namespace"))?
+        {
+            SemanticClientResponse::ReadStableNamespace(result) => {
+                self.spy_namespace.seed(result?.as_ref())?;
+                Ok(())
+            }
+            response => eyre::bail!(
+                "unexpected semantic response while initializing spy namespace: {}",
+                Into::<&'static str>::into(&response)
+            ),
         }
     }
 
@@ -367,7 +472,6 @@ impl Engine {
         } else {
             debug!(role = role.as_str(), "shared log link online");
         }
-        self.publish_connectivity_status();
     }
 
     fn mark_link_disconnected(
@@ -394,8 +498,6 @@ impl Engine {
             ConnectivityRole::Writer => TimerEvent::WriterReconnect,
         };
         Self::coalescing_arm_at(timer, event, retry_at);
-        self.publish_connectivity_status();
-
         if role == ConnectivityRole::Writer {
             self.outbox_read_requested = true;
             self.request_outbox_release()?;
@@ -406,7 +508,6 @@ impl Engine {
     fn mark_link_reconnecting(&mut self, role: ConnectivityRole) {
         self.connectivity.link_mut(role).reconnect();
         debug!(role = role.as_str(), "shared log link reconnecting");
-        self.publish_connectivity_status();
     }
 
     fn link_is_online(&self, role: ConnectivityRole) -> bool {
@@ -785,11 +886,28 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_spy_namespace_update(
+        &mut self,
+        message: &SharedMessage,
+    ) -> Option<NamespaceUpdateSummary> {
+        let SharedMessage::NamespaceUpdate { yjs_update } = message else {
+            return None;
+        };
+
+        match self.spy_namespace.try_apply_update(yjs_update.as_ref()) {
+            Ok(summary) => Some(summary),
+            Err(error) => {
+                warn!(?error, "failed to update in-memory spy namespace");
+                None
+            }
+        }
+    }
+
     pub async fn run(mut self, token: CancellationToken) -> eyre::Result<()> {
         let timer = MuxTimer::<{ TimerEvent::VARIANT_COUNT }>::default();
         tokio::pin!(timer);
 
-        self.publish_connectivity_status();
+        self.initialize_spy_namespace().await?;
         self.request_scan(ScanScope::Full)?;
         self.request_outbox_read()?;
         Self::coalescing_arm_at(
@@ -849,6 +967,10 @@ impl Engine {
                                 self.log_writer_tx.send(LogWriterRequest::Reconnect)?;
                             }
                         }
+                        TimerEvent::Stop => {
+                            info!("stop requested; engine exiting");
+                            return Ok(());
+                        }
                     }
                 }
 
@@ -863,8 +985,12 @@ impl Engine {
                         }
                         LogReaderEvent::Status{ .. } => {}
                         LogReaderEvent::Read(envelope) => {
+                            let namespace_summary = self.apply_spy_namespace_update(&envelope.shared_message);
                             if let Some(spy_tx) = &self.spy_tx {
-                                let _ = spy_tx.send(SpyEvent::shared_message(&envelope));
+                                let _ = spy_tx.send(SpyEvent::shared_message_with_namespace_summary(
+                                    &envelope,
+                                    namespace_summary,
+                                ));
                             }
                             self.shared_message_buffer.insert(envelope);
                             if self.semantic_client.can_accept_apply_shared_message_batch() {
@@ -942,8 +1068,13 @@ impl Engine {
                         SemanticClientResponse::GetNextWork { boundary, result } => {
                             self.handle_get_next_work_response(boundary, result)?;
                         }
-                        SemanticClientResponse::ApplySharedMessageBatch(result) => {
+                        SemanticClientResponse::ApplySharedMessageBatch {
+                            sequence_range,
+                            result,
+                        } => {
                             result?;
+                            self.status
+                                .update_stable_cursor_after_batch(&sequence_range)?;
                             if let Some(next_fire_at) = self.shared_message_buffer.next_fire_at() {
                                 Self::coalescing_arm_at(&mut timer, TimerEvent::SharedMessageBufferDrain, next_fire_at);
                             }
@@ -998,6 +1129,9 @@ impl Engine {
                                 })?;
                             }
                         }
+                        SemanticClientResponse::ReadStableNamespace(_) => {
+                            eyre::bail!("sync engine received startup-only stable namespace response");
+                        }
                     }
                 }
 
@@ -1023,6 +1157,29 @@ impl Engine {
                     match command {
                         EngineCommand::Scan(scope) => {
                             self.request_scan(scope)?;
+                        }
+                        EngineCommand::Status { reply } => {
+                            let _ = reply.send(self.daemon_status());
+                        }
+                        EngineCommand::OpenSpy { reply } => {
+                            let result = self
+                                .spy_tx
+                                .as_ref()
+                                .map(|spy_tx| SpyOpen {
+                                    daemon_writer_id_b64: self.status.daemon_writer_id.encode_b64(),
+                                    namespace_snapshot_b64: self.spy_namespace.snapshot_b64(),
+                                    events: spy_tx.subscribe(),
+                                })
+                                .ok_or_else(|| "spy stream is not enabled".to_string());
+                            let _ = reply.send(result);
+                        }
+                        EngineCommand::Stop { reply } => {
+                            let _ = reply.send(self.daemon_status());
+                            Self::coalescing_arm_at(
+                                &mut timer,
+                                TimerEvent::Stop,
+                                Instant::now() + STOP_RESPONSE_GRACE,
+                            );
                         }
                     }
                 }

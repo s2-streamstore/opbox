@@ -400,6 +400,20 @@ impl SemanticService {
         .await
     }
 
+    pub(crate) async fn read_stable_namespace(&self) -> eyre::Result<Bytes> {
+        self.exec_tx("read_stable_namespace", move |tx| {
+            Box::pin(async move {
+                let stable_namespace = tx.select_stable_namespace().await?.ok_or_else(|| {
+                    SemanticTransactionError::InvariantViolation(
+                        "missing stable_namespace".to_string(),
+                    )
+                })?;
+                Ok(stable_namespace.doc_blob)
+            })
+        })
+        .await
+    }
+
     async fn exec_tx<T, F>(&self, label: &'static str, mut body: F) -> eyre::Result<T>
     where
         F: for<'tx> FnMut(
@@ -1058,7 +1072,7 @@ async fn commit_completed_projection_action_tx(
             Err(SemanticTransactionError::InvariantViolation(format!(
                 "cannot commit invalidated projection write result for action {:?}: {}",
                 action.action_id,
-                guarded_write_result_kind(result)
+                Into::<&'static str>::into(result)
             )))
         }
         ProjectionActionResult::DeleteFile {
@@ -1087,16 +1101,6 @@ async fn commit_completed_projection_action_tx(
                 action.action_id
             )))
         }
-    }
-}
-
-fn guarded_write_result_kind(result: &GuardedWriteResult) -> &'static str {
-    match result {
-        GuardedWriteResult::Written { .. } => "written",
-        GuardedWriteResult::AlreadyApplied { .. } => "already_applied",
-        GuardedWriteResult::ConflictBeforeSwap { .. } => "conflict_before_swap",
-        GuardedWriteResult::ConflictAfterSwap { .. } => "conflict_after_swap",
-        GuardedWriteResult::Conflict { .. } => "conflict",
     }
 }
 
