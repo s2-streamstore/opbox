@@ -1,10 +1,9 @@
-use crate::app::db::load_stable_namespace_blob;
 use crate::app::workspace::{real_socket_path, remove_stale_socket_files, socket_link_path};
 use crate::engine::actor::EngineCommand;
 use crate::semantic::table::daemon_state;
 use crate::spy::SpyEvent;
 use bytes::Bytes;
-use futures::{StreamExt, stream};
+use futures::stream;
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -36,10 +35,8 @@ pub struct StopResponse {
 #[derive(Debug, Clone)]
 pub struct ControlServerConfig {
     pub sync_root: PathBuf,
-    pub db_path: PathBuf,
     pub daemon_state: daemon_state::Row,
     pub engine_tx: mpsc::UnboundedSender<EngineCommand>,
-    pub spy_tx: broadcast::Sender<SpyEvent>,
 }
 
 pub async fn request_status(sync_root: &Path) -> eyre::Result<DaemonStatus> {
@@ -251,14 +248,13 @@ async fn handle_control_request(
                 text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
             }
         },
-        (&Method::GET, "/spy") => {
-            let namespace_snapshot = load_stable_namespace_blob(&config.db_path).await.ok();
-            Ok(spy_response(
-                config.spy_tx.subscribe(),
-                token,
-                namespace_snapshot,
-            ))
-        }
+        (&Method::GET, "/spy") => match request_engine_spy(&config).await {
+            Ok(rx) => Ok(spy_response(rx, token)),
+            Err(error) => {
+                warn!(?error, "spy request failed");
+                text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+            }
+        },
         (&Method::POST, "/stop") => match request_engine_status(&config).await {
             Ok(status) => {
                 let response = json_response(
@@ -300,25 +296,18 @@ async fn request_engine_status(config: &ControlServerConfig) -> eyre::Result<Dae
     Ok(rx.await?)
 }
 
-fn spy_response(
-    rx: broadcast::Receiver<SpyEvent>,
-    token: CancellationToken,
-    namespace_snapshot: Option<bytes::Bytes>,
-) -> Response<IpcBody> {
-    let snapshot_frame = namespace_snapshot.and_then(|blob| {
-        let event = SpyEvent::NamespaceSnapshot {
-            yjs_state_b64: {
-                use base64::Engine;
-                base64::engine::general_purpose::STANDARD.encode(&blob)
-            },
-        };
-        let json = serde_json::to_string(&event).ok()?;
-        Some(Ok::<_, Infallible>(Frame::data(Bytes::from(format!(
-            "data: {json}\n\n"
-        )))))
-    });
-    let snapshot_stream = stream::iter(snapshot_frame);
+async fn request_engine_spy(
+    config: &ControlServerConfig,
+) -> eyre::Result<broadcast::Receiver<SpyEvent>> {
+    let (reply, rx) = oneshot::channel();
+    config.engine_tx.send(EngineCommand::OpenSpy { reply })?;
+    match rx.await? {
+        Ok(rx) => Ok(rx),
+        Err(error) => eyre::bail!(error),
+    }
+}
 
+fn spy_response(rx: broadcast::Receiver<SpyEvent>, token: CancellationToken) -> Response<IpcBody> {
     let live_stream = stream::unfold((rx, token), |(mut rx, token)| async move {
         let cancel_token = token.clone();
         let event = tokio::select! {
@@ -341,13 +330,11 @@ fn spy_response(
         Some((Ok::<_, Infallible>(frame), (rx, token)))
     });
 
-    let event_stream = snapshot_stream.chain(live_stream);
-
     Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "text/event-stream")
         .header(hyper::header::CACHE_CONTROL, "no-cache")
-        .body(StreamBody::new(event_stream).boxed_unsync())
+        .body(StreamBody::new(live_stream).boxed_unsync())
         .expect("spy response is valid")
 }
 
@@ -426,19 +413,18 @@ mod tests {
             std::env::temp_dir().join(format!("opbox-ipc-test-{}", rand::random::<u64>()));
         std::fs::create_dir(&sync_root)?;
         std::fs::create_dir(metadata_dir(&sync_root))?;
+        let writer_bytes = rand::random::<[u8; 16]>();
 
         let daemon_row = daemon_state::Row {
             workspace_id: WorkspaceId("0123456789abcdefghijklmnopqrstuv".to_string()),
             s2_basin: "test-basin".parse()?,
             s2_account_endpoint: None,
             s2_basin_endpoint: None,
-            daemon_writer_id: DaemonWriterId(Bytes::from_static(b"ipc-test-writer-1")),
+            daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),
         };
-        let db_path = metadata_dir(&sync_root).join("storage.db");
 
-        let (spy_tx, _) = broadcast::channel(8);
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
         let expected_status = DaemonStatus {
             workspace_id: daemon_row.workspace_id.0.clone(),
@@ -458,6 +444,7 @@ mod tests {
                         let _ = reply.send(expected_status);
                     }
                     Some(EngineCommand::Scan(_)) => panic!("unexpected scan command"),
+                    Some(EngineCommand::OpenSpy { .. }) => panic!("unexpected open-spy command"),
                     None => panic!("engine command channel closed"),
                 }
             }
@@ -468,10 +455,8 @@ mod tests {
             let token = token.clone();
             let config = ControlServerConfig {
                 sync_root: sync_root.clone(),
-                db_path: db_path.clone(),
                 daemon_state: daemon_row,
                 engine_tx,
-                spy_tx,
             };
             async move { serve_control(config, token, stop_tx).await }
         });
@@ -487,6 +472,64 @@ mod tests {
         assert_eq!(status.connectivity, expected_status.connectivity);
 
         token.cancel();
+        server.await??;
+        engine.await?;
+        let _ = std::fs::remove_dir_all(&sync_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spy_stream_opens_through_engine_mailbox() -> eyre::Result<()> {
+        let sync_root =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&sync_root)?;
+        std::fs::create_dir(metadata_dir(&sync_root))?;
+        let writer_bytes = rand::random::<[u8; 16]>();
+
+        let daemon_row = daemon_state::Row {
+            workspace_id: WorkspaceId("0123456789abcdefghijklmnopqrstuv".to_string()),
+            s2_basin: "test-basin".parse()?,
+            s2_account_endpoint: None,
+            s2_basin_endpoint: None,
+            daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
+            stable_cursor: ..0,
+            next_outbox_id: OutboxId::new(0),
+        };
+
+        let (spy_tx, _) = broadcast::channel(8);
+        let spy_tx_for_test = spy_tx.clone();
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+        let engine = tokio::spawn(async move {
+            match engine_rx.recv().await {
+                Some(EngineCommand::OpenSpy { reply }) => {
+                    let _ = reply.send(Ok(spy_tx.subscribe()));
+                }
+                Some(EngineCommand::Status { .. }) => panic!("unexpected status command"),
+                Some(EngineCommand::Scan(_)) => panic!("unexpected scan command"),
+                None => panic!("engine command channel closed"),
+            }
+        });
+        let token = CancellationToken::new();
+        let (stop_tx, _stop_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn({
+            let token = token.clone();
+            let config = ControlServerConfig {
+                sync_root: sync_root.clone(),
+                daemon_state: daemon_row,
+                engine_tx,
+            };
+            async move { serve_control(config, token, stop_tx).await }
+        });
+
+        wait_for_socket(&sync_root).await?;
+
+        let mut stream = open_spy_stream(&sync_root).await?;
+        spy_tx_for_test.send(SpyEvent::Lagged { skipped: 9 })?;
+        let event = stream.next_event().await?;
+        assert!(matches!(event, Some(SpyEvent::Lagged { skipped: 9 })));
+
+        token.cancel();
+        drop(stream);
         server.await??;
         engine.await?;
         let _ = std::fs::remove_dir_all(&sync_root);

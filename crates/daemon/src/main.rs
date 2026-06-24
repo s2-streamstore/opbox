@@ -123,10 +123,8 @@ async fn run(
 
     let control_config = ControlServerConfig {
         sync_root: sync_root.clone(),
-        db_path: db_path.clone(),
         daemon_state: daemon_row.clone(),
         engine_tx,
-        spy_tx,
     };
     let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
     let mut control_task = tokio::spawn({

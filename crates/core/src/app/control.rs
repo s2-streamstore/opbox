@@ -14,6 +14,7 @@ pub enum EnginePhaseStatus {
 
 impl std::fmt::Display for EnginePhaseStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // TODO lets use strum
         let text = match self {
             Self::Idle => "idle",
             Self::AwaitingNextWork => "awaiting_next_work",

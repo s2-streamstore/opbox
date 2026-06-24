@@ -257,6 +257,9 @@ pub enum EngineCommand {
     Status {
         reply: oneshot::Sender<DaemonStatus>,
     },
+    OpenSpy {
+        reply: oneshot::Sender<Result<broadcast::Receiver<SpyEvent>, String>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1101,6 +1104,14 @@ impl Engine {
                         }
                         EngineCommand::Status { reply } => {
                             let _ = reply.send(self.daemon_status());
+                        }
+                        EngineCommand::OpenSpy { reply } => {
+                            let result = self
+                                .spy_tx
+                                .as_ref()
+                                .map(|spy_tx| spy_tx.subscribe())
+                                .ok_or_else(|| "spy stream is not enabled".to_string());
+                            let _ = reply.send(result);
                         }
                     }
                 }
