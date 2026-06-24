@@ -42,24 +42,6 @@ pub async fn initialize_database(
     Ok(())
 }
 
-pub async fn load_stable_namespace_blob(db_path: &Path) -> eyre::Result<bytes::Bytes> {
-    let db = open_database(db_path).await?;
-    let conn = db.connect()?;
-    configure_connection(&conn).await?;
-    let mut rows = conn
-        .query(
-            "SELECT doc_blob FROM stable_namespace WHERE id = 1",
-            (),
-        )
-        .await?;
-    let row = rows
-        .next()
-        .await?
-        .ok_or_else(|| eyre!("stable_namespace row missing"))?;
-    let blob: Vec<u8> = row.get(0)?;
-    Ok(bytes::Bytes::from(blob))
-}
-
 pub async fn load_daemon_state(db_path: &Path) -> eyre::Result<daemon_state::Row> {
     let db = open_database(db_path).await?;
     let conn = db.connect()?;
