@@ -514,19 +514,23 @@ fn format_namespace_summary(
     let mut out = String::new();
     for claim in &summary.added_claims {
         out.push_str(&format!(
-            "  {}{}={}",
+            "  {}{}={} {}",
             style.green("+"),
             style.green("claim"),
-            style.green(format!("\"{}\" ({})", claim.path, claim.kind))
+            style.green(format!("\"{}\"", claim.path)),
+            format_kv("obj", style.green(short_id(&claim.object_id_b64)), style),
         ));
+        out.push_str(&style.green(format!(" ({})", claim.kind)));
     }
     for claim in &summary.removed_claims {
         out.push_str(&format!(
-            "  {}{}={}",
+            "  {}{}={} {}",
             style.red("-"),
             style.red("claim"),
-            style.red(format!("\"{}\" ({})", claim.path, claim.kind))
+            style.red(format!("\"{}\"", claim.path)),
+            format_kv("obj", style.red(short_id(&claim.object_id_b64)), style),
         ));
+        out.push_str(&style.red(format!(" ({})", claim.kind)));
     }
     out
 }
@@ -584,7 +588,7 @@ impl CliStyle {
     }
 
     fn seq(self, sequence_number: u64) -> String {
-        self.dim(format!("#{sequence_number:<6}"))
+        self.dim(format!("..{sequence_number:<6}"))
     }
 
     fn bytes(self, bytes: usize) -> String {

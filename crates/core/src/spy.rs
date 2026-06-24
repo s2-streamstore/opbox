@@ -54,6 +54,7 @@ pub struct NamespaceUpdateSummary {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NamespaceClaimSummary {
     pub path: String,
+    pub object_id_b64: String,
     pub kind: String,
 }
 
@@ -235,6 +236,7 @@ impl NamespaceSpyTracker {
                     .unwrap_or_default();
                 Some(NamespaceClaimSummary {
                     path: record.path.to_string(),
+                    object_id_b64: record.object_id.encode_b64(),
                     kind,
                 })
             })
@@ -260,6 +262,7 @@ impl NamespaceSpyTracker {
             .unwrap_or_default();
         NamespaceClaimSummary {
             path: claim.record.path.to_string(),
+            object_id_b64: claim.record.object_id.encode_b64(),
             kind,
         }
     }
@@ -404,6 +407,10 @@ mod tests {
 
         assert_eq!(summary.added_claims.len(), 1);
         assert_eq!(summary.added_claims[0].path, "src/main.rs");
+        assert_eq!(
+            summary.added_claims[0].object_id_b64,
+            object_id.encode_b64()
+        );
         assert_eq!(summary.added_claims[0].kind, "text");
         assert_eq!(summary.removed_claims.len(), 0);
         Ok(())
@@ -446,6 +453,10 @@ mod tests {
         assert_eq!(summary.added_claims.len(), 0);
         assert_eq!(summary.removed_claims.len(), 1);
         assert_eq!(summary.removed_claims[0].path, "old.txt");
+        assert_eq!(
+            summary.removed_claims[0].object_id_b64,
+            object_id.encode_b64()
+        );
         assert_eq!(summary.removed_claims[0].kind, "text");
         Ok(())
     }
