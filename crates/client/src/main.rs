@@ -653,7 +653,7 @@ impl CliStyle {
 
     fn spy_position(self, sequence_number: u64, timestamp_ns: i64) -> String {
         let timestamp_ms = timestamp_ns / 1_000_000;
-        let position = format!("#{sequence_number}/{timestamp_ms}");
+        let position = format!("#{sequence_number}@{timestamp_ms}");
         self.dim(format!("{position:<24}"))
     }
 
