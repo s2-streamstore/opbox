@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use time::OffsetDateTime;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ConnectivityRole {
     Reader,
     Writer,
@@ -10,10 +11,7 @@ pub enum ConnectivityRole {
 
 impl ConnectivityRole {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Reader => "reader",
-            Self::Writer => "writer",
-        }
+        self.into()
     }
 }
 

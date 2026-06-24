@@ -165,21 +165,6 @@ fn subtree_contains_scope(subtree: &RelativePath, scope: &ScanScope) -> bool {
     }
 }
 
-fn semantic_response_kind(response: &SemanticClientResponse) -> &'static str {
-    match response {
-        SemanticClientResponse::ApplyInitScan(_) => "apply_init_scan",
-        SemanticClientResponse::ApplyScan(_) => "apply_scan",
-        SemanticClientResponse::CommitImportEpoch(_) => "commit_import_epoch",
-        SemanticClientResponse::CommitProjectionEpoch(_) => "commit_projection_epoch",
-        SemanticClientResponse::GetNextWork { .. } => "get_next_work",
-        SemanticClientResponse::ApplySharedMessageBatch { .. } => "apply_shared_message_batch",
-        SemanticClientResponse::ReadOutbox(_) => "read_outbox",
-        SemanticClientResponse::ReleaseOutbox(_) => "release_outbox",
-        SemanticClientResponse::ReadStableCursor(_) => "read_stable_cursor",
-        SemanticClientResponse::ReadStableNamespace(_) => "read_stable_namespace",
-    }
-}
-
 /// Monotone id stamped on each `get_next_work` request so its response can be
 /// bound to the boundary that issued it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,7 +451,7 @@ impl Engine {
             }
             response => eyre::bail!(
                 "unexpected semantic response while initializing spy namespace: {}",
-                semantic_response_kind(&response)
+                Into::<&'static str>::into(&response)
             ),
         }
     }

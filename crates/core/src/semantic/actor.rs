@@ -408,8 +408,8 @@ impl SemanticActor {
             (result, pending) => {
                 return Err(eyre!(
                     "semantic op {op_id:?} completed with mismatched pending kind: result={}, pending={}",
-                    result.kind(),
-                    pending.kind(),
+                    Into::<&'static str>::into(&result),
+                    Into::<&'static str>::into(&pending),
                 ));
             }
         }
@@ -946,120 +946,96 @@ pub(crate) struct CompletedProjectionAction {
 }
 
 #[derive(strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 enum PendingSemanticOpKind {
-    #[strum(serialize = "apply_init_scan")]
     ApplyInitScan {
         reply: oneshot::Sender<eyre::Result<NextWork>>,
     },
-    #[strum(serialize = "apply_scan")]
     ApplyScan {
         reply: oneshot::Sender<eyre::Result<NextWork>>,
     },
-    #[strum(serialize = "commit_import_epoch")]
     CommitImportEpoch {
         reply: oneshot::Sender<eyre::Result<()>>,
     },
-    #[strum(serialize = "commit_import_action")]
     CommitImportAction,
-    #[strum(serialize = "commit_projection_action")]
     CommitProjectionAction,
-    #[strum(serialize = "commit_projection_epoch")]
     CommitProjectionEpoch {
         reply: oneshot::Sender<eyre::Result<()>>,
     },
-    #[strum(serialize = "get_next_work")]
     GetNextWork {
         reply: oneshot::Sender<eyre::Result<NextWork>>,
     },
-    #[strum(serialize = "read_outbox")]
     ReadOutbox {
         reply: oneshot::Sender<
             eyre::Result<Vec<(crate::types::OutboxId, crate::crdt::types::SharedMessage)>>,
         >,
     },
-    #[strum(serialize = "release_outbox")]
     ReleaseOutbox {
         reply: oneshot::Sender<eyre::Result<u64>>,
     },
-    #[strum(serialize = "trim_outbox")]
     TrimOutbox,
-    #[strum(serialize = "read_stable_cursor")]
     ReadStableCursor {
         reply: oneshot::Sender<eyre::Result<std::ops::RangeTo<crate::log::types::SequenceNumber>>>,
     },
-    #[strum(serialize = "read_stable_namespace")]
     ReadStableNamespace {
         reply: oneshot::Sender<eyre::Result<bytes::Bytes>>,
     },
-    #[strum(serialize = "apply_shared_message_batch")]
     ApplySharedMessageBatch {
         reply: oneshot::Sender<eyre::Result<()>>,
     },
 }
 
 #[derive(strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 enum SemanticTaskResult {
-    #[strum(serialize = "apply_init_scan")]
     ApplyInitScan {
         op_id: SemanticOpId,
         result: eyre::Result<ImportEpochStarted>,
     },
-    #[strum(serialize = "apply_scan")]
     ApplyScan {
         op_id: SemanticOpId,
         result: eyre::Result<ApplyScanOutput>,
     },
-    #[strum(serialize = "apply_shared_message_batch")]
     ApplySharedMessageBatch {
         op_id: SemanticOpId,
         result: eyre::Result<ApplySharedMessageBatchOutput>,
     },
-    #[strum(serialize = "commit_import_epoch")]
     CommitImportEpoch {
         op_id: SemanticOpId,
         result: eyre::Result<CommitImportEpochOutput>,
     },
-    #[strum(serialize = "commit_import_action")]
     CommitImportAction {
         op_id: SemanticOpId,
         result: eyre::Result<CommitImportActionOutcome>,
     },
-    #[strum(serialize = "commit_projection_action")]
     CommitProjectionAction {
         op_id: SemanticOpId,
         result: eyre::Result<ProjectionActionResult>,
     },
-    #[strum(serialize = "commit_projection_epoch")]
     CommitProjectionEpoch {
         op_id: SemanticOpId,
         result: eyre::Result<()>,
     },
-    #[strum(serialize = "get_next_work")]
     GetNextWork {
         op_id: SemanticOpId,
         result: eyre::Result<NextWork>,
     },
-    #[strum(serialize = "read_outbox")]
     ReadOutbox {
         op_id: SemanticOpId,
         result: eyre::Result<Vec<(crate::types::OutboxId, crate::crdt::types::SharedMessage)>>,
     },
-    #[strum(serialize = "release_outbox")]
     ReleaseOutbox {
         op_id: SemanticOpId,
         result: eyre::Result<u64>,
     },
-    #[strum(serialize = "trim_outbox")]
     TrimOutbox {
         op_id: SemanticOpId,
         result: eyre::Result<()>,
     },
-    #[strum(serialize = "read_stable_cursor")]
     ReadStableCursor {
         op_id: SemanticOpId,
         result: eyre::Result<std::ops::RangeTo<crate::log::types::SequenceNumber>>,
     },
-    #[strum(serialize = "read_stable_namespace")]
     ReadStableNamespace {
         op_id: SemanticOpId,
         result: eyre::Result<bytes::Bytes>,
@@ -1083,16 +1059,6 @@ impl SemanticTaskResult {
             | Self::ReadStableCursor { op_id, .. }
             | Self::ReadStableNamespace { op_id, .. } => *op_id,
         }
-    }
-
-    fn kind(&self) -> &'static str {
-        self.into()
-    }
-}
-
-impl PendingSemanticOpKind {
-    fn kind(&self) -> &'static str {
-        self.into()
     }
 }
 

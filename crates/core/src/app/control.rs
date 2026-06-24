@@ -1,8 +1,9 @@
 use crate::app::connectivity::ConnectivitySnapshot;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum EnginePhaseStatus {
     Idle,
     AwaitingNextWork,
@@ -14,15 +15,7 @@ pub enum EnginePhaseStatus {
 
 impl std::fmt::Display for EnginePhaseStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // TODO lets use strum
-        let text = match self {
-            Self::Idle => "idle",
-            Self::AwaitingNextWork => "awaiting_next_work",
-            Self::Scanning => "scanning",
-            Self::PlanningImport => "planning_import",
-            Self::Importing => "importing",
-            Self::Projecting => "projecting",
-        };
+        let text: &'static str = (*self).into();
         f.write_str(text)
     }
 }

@@ -15,6 +15,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tracing::instrument;
 
+#[derive(strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum SemanticClientResponse {
     ApplyInitScan(eyre::Result<NextWork>),
     ApplyScan(eyre::Result<NextWork>),

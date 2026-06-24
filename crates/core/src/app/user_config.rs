@@ -5,7 +5,8 @@ pub const OPBOX_CONFIG_DIR_ENV: &str = "OPBOX_CONFIG_DIR";
 const CONFIG_DIR_NAME: &str = "opbox";
 const CONFIG_FILE_NAME: &str = "config.toml";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "kebab-case")]
 pub enum UserConfigKey {
     DefaultBasin,
     AccessToken,
@@ -15,12 +16,7 @@ pub enum UserConfigKey {
 
 impl UserConfigKey {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::DefaultBasin => "default-basin",
-            Self::AccessToken => "access-token",
-            Self::AccountEndpoint => "account-endpoint",
-            Self::BasinEndpoint => "basin-endpoint",
-        }
+        self.into()
     }
 }
 

@@ -344,6 +344,8 @@ pub enum GuardedReadResult {
     },
 }
 
+#[derive(strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum GuardedWriteResult {
     Written {
         fingerprint: FileFingerprint,

@@ -1072,7 +1072,7 @@ async fn commit_completed_projection_action_tx(
             Err(SemanticTransactionError::InvariantViolation(format!(
                 "cannot commit invalidated projection write result for action {:?}: {}",
                 action.action_id,
-                guarded_write_result_kind(result)
+                Into::<&'static str>::into(result)
             )))
         }
         ProjectionActionResult::DeleteFile {
@@ -1101,16 +1101,6 @@ async fn commit_completed_projection_action_tx(
                 action.action_id
             )))
         }
-    }
-}
-
-fn guarded_write_result_kind(result: &GuardedWriteResult) -> &'static str {
-    match result {
-        GuardedWriteResult::Written { .. } => "written",
-        GuardedWriteResult::AlreadyApplied { .. } => "already_applied",
-        GuardedWriteResult::ConflictBeforeSwap { .. } => "conflict_before_swap",
-        GuardedWriteResult::ConflictAfterSwap { .. } => "conflict_after_swap",
-        GuardedWriteResult::Conflict { .. } => "conflict",
     }
 }
 
