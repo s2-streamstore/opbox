@@ -8,7 +8,7 @@ Real-time, editor agnostic, multiplayer sync for regular UTF-8 text files.
 
 Great for collaborating on an Obsidian graph or a codebase without going through `git` for everything.
 
-### how it works 
+### how it works
 
 A local daemon listens for both local and remote changes to files in a synced workspace directory.
 

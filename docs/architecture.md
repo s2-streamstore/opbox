@@ -2,8 +2,6 @@
 
 ## Concepts
 
-Let's get these out of the way.
-
 - CRDTs
   - [Conflict-free replicate data type](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type)
   - Sync works in `opbox` by distributing messages representing operations (ops) on CRDT data structures.
@@ -55,4 +53,3 @@ Let's get these out of the way.
 - Why is a db needed?
 - Why Turso?
 - Why not a mountable VFS?
-- 
