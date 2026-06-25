@@ -12,6 +12,7 @@ use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use time::OffsetDateTime;
+use tracing::debug;
 use xxhash_rust::xxh3::xxh3_64;
 
 #[derive(Clone)]
@@ -73,7 +74,8 @@ impl LocalFileIO {
         }
 
         if !metadata.is_file() {
-            eyre::bail!("unsupported non-file, non-directory path: {path}");
+            debug!(%path, "skipping non-file, non-directory path (e.g. symlink)");
+            return Ok(None);
         }
 
         Ok(Some(TreeEntry {

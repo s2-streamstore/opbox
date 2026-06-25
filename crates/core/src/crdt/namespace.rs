@@ -232,6 +232,14 @@ impl NamespaceDoc {
         self.removed_claims.get(&txn, claim_key.as_str()).is_some()
     }
 
+    pub fn removed_claim_ids(&self) -> Vec<NamespaceClaimId> {
+        let txn = self.doc.transact();
+        self.removed_claims
+            .iter(&txn)
+            .filter_map(|(key, _)| NamespaceClaimId::decode_b64(key))
+            .collect()
+    }
+
     pub fn active_claims(&self) -> Result<Vec<ActiveClaim>> {
         let txn = self.doc.transact();
         let mut result = Vec::new();
@@ -303,7 +311,7 @@ static READ_ONLY_CLIENT_ID_COUNTER: AtomicU64 = AtomicU64::new(20_000_000);
 /// it, so these ids are safe ONLY for paths that never mint ops. Any local
 /// mutation that will be published must use [`client_id_for_writer`], or the
 /// resulting op ids can collide across daemons and silently diverge.
-fn read_only_client_id() -> u64 {
+pub(crate) fn read_only_client_id() -> u64 {
     READ_ONLY_CLIENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 

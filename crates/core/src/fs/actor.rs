@@ -194,8 +194,8 @@ impl<IO: FileIO + Clone + Send + 'static> FsActor<IO> {
             (result, pending) => {
                 return Err(eyre!(
                     "fs op {op_id:?} completed with mismatched pending kind: result={}, pending={}",
-                    result.kind(),
-                    pending.kind(),
+                    Into::<&'static str>::into(&result),
+                    Into::<&'static str>::into(&pending),
                 ));
             }
         }
@@ -229,67 +229,51 @@ impl PendingFsOp {
 }
 
 #[derive(strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 enum PendingFsOpKind {
-    #[strum(serialize = "scan")]
     Scan {
         reply: oneshot::Sender<eyre::Result<ScanResult>>,
     },
-    #[strum(serialize = "stat")]
     Stat {
         reply: oneshot::Sender<eyre::Result<Option<TreeEntry>>>,
     },
-    #[strum(serialize = "guarded_read")]
     GuardedRead {
         reply: oneshot::Sender<eyre::Result<GuardedReadResult>>,
     },
-    #[strum(serialize = "guarded_write")]
     GuardedWrite {
         reply: oneshot::Sender<eyre::Result<GuardedWriteResult>>,
     },
-    #[strum(serialize = "guarded_delete")]
     GuardedDelete {
         reply: oneshot::Sender<eyre::Result<GuardedDeleteResult>>,
     },
-    #[strum(serialize = "delete_if_exists")]
     DeleteIfExists {
         reply: oneshot::Sender<eyre::Result<DeleteIfExistsResult>>,
     },
 }
 
-impl PendingFsOpKind {
-    fn kind(&self) -> &'static str {
-        self.into()
-    }
-}
-
 #[derive(strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 enum FsTaskResult {
-    #[strum(serialize = "scan")]
     Scan {
         op_id: FsOpId,
         result: eyre::Result<ScanResult>,
     },
-    #[strum(serialize = "stat")]
     Stat {
         op_id: FsOpId,
         result: eyre::Result<Option<TreeEntry>>,
     },
-    #[strum(serialize = "guarded_read")]
     GuardedRead {
         op_id: FsOpId,
         result: eyre::Result<GuardedReadResult>,
     },
-    #[strum(serialize = "guarded_write")]
     GuardedWrite {
         op_id: FsOpId,
         result: eyre::Result<GuardedWriteResult>,
     },
-    #[strum(serialize = "guarded_delete")]
     GuardedDelete {
         op_id: FsOpId,
         result: eyre::Result<GuardedDeleteResult>,
     },
-    #[strum(serialize = "delete_if_exists")]
     DeleteIfExists {
         op_id: FsOpId,
         result: eyre::Result<DeleteIfExistsResult>,
@@ -306,9 +290,5 @@ impl FsTaskResult {
             | Self::GuardedDelete { op_id, .. }
             | Self::DeleteIfExists { op_id, .. } => *op_id,
         }
-    }
-
-    fn kind(&self) -> &'static str {
-        self.into()
     }
 }

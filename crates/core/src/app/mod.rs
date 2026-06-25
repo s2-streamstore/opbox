@@ -1,4 +1,5 @@
 pub mod connectivity;
+pub mod control;
 pub mod db;
 pub mod ipc;
 pub mod runtime;

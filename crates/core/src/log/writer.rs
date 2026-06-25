@@ -213,7 +213,6 @@ impl LogWriterActor {
 
                     match res {
                         Ok(Ok((outbox_id, pointer_record))) => {
-                            // TODO: append the pointer record now that all parts are durable.
                             inflight += 1;
                             let ticket = producer
                                 .submit(pointer_record)

@@ -1,5 +1,6 @@
-use crate::app::connectivity::ConnectivitySnapshot;
-use crate::engine::actor::{Engine, EngineClients, EngineConfig, EngineEvents};
+use crate::engine::actor::{
+    Engine, EngineClients, EngineCommand, EngineConfig, EngineEvents, EngineStatusConfig,
+};
 use crate::engine::clone as engine_clone;
 use crate::engine::init as engine_init;
 use crate::fs::actor::FsActor;
@@ -16,7 +17,7 @@ use crate::semantic::service::SemanticService;
 use crate::semantic::table::daemon_state;
 use crate::spy::SpyEvent;
 use s2_sdk::S2Basin;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
@@ -41,8 +42,8 @@ pub struct AppRuntimeConfig<IO, NIO = ()> {
     pub daemon_row: daemon_state::Row,
     pub s2_basin: S2Basin,
     pub clone_log_read_stop: Option<LogReadStop>,
+    pub engine_status: Option<EngineStatusConfig>,
     pub spy_tx: Option<broadcast::Sender<SpyEvent>>,
-    pub connectivity_status_tx: Option<watch::Sender<ConnectivitySnapshot>>,
 }
 
 pub struct AppRuntime<IO, NIO = ()> {
@@ -67,8 +68,8 @@ where
             daemon_row,
             s2_basin,
             clone_log_read_stop,
+            engine_status,
             spy_tx,
-            connectivity_status_tx,
         } = self.config;
 
         let (semantic_request_tx, semantic_request_rx) = mpsc::unbounded_channel();
@@ -91,6 +92,8 @@ where
             let token = cancellation_token.clone();
             async move { ("fs", fs_actor.run(token).await) }
         });
+        let mut sync_engine_command_tx = None;
+
         match mode {
             RunMode::Init => {
                 let (log_writer_req_tx, log_writer_req_rx) = mpsc::unbounded_channel();
@@ -180,6 +183,8 @@ where
                 let (log_reader_resp_tx, log_reader_resp_rx) =
                     mpsc::channel(LOG_READER_EVENT_CHANNEL_CAPACITY);
                 let (engine_command_tx, engine_command_rx) = mpsc::unbounded_channel();
+                let sync_engine_status =
+                    engine_status.expect("sync mode requires engine status config");
                 let log_reader = LogReaderActor::new(
                     s2_basin.clone(),
                     daemon_row.workspace_id.clone(),
@@ -202,13 +207,15 @@ where
                     semantic: semantic_event_rx,
                     commands: engine_command_rx,
                     spy: spy_tx,
-                    connectivity_status: connectivity_status_tx,
                 };
 
                 let engine = Engine::new(EngineConfig {
                     clients: engine_clients,
                     events: engine_events,
+                    status: sync_engine_status,
                 });
+
+                sync_engine_command_tx = Some(engine_command_tx.clone());
 
                 actors.spawn({
                     let token = cancellation_token.clone();
@@ -232,7 +239,10 @@ where
             }
         }
 
-        AppActors { actors }
+        AppActors {
+            actors,
+            engine_command_tx: sync_engine_command_tx,
+        }
     }
 
     pub async fn run_until_shutdown(self) -> eyre::Result<()> {
@@ -246,9 +256,14 @@ where
 
 pub struct AppActors {
     actors: JoinSet<ActorResult>,
+    engine_command_tx: Option<mpsc::UnboundedSender<EngineCommand>>,
 }
 
 impl AppActors {
+    pub fn engine_command_tx(&self) -> Option<mpsc::UnboundedSender<EngineCommand>> {
+        self.engine_command_tx.clone()
+    }
+
     pub async fn wait_for_actor_stop(&mut self) -> Option<eyre::Report> {
         actor_stopped("initial", self.actors.join_next().await)
     }

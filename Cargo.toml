@@ -2,3 +2,7 @@
 members = ["crates/core", "crates/client", "crates/daemon", "sim"]
 default-members = ["crates/client"]
 resolver = "3"
+
+[workspace.package]
+version = "0.1.1"
+edition = "2024"

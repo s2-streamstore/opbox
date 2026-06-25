@@ -3180,7 +3180,7 @@ dependencies = [
 
 [[package]]
 name = "ob"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "clap",
@@ -3279,7 +3279,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "opbox-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -3320,7 +3320,7 @@ dependencies = [
 
 [[package]]
 name = "opbox-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "eyre",
@@ -3334,7 +3334,7 @@ dependencies = [
 
 [[package]]
 name = "opbox-sim"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bb8",

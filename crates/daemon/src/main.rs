@@ -1,5 +1,4 @@
 use clap::Parser;
-use opbox_core::app::connectivity::ConnectivitySnapshot;
 use opbox_core::app::db::{open_database, semantic_pool};
 use opbox_core::app::ipc::{self, ControlServerConfig};
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
@@ -12,13 +11,14 @@ use opbox_core::app::workspace::{
     DaemonLock, WorkspaceEnv, canonicalize_existing_dir, load_configured_daemon_state,
     load_workspace_env, remove_pid, workspace_env_path, write_pid,
 };
+use opbox_core::engine::actor::EngineStatusConfig;
 use opbox_core::fs::fio::local::LocalFileIO;
 use opbox_core::notify::nio::LocalNotifyIO;
 use opbox_core::semantic::service::SemanticService;
 use std::path::PathBuf;
 use std::time::Duration;
 use time::OffsetDateTime;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
@@ -96,8 +96,7 @@ async fn run(
     let semantic_service = SemanticService::new(pool);
     let notify_io = Some(LocalNotifyIO::new(&sync_root, Duration::from_millis(50))?);
     let (spy_tx, _) = broadcast::channel(1024);
-    let (connectivity_status_tx, connectivity_status_rx) =
-        watch::channel(ConnectivitySnapshot::starting());
+    let started_at = OffsetDateTime::now_utc();
 
     let token = CancellationToken::new();
     let mut actors = AppRuntime::new(AppRuntimeConfig {
@@ -108,23 +107,28 @@ async fn run(
         daemon_row: daemon_row.clone(),
         s2_basin,
         clone_log_read_stop: None,
+        engine_status: Some(EngineStatusConfig {
+            sync_root: sync_root.clone(),
+            workspace_id: daemon_row.workspace_id.clone(),
+            daemon_writer_id: daemon_row.daemon_writer_id.clone(),
+            stable_cursor: daemon_row.stable_cursor.clone(),
+            started_at,
+        }),
         spy_tx: Some(spy_tx.clone()),
-        connectivity_status_tx: Some(connectivity_status_tx),
     })
     .spawn(token.clone());
+    let engine_tx = actors
+        .engine_command_tx()
+        .expect("sync runtime exposes engine command mailbox");
 
     let control_config = ControlServerConfig {
         sync_root: sync_root.clone(),
-        db_path: db_path.clone(),
         daemon_state: daemon_row.clone(),
-        started_at: OffsetDateTime::now_utc(),
-        spy_tx,
-        connectivity_status_rx,
+        engine_tx,
     };
-    let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
     let mut control_task = tokio::spawn({
         let token = token.clone();
-        async move { ipc::serve_control(control_config, token, stop_tx).await }
+        async move { ipc::serve_control(control_config, token).await }
     });
 
     info!(root = %sync_root.display(), "opbox daemon started");
@@ -136,10 +140,6 @@ async fn run(
             None
         }
         actor_error = actors.wait_for_actor_stop() => actor_error,
-        Some(()) = stop_rx.recv() => {
-            info!("stop requested");
-            None
-        }
         control_result = &mut control_task => {
             match control_result {
                 Ok(Ok(())) => None,

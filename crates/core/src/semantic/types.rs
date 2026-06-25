@@ -243,6 +243,11 @@ pub enum SemanticRequest {
         reply: oneshot::Sender<eyre::Result<RangeTo<SequenceNumber>>>,
     },
 
+    /// Read the stable namespace document snapshot from semantic state.
+    ReadStableNamespace {
+        reply: oneshot::Sender<eyre::Result<Bytes>>,
+    },
+
     /// Apply shared log messages to stable semantic state.
     ApplySharedMessageBatch {
         batch: SharedMessageBatch,
