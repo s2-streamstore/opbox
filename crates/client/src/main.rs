@@ -14,7 +14,8 @@ use opbox_core::app::user_config::{
 use opbox_core::app::workspace::{
     NotInWorkspace, canonicalize_existing_dir, create_metadata_dir, current_dir, daemon_log_path,
     ensure_clean_clone_root, ensure_sync_root_unconfigured, find_workspace_root,
-    load_configured_daemon_state, remove_socket_pointer, socket_link_path, storage_db_path,
+    load_configured_daemon_state, pid_path, remove_pid, remove_socket_pointer,
+    remove_stale_socket_files, socket_link_path, storage_db_path,
 };
 use opbox_core::fs::fio::local::LocalFileIO;
 use opbox_core::fs::ignore::{IGNORE_FILE_NAME, default_ignore_file_contents};
@@ -900,17 +901,57 @@ async fn run_start(sync_root: Option<PathBuf>) -> eyre::Result<()> {
 
 async fn run_stop(sync_root: Option<PathBuf>) -> eyre::Result<()> {
     let root = find_workspace_root(&root_or_current(sync_root)?)?;
-    if let Err(error) = request_valid_status(&root).await {
-        exit_daemon_not_running_or_report(&root, error);
-    }
-    let response = match ipc::request_stop(&root).await {
-        Ok(response) => response,
-        Err(error) => exit_daemon_not_running_or_report(&root, error),
+    let response = match request_valid_status(&root).await {
+        Ok(_) => match ipc::request_stop(&root).await {
+            Ok(response) => response,
+            Err(error) => {
+                if error.downcast_ref::<ipc::DaemonBuildMismatch>().is_some() {
+                    stop_mismatched_daemon_by_signal(&root, &error).await?
+                } else {
+                    exit_daemon_not_running_or_report(&root, error);
+                }
+            }
+        },
+        Err(error) => {
+            if error.downcast_ref::<ipc::DaemonBuildMismatch>().is_some() {
+                stop_mismatched_daemon_by_signal(&root, &error).await?
+            } else {
+                exit_daemon_not_running_or_report(&root, error);
+            }
+        }
     };
 
+    wait_for_daemon_process_exit(&root, &response).await
+}
+
+async fn stop_mismatched_daemon_by_signal(
+    root: &Path,
+    error: &eyre::Report,
+) -> eyre::Result<ipc::StopResponse> {
+    let style = CliStyle::for_stderr();
+    eprintln!("{}", style.yellow(error));
+    let pid = read_daemon_pid(root)?;
+    terminate_daemon_process(pid)?;
+    eprintln!(
+        "{}",
+        style.yellow(format!("sent SIGTERM to mismatched opbox daemon pid {pid}"))
+    );
+    let workspace_id = load_configured_daemon_state(root)
+        .await
+        .map(|(_, row)| row.workspace_id.0)
+        .unwrap_or_else(|_| "unknown".to_string());
+    Ok(ipc::StopResponse { workspace_id, pid })
+}
+
+async fn wait_for_daemon_process_exit(
+    root: &Path,
+    response: &ipc::StopResponse,
+) -> eyre::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if request_valid_status(&root).await.is_err() {
+        if !daemon_process_is_alive(response.pid) {
+            let _ = remove_stale_socket_files(root);
+            remove_pid(root);
             println!(
                 "stopped opbox daemon for workspace {} (pid {})",
                 response.workspace_id, response.pid
@@ -928,6 +969,37 @@ async fn run_stop(sync_root: Option<PathBuf>) -> eyre::Result<()> {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+fn read_daemon_pid(root: &Path) -> eyre::Result<u32> {
+    let path = pid_path(root);
+    let contents = std::fs::read_to_string(&path).map_err(|error| {
+        eyre::eyre!("failed to read daemon pid from {}: {error}", path.display())
+    })?;
+    contents
+        .trim()
+        .parse()
+        .map_err(|error| eyre::eyre!("invalid daemon pid in {}: {error}", path.display()))
+}
+
+fn terminate_daemon_process(pid: u32) -> eyre::Result<()> {
+    let status = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .map_err(|error| eyre::eyre!("failed to signal daemon pid {pid}: {error}"))?;
+    if !status.success() {
+        eyre::bail!("failed to signal daemon pid {pid}: kill exited with {status}");
+    }
+    Ok(())
+}
+
+fn daemon_process_is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn run_daemon_logs(follow: bool, sync_root: Option<PathBuf>) -> eyre::Result<()> {
