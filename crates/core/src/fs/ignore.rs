@@ -1,5 +1,5 @@
 use crate::fs::types::RelativePath;
-use compact_str::CompactString;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::path::Path;
 
 pub const METADATA_DIR_NAME: &str = ".opbox";
@@ -7,6 +7,7 @@ pub const IGNORE_FILE_NAME: &str = ".opboxignore";
 
 const DEFAULT_IGNORE_FILE: &str = "\
 # opbox always ignores .opbox/ internally.
+# .opboxignore uses gitignore syntax.
 # A bare name matches that file or directory at any depth.
 
 # version control
@@ -30,63 +31,69 @@ __pycache__
 Thumbs.db
 ";
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct IgnoreRules {
-    patterns: Vec<IgnorePattern>,
+    matcher: Gitignore,
+}
+
+impl Default for IgnoreRules {
+    fn default() -> Self {
+        Self {
+            matcher: Gitignore::empty(),
+        }
+    }
 }
 
 impl IgnoreRules {
     pub fn load(root: &Path) -> eyre::Result<Self> {
         let path = root.join(IGNORE_FILE_NAME);
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(error.into()),
+        let mut builder = GitignoreBuilder::new(root);
+        match builder.add(&path) {
+            None => {}
+            Some(error) if path.exists() => return Err(error.into()),
+            Some(_) => {}
         };
 
-        Self::parse(&contents)
+        Self::from_builder(builder)
     }
 
     pub fn parse(contents: &str) -> eyre::Result<Self> {
-        let mut patterns = Vec::new();
+        Self::parse_for_root(Path::new(""), contents)
+    }
+
+    pub fn parse_for_root(root: &Path, contents: &str) -> eyre::Result<Self> {
+        let mut builder = GitignoreBuilder::new(root);
         for (idx, line) in contents.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            patterns.push(IgnorePattern::parse(line).map_err(|error| {
+            builder.add_line(None, line).map_err(|error| {
                 eyre::eyre!(
                     "invalid {IGNORE_FILE_NAME} pattern on line {}: {error}",
                     idx + 1
                 )
-            })?);
+            })?;
         }
 
-        Ok(Self { patterns })
+        Self::from_builder(builder)
     }
 
-    pub fn is_ignored(&self, path: &RelativePath) -> bool {
+    fn from_builder(builder: GitignoreBuilder) -> eyre::Result<Self> {
+        Ok(Self {
+            matcher: builder.build()?,
+        })
+    }
+
+    pub fn is_ignored(&self, path: &RelativePath, is_dir: bool) -> bool {
         if is_hard_ignored(path) {
             return true;
         }
 
-        self.patterns
-            .iter()
-            .any(|pattern| pattern.matches_path(path))
+        self.matcher
+            .matched_path_or_any_parents(path.to_db_path(), is_dir)
+            .is_ignore()
     }
 }
 
 pub fn default_ignore_file_contents() -> &'static str {
     DEFAULT_IGNORE_FILE
-}
-
-pub fn ignore_pattern_is_supported(pattern: &str) -> bool {
-    let pattern = pattern.trim();
-    if pattern.is_empty() || pattern.starts_with('#') || pattern.starts_with('!') {
-        return false;
-    }
-
-    IgnorePattern::parse(pattern).is_ok()
 }
 
 pub fn is_hard_ignored(path: &RelativePath) -> bool {
@@ -98,76 +105,6 @@ pub fn is_hard_ignored(path: &RelativePath) -> bool {
 
 fn is_projection_temp_component(component: &str) -> bool {
     component.starts_with('.') && component.contains(".opbox-tmp-")
-}
-
-#[derive(Debug, Clone)]
-enum IgnorePattern {
-    Component(ComponentPattern),
-    Path(Vec<ComponentPattern>),
-}
-
-impl IgnorePattern {
-    fn parse(value: &str) -> eyre::Result<Self> {
-        let value = value.trim_matches('/');
-        if value.is_empty() {
-            eyre::bail!("pattern must not be empty");
-        }
-        if value.contains("**") {
-            eyre::bail!("** is not supported yet");
-        }
-
-        let components = value
-            .split('/')
-            .map(ComponentPattern::new)
-            .collect::<eyre::Result<Vec<_>>>()?;
-        if components.len() == 1 {
-            Ok(Self::Component(
-                components.into_iter().next().expect("one component"),
-            ))
-        } else {
-            Ok(Self::Path(components))
-        }
-    }
-
-    fn matches_path(&self, path: &RelativePath) -> bool {
-        match self {
-            IgnorePattern::Component(pattern) => path
-                .as_components()
-                .iter()
-                .any(|component| pattern.matches(component.as_str())),
-            IgnorePattern::Path(patterns) => {
-                let components = path.as_components();
-                components.len() >= patterns.len()
-                    && components
-                        .iter()
-                        .zip(patterns)
-                        .all(|(component, pattern)| pattern.matches(component.as_str()))
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ComponentPattern {
-    raw: CompactString,
-}
-
-impl ComponentPattern {
-    fn new(value: &str) -> eyre::Result<Self> {
-        if value.is_empty() {
-            eyre::bail!("path component pattern must not be empty");
-        }
-        if value == "." || value == ".." {
-            eyre::bail!("path component pattern must not be {value:?}");
-        }
-        Ok(Self {
-            raw: CompactString::from(value),
-        })
-    }
-
-    fn matches(&self, value: &str) -> bool {
-        wildcard_match(self.raw.as_str(), value)
-    }
 }
 
 #[cfg(test)]
@@ -195,7 +132,7 @@ mod tests {
             "nested/.note.txt.opbox-tmp-0123456789abcdef",
         ] {
             assert!(
-                rules.is_ignored(&path(ignored)),
+                rules.is_ignored(&path(ignored), false),
                 "{ignored} must be ignored"
             );
         }
@@ -206,54 +143,47 @@ mod tests {
             "docs/ideas.md",
             "src/main.rs",
         ] {
-            assert!(!rules.is_ignored(&path(kept)), "{kept} must not be ignored");
+            assert!(
+                !rules.is_ignored(&path(kept), false),
+                "{kept} must not be ignored"
+            );
         }
         Ok(())
     }
 
     #[test]
-    fn reports_supported_ignore_pattern_subset() {
-        assert!(ignore_pattern_is_supported("target"));
-        assert!(ignore_pattern_is_supported("/dist/"));
-        assert!(ignore_pattern_is_supported("*.log"));
+    fn opboxignore_uses_gitignore_syntax() -> eyre::Result<()> {
+        let rules = IgnoreRules::parse(
+            "\
+dist/
+!dist/keep.txt
+foo/**/bar
+*.log
+",
+        )?;
 
-        assert!(!ignore_pattern_is_supported(""));
-        assert!(!ignore_pattern_is_supported("# comment"));
-        assert!(!ignore_pattern_is_supported("!keep.txt"));
-        assert!(!ignore_pattern_is_supported("foo/**/bar"));
-        assert!(!ignore_pattern_is_supported("/"));
-    }
-}
+        assert!(rules.is_ignored(&path("dist"), true));
+        assert!(!rules.is_ignored(&path("dist"), false));
+        assert!(!rules.is_ignored(&path("dist/keep.txt"), false));
+        assert!(rules.is_ignored(&path("dist/drop.txt"), false));
+        assert!(rules.is_ignored(&path("foo/a/b/bar"), false));
+        assert!(rules.is_ignored(&path("nested/error.log"), false));
+        assert!(!rules.is_ignored(&path("nested/error.txt"), false));
 
-fn wildcard_match(pattern: &str, value: &str) -> bool {
-    let pattern = pattern.as_bytes();
-    let value = value.as_bytes();
-    let (mut pattern_idx, mut value_idx) = (0, 0);
-    let mut star_idx = None;
-    let mut star_value_idx = 0;
-
-    while value_idx < value.len() {
-        if pattern_idx < pattern.len()
-            && (pattern[pattern_idx] == value[value_idx] || pattern[pattern_idx] == b'?')
-        {
-            pattern_idx += 1;
-            value_idx += 1;
-        } else if pattern_idx < pattern.len() && pattern[pattern_idx] == b'*' {
-            star_idx = Some(pattern_idx);
-            pattern_idx += 1;
-            star_value_idx = value_idx;
-        } else if let Some(star) = star_idx {
-            pattern_idx = star + 1;
-            star_value_idx += 1;
-            value_idx = star_value_idx;
-        } else {
-            return false;
-        }
+        Ok(())
     }
 
-    while pattern_idx < pattern.len() && pattern[pattern_idx] == b'*' {
-        pattern_idx += 1;
-    }
+    #[test]
+    fn hard_ignores_cannot_be_unignored() -> eyre::Result<()> {
+        let rules = IgnoreRules::parse(
+            "\
+!.opbox/**
+!*.opbox-tmp-*
+",
+        )?;
 
-    pattern_idx == pattern.len()
+        assert!(rules.is_ignored(&path(".opbox/storage.db"), false));
+        assert!(rules.is_ignored(&path(".note.txt.opbox-tmp-0123456789abcdef"), false));
+        Ok(())
+    }
 }

@@ -1,5 +1,5 @@
 use crate::fs::fio::FileIO;
-use crate::fs::ignore::IgnoreRules;
+use crate::fs::ignore::{IgnoreRules, is_hard_ignored};
 use crate::fs::types::{
     DeleteIfExistsResult, ExpectedBefore, FileContentFingerprint, FileFingerprint, FileHash,
     FileKey, FileStatFingerprint, GuardedDeleteResult, GuardedReadResult, GuardedWriteResult,
@@ -225,9 +225,17 @@ impl FileIO for LocalFileIO {
         match &scope {
             ScanScope::Full => pending_dirs.push(None),
             ScanScope::Subtree(path) => {
-                if ignore_rules.is_ignored(path) {
+                if is_hard_ignored(path) {
                     // Ignored subtrees are local-only implementation details.
                 } else if let Some(entry) = self.stat_path(path.clone()).await? {
+                    let is_dir = matches!(entry.kind, TreeEntryKind::Directory);
+                    if ignore_rules.is_ignored(path, is_dir) {
+                        return Ok(ScanResult {
+                            finished_at: OffsetDateTime::now_utc(),
+                            scope,
+                            tree: Tree::new(entries)?,
+                        });
+                    }
                     if matches!(entry.kind, TreeEntryKind::Directory) {
                         pending_dirs.push(Some(path.clone()));
                     }
@@ -235,8 +243,11 @@ impl FileIO for LocalFileIO {
                 }
             }
             ScanScope::SingleFile(path) => {
-                if !ignore_rules.is_ignored(path)
-                    && let Some(entry) = self.stat_path(path.clone()).await?
+                if is_hard_ignored(path) {
+                    // Ignored files are local-only implementation details.
+                } else if let Some(entry) = self.stat_path(path.clone()).await?
+                    && !ignore_rules
+                        .is_ignored(path, matches!(entry.kind, TreeEntryKind::Directory))
                 {
                     entries.push(entry);
                 }
@@ -262,14 +273,18 @@ impl FileIO for LocalFileIO {
                     Err(error) => return Err(error.into()),
                 };
                 let SelfPath(path) = Self::child_path(dir.as_ref(), &entry.file_name())?;
-                if ignore_rules.is_ignored(&path) {
+                if is_hard_ignored(&path) {
                     continue;
                 }
                 let Some(tree_entry) = self.stat_path(path.clone()).await? else {
                     continue;
                 };
+                let is_dir = matches!(tree_entry.kind, TreeEntryKind::Directory);
+                if ignore_rules.is_ignored(&path, is_dir) {
+                    continue;
+                }
 
-                if matches!(tree_entry.kind, TreeEntryKind::Directory) {
+                if is_dir {
                     pending_dirs.push(Some(path));
                 }
                 entries.push(tree_entry);
