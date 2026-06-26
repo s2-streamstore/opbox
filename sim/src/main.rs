@@ -178,6 +178,8 @@ enum Workload {
     SustainedEditingStress,
     DeleteWhileOffline,
     BinaryFileIgnore,
+    PermissionDeniedIgnore,
+    TooLargeIgnore,
 }
 
 impl Workload {
@@ -311,6 +313,12 @@ fn run_single(args: SingleArgs) -> eyre::Result<()> {
         }
         Workload::BinaryFileIgnore => {
             run_binary_file_ignore_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::PermissionDeniedIgnore => {
+            run_permission_denied_ignore_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::TooLargeIgnore => {
+            run_too_large_ignore_workload(&mut sim, seed, args.common.max_steps)?
         }
     }
 
@@ -1179,6 +1187,160 @@ fn run_binary_file_ignore_workload(
         .await?;
 
         println!("SIM_OK workload=binary-file-ignore seed={seed}");
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
+fn run_permission_denied_ignore_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000015".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "secret.txt";
+        let content = format!("readable content seed={seed}\n");
+
+        // Inject a permission-denied fault BEFORE writing so the
+        // guarded_read triggered by import will fail.
+        daemon_b.inject_guarded_read_permission_denied(path).await?;
+
+        // Write a readable text file from daemon B.
+        daemon_b
+            .write_file(path, Bytes::from(content.clone()))
+            .await?;
+
+        // Explicitly request a scan so the engine discovers the file
+        // regardless of whether the startup scan already completed.
+        daemon_b.request_full_scan().await?;
+
+        // Allow scan cycles to process.
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        // The file should be tracked as ignored on daemon B.
+        let debug_b = daemon_b.semantic_debug_snapshot().await?;
+        assert!(
+            debug_b.ignored_files_count >= 1,
+            "expected ignored_files_count >= 1 on daemon B after permission denied, got {}",
+            debug_b.ignored_files_count
+        );
+
+        // The file should NOT appear on daemon A (never successfully imported).
+        let files_a = daemon_a.snapshot_utf8_text_files().await?;
+        assert!(
+            !files_a.contains_key(path),
+            "permission-denied file should not sync to daemon A"
+        );
+
+        // Now "restore permissions" by not injecting any more faults and
+        // requesting another scan. Since PermissionDenied entries are always
+        // re-attempted (permission changes don't affect stat fingerprint),
+        // the daemon should retry, succeed, and remove from ignore table.
+        daemon_b.request_full_scan().await?;
+
+        // Both daemons should converge on the text content.
+        wait_for_text_files(
+            &daemon_a,
+            &daemon_b,
+            &BTreeMap::from([(path.to_string(), content)]),
+            steps,
+        )
+        .await?;
+
+        // After convergence, ignored_files should be cleared.
+        let debug_b = daemon_b.semantic_debug_snapshot().await?;
+        assert_eq!(
+            debug_b.ignored_files_count, 0,
+            "expected ignored_files_count == 0 after permission restored, got {}",
+            debug_b.ignored_files_count
+        );
+
+        println!("SIM_OK workload=permission-denied-ignore seed={seed}");
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
+fn run_too_large_ignore_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000016".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "huge.txt";
+
+        // 20 MiB + 1 byte — just over the limit.
+        let over_limit_size = 20 * 1024 * 1024 + 1;
+        let large_content = Bytes::from(vec![b'x'; over_limit_size]);
+        daemon_b.write_file(path, large_content).await?;
+
+        // Explicitly request a scan so the engine discovers the file
+        // regardless of whether the startup scan already completed.
+        daemon_b.request_full_scan().await?;
+
+        // Allow scan cycles to process.
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        // The file should be tracked as ignored on daemon B.
+        let debug_b = daemon_b.semantic_debug_snapshot().await?;
+        assert!(
+            debug_b.ignored_files_count >= 1,
+            "expected ignored_files_count >= 1 on daemon B after too-large file, got {}",
+            debug_b.ignored_files_count
+        );
+
+        // The file should NOT appear on daemon A.
+        let files_a = daemon_a.snapshot_utf8_text_files().await?;
+        assert!(
+            !files_a.contains_key(path),
+            "too-large file should not sync to daemon A"
+        );
+
+        // Now shrink the file below the limit. The stat fingerprint (size)
+        // changes, so the daemon should re-attempt and succeed.
+        let small_content = format!("shrunk content seed={seed}\n");
+        daemon_b
+            .replace_file_contents(path, Bytes::from(small_content.clone()))
+            .await?;
+
+        // Both daemons should converge on the small content.
+        wait_for_text_files(
+            &daemon_a,
+            &daemon_b,
+            &BTreeMap::from([(path.to_string(), small_content)]),
+            steps,
+        )
+        .await?;
+
+        // After convergence, ignored_files should be cleared.
+        let debug_b = daemon_b.semantic_debug_snapshot().await?;
+        assert_eq!(
+            debug_b.ignored_files_count, 0,
+            "expected ignored_files_count == 0 after file shrunk, got {}",
+            debug_b.ignored_files_count
+        );
+
+        println!("SIM_OK workload=too-large-ignore seed={seed}");
         daemon_a.shutdown().await;
         daemon_b.shutdown().await;
         Ok(())
@@ -3094,6 +3256,12 @@ async fn run_daemon_client(
                         let result = notify_handle.send_scope(scope).map_err(|err| err.to_string());
                         let _ = reply.send(result);
                     }
+                    SimDaemonCommand::InjectGuardedReadPermissionDenied { path, reply } => {
+                        let result = file_io
+                            .inject_guarded_read_permission_denied(path)
+                            .map_err(|err| err.to_string());
+                        let _ = reply.send(result);
+                    }
                     SimDaemonCommand::InjectGuardedReadChangedBetweenStats { path, replacement, reply } => {
                         let result = file_io
                             .inject_guarded_read_changed_between_stats(path, replacement)
@@ -3317,6 +3485,21 @@ impl SimDaemonHandle {
         recv.await.map_err(io_err)?.map_err(io_err)
     }
 
+    async fn inject_guarded_read_permission_denied(
+        &self,
+        path: impl Into<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (reply, recv) = oneshot::channel();
+        self.command_tx
+            .send(SimDaemonCommand::InjectGuardedReadPermissionDenied {
+                path: path.into(),
+                reply,
+            })
+            .await
+            .map_err(io_err)?;
+        recv.await.map_err(io_err)?.map_err(io_err)
+    }
+
     async fn inject_guarded_read_changed_between_stats(
         &self,
         path: impl Into<String>,
@@ -3460,6 +3643,10 @@ enum SimDaemonCommand {
     },
     RequestScan {
         scope: ScanScope,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    InjectGuardedReadPermissionDenied {
+        path: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
     InjectGuardedReadChangedBetweenStats {
