@@ -55,6 +55,7 @@ pub struct SemanticDebugSnapshot {
     pub stable_paths: BTreeMap<String, ObjectId>,
     pub outbox_rows: u64,
     pub outbox_inflight_rows: u64,
+    pub ignored_files_count: u64,
 }
 
 impl SemanticService {
@@ -82,11 +83,13 @@ impl SemanticService {
                     .collect();
                 let outbox_rows = tx.count_table("outbox").await?;
                 let outbox_inflight_rows = tx.count_outbox_inflight().await?;
+                let ignored_files_count = tx.count_table("ignored_files").await?;
                 Ok(SemanticDebugSnapshot {
                     prior_live_paths,
                     stable_paths,
                     outbox_rows,
                     outbox_inflight_rows,
+                    ignored_files_count,
                 })
             })
         })

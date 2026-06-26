@@ -1358,6 +1358,7 @@ impl<'a> SemanticTransaction<'a> {
             "prior_tree" => "SELECT COUNT(*) FROM prior_tree",
             "import_staged_files" => "SELECT COUNT(*) FROM import_staged_files",
             "outbox" => "SELECT COUNT(*) FROM outbox",
+            "ignored_files" => "SELECT COUNT(*) FROM ignored_files",
             _ => {
                 return Err(SemanticTransactionError::InvariantViolation(format!(
                     "unsupported table count: {table}"
