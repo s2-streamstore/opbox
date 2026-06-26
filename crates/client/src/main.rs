@@ -1204,19 +1204,10 @@ async fn run_start(sync_root: Option<PathBuf>) -> eyre::Result<()> {
 async fn run_stop(sync_root: Option<PathBuf>) -> eyre::Result<()> {
     let root = find_workspace_root(&root_or_current(sync_root)?)?;
     let response = match request_valid_status(&root).await {
-        Ok(_) => match ipc::request_stop(&root).await {
-            Ok(response) => response,
-            Err(error) => {
-                if error.downcast_ref::<ipc::DaemonBuildMismatch>().is_some() {
-                    stop_mismatched_daemon_by_signal(&root, &error).await?
-                } else {
-                    exit_daemon_not_running_or_report(&root, error);
-                }
-            }
-        },
+        Ok(_) => request_stop_with_mismatch_fallback(&root).await?,
         Err(error) => {
             if error.downcast_ref::<ipc::DaemonBuildMismatch>().is_some() {
-                stop_mismatched_daemon_by_signal(&root, &error).await?
+                request_stop_with_mismatch_fallback(&root).await?
             } else {
                 exit_daemon_not_running_or_report(&root, error);
             }
@@ -1226,6 +1217,19 @@ async fn run_stop(sync_root: Option<PathBuf>) -> eyre::Result<()> {
     wait_for_daemon_process_exit(&root, &response).await
 }
 
+async fn request_stop_with_mismatch_fallback(root: &Path) -> eyre::Result<ipc::StopResponse> {
+    match ipc::request_stop(root).await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            if error.downcast_ref::<ipc::DaemonBuildMismatch>().is_some() {
+                stop_mismatched_daemon_by_signal(root, &error).await
+            } else {
+                exit_daemon_not_running_or_report(root, error);
+            }
+        }
+    }
+}
+
 async fn stop_mismatched_daemon_by_signal(
     root: &Path,
     error: &eyre::Report,
@@ -1233,15 +1237,15 @@ async fn stop_mismatched_daemon_by_signal(
     let style = CliStyle::for_stderr();
     eprintln!("{}", style.yellow(error));
     let pid = read_daemon_pid(root)?;
+    let workspace_id = load_configured_daemon_state(root)
+        .await
+        .map(|(_, row)| row.workspace_id.0)
+        .unwrap_or_else(|_| "unknown".to_string());
     terminate_daemon_process(pid)?;
     eprintln!(
         "{}",
         style.yellow(format!("sent SIGTERM to mismatched opbox daemon pid {pid}"))
     );
-    let workspace_id = load_configured_daemon_state(root)
-        .await
-        .map(|(_, row)| row.workspace_id.0)
-        .unwrap_or_else(|_| "unknown".to_string());
     Ok(ipc::StopResponse { workspace_id, pid })
 }
 
@@ -1300,6 +1304,8 @@ fn daemon_process_is_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
 }
