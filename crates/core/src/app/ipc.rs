@@ -349,12 +349,10 @@ fn resolve_socket_address(sync_root: &Path) -> eyre::Result<std::net::SocketAddr
             link_path.display()
         )
     })?;
-    contents.trim().parse().map_err(|error| {
-        eyre::eyre!(
-            "invalid daemon address in {}: {error}",
-            link_path.display()
-        )
-    })
+    contents
+        .trim()
+        .parse()
+        .map_err(|error| eyre::eyre!("invalid daemon address in {}: {error}", link_path.display()))
 }
 
 pub async fn serve_control(
@@ -682,10 +680,7 @@ fn replace_socket_symlink(socket_path: &Path, link_path: &Path) -> eyre::Result<
 }
 
 #[cfg(windows)]
-fn write_socket_address(
-    link_path: &Path,
-    addr: &std::net::SocketAddr,
-) -> eyre::Result<()> {
+fn write_socket_address(link_path: &Path, addr: &std::net::SocketAddr) -> eyre::Result<()> {
     use std::io::Write;
     match std::fs::remove_file(link_path) {
         Ok(()) => {}

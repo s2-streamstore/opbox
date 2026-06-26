@@ -133,13 +133,9 @@ impl LocalFileIO {
 
         let file = std::fs::File::open(path)?;
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        let ret =
-            unsafe { GetFileInformationByHandle(file.as_raw_handle() as *mut _, &mut info) };
+        let ret = unsafe { GetFileInformationByHandle(file.as_raw_handle() as *mut _, &mut info) };
         if ret == 0 {
-            eyre::bail!(
-                "GetFileInformationByHandle failed for {}",
-                path.display()
-            );
+            eyre::bail!("GetFileInformationByHandle failed for {}", path.display());
         }
 
         let file_index = ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64);

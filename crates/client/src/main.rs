@@ -1186,7 +1186,9 @@ async fn stop_mismatched_daemon_by_signal(
     terminate_daemon_process(pid)?;
     eprintln!(
         "{}",
-        style.yellow(format!("sent termination signal to mismatched opbox daemon pid {pid}"))
+        style.yellow(format!(
+            "sent termination signal to mismatched opbox daemon pid {pid}"
+        ))
     );
     let workspace_id = load_configured_daemon_state(root)
         .await
