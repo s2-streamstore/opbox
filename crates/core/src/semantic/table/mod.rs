@@ -1,4 +1,5 @@
 pub mod daemon_state;
+pub mod ignored_files;
 pub mod import_staged_files;
 pub mod objects;
 pub mod outbox;
