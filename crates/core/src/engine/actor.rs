@@ -1051,12 +1051,22 @@ impl Engine {
                                 }
                             }
                         }
+                        SemanticClientResponse::CommitImportAction(_) => {
+                            eyre::bail!(
+                                "sync engine received bootstrap-only commit import action response"
+                            );
+                        }
                         SemanticClientResponse::CommitImportEpoch(result) => {
                             result?;
                             let EnginePhase::Importing(ImportPhase::Committing { .. }) = &self.phase else {
                                 eyre::bail!("import epoch commit response while engine was not committing an import epoch");
                             };
                             self.enter_boundary()?;
+                        }
+                        SemanticClientResponse::CommitProjectionAction(_) => {
+                            eyre::bail!(
+                                "sync engine received bootstrap-only commit projection action response"
+                            );
                         }
                         SemanticClientResponse::CommitProjectionEpoch(result) => {
                             result?;

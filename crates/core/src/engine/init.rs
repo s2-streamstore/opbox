@@ -60,7 +60,8 @@ pub async fn run(config: InitConfig) -> eyre::Result<InitResult> {
                 fs.apply_import_action(action)?;
                 let result = await_import_action(&mut fs).await?;
                 debug!(?result, "import action completed");
-                semantic.commit_import_action(result)?;
+                semantic.commit_import_action_checked(result)?;
+                await_commit_import_action(&mut semantic).await?;
                 imported_actions += 1;
             }
 
@@ -115,6 +116,19 @@ async fn await_apply_init_scan(semantic: &mut SemanticClient) -> eyre::Result<Ne
         SemanticClientResponse::ApplyInitScan(result) => result,
         _ => Err(eyre!(
             "unexpected semantic response while init waited for apply_init_scan"
+        )),
+    }
+}
+
+async fn await_commit_import_action(semantic: &mut SemanticClient) -> eyre::Result<()> {
+    match semantic
+        .next()
+        .await
+        .ok_or_else(|| eyre!("semantic actor stopped while init waited for commit_import_action"))?
+    {
+        SemanticClientResponse::CommitImportAction(result) => result,
+        _ => Err(eyre!(
+            "unexpected semantic response while init waited for commit_import_action"
         )),
     }
 }

@@ -272,10 +272,12 @@ impl AppActors {
         &mut self,
         cancellation_token: CancellationToken,
     ) -> eyre::Result<()> {
+        let mut interrupted = false;
         let mut shutdown_error = tokio::select! {
             ctrl_c = tokio::signal::ctrl_c() => {
                 ctrl_c?;
                 info!("ctrl-c received");
+                interrupted = true;
                 None
             }
             result = self.actors.join_next() => {
@@ -284,7 +286,13 @@ impl AppActors {
         };
 
         cancellation_token.cancel();
-        self.drain_with_timeout(&mut shutdown_error).await;
+        let shutdown_timed_out = self.drain_with_timeout(&mut shutdown_error).await;
+        if shutdown_timed_out && shutdown_error.is_none() {
+            shutdown_error = Some(eyre::eyre!("shutdown timed out"));
+        }
+        if interrupted && shutdown_error.is_none() {
+            shutdown_error = Some(eyre::eyre!("operation interrupted"));
+        }
 
         info!("exiting");
 
@@ -300,11 +308,14 @@ impl AppActors {
     ) -> Option<eyre::Report> {
         cancellation_token.cancel();
         let mut shutdown_error = None;
-        self.drain_with_timeout(&mut shutdown_error).await;
+        let shutdown_timed_out = self.drain_with_timeout(&mut shutdown_error).await;
+        if shutdown_timed_out && shutdown_error.is_none() {
+            shutdown_error = Some(eyre::eyre!("shutdown timed out"));
+        }
         shutdown_error
     }
 
-    async fn drain_with_timeout(&mut self, shutdown_error: &mut Option<eyre::Report>) {
+    async fn drain_with_timeout(&mut self, shutdown_error: &mut Option<eyre::Report>) -> bool {
         let drain = async {
             while let Some(result) = self.actors.join_next().await {
                 if shutdown_error.is_none() {
@@ -321,6 +332,9 @@ impl AppActors {
                 "shutdown timed out; aborting actors"
             );
             self.actors.abort_all();
+            true
+        } else {
+            false
         }
     }
 }

@@ -80,6 +80,15 @@ pub fn default_ignore_file_contents() -> &'static str {
     DEFAULT_IGNORE_FILE
 }
 
+pub fn ignore_pattern_is_supported(pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern.starts_with('#') || pattern.starts_with('!') {
+        return false;
+    }
+
+    IgnorePattern::parse(pattern).is_ok()
+}
+
 pub fn is_hard_ignored(path: &RelativePath) -> bool {
     path.as_components().iter().any(|component| {
         let component = component.as_str();
@@ -200,6 +209,19 @@ mod tests {
             assert!(!rules.is_ignored(&path(kept)), "{kept} must not be ignored");
         }
         Ok(())
+    }
+
+    #[test]
+    fn reports_supported_ignore_pattern_subset() {
+        assert!(ignore_pattern_is_supported("target"));
+        assert!(ignore_pattern_is_supported("/dist/"));
+        assert!(ignore_pattern_is_supported("*.log"));
+
+        assert!(!ignore_pattern_is_supported(""));
+        assert!(!ignore_pattern_is_supported("# comment"));
+        assert!(!ignore_pattern_is_supported("!keep.txt"));
+        assert!(!ignore_pattern_is_supported("foo/**/bar"));
+        assert!(!ignore_pattern_is_supported("/"));
     }
 }
 

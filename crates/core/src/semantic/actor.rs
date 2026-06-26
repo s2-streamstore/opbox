@@ -78,8 +78,10 @@ impl SemanticActor {
                     self.finish_task_result(result).await?;
                 }
 
-                // New requests from engine.
-                Some(request) = self.request_rx.recv() => {
+                // New requests from engine. Semantic owns a single write lane
+                // over the local database; queueing in the mailbox keeps
+                // transaction retries from competing with ourselves.
+                Some(request) = self.request_rx.recv(), if self.running_ops.is_empty() => {
                     self.start_request(request)?;
                 }
 
@@ -124,12 +126,12 @@ impl SemanticActor {
                     }
                 }));
             }
-            SemanticRequest::CommitImportAction { result } => {
+            SemanticRequest::CommitImportAction { result, reply } => {
                 let context = self.runtime_state.validate_import_action(&result);
                 let op_id = self.next_op_id();
                 self.pending_ops.insert(
                     op_id,
-                    PendingSemanticOp::new(PendingSemanticOpKind::CommitImportAction),
+                    PendingSemanticOp::new(PendingSemanticOpKind::CommitImportAction { reply }),
                 );
                 let service = self.service.clone();
                 self.running_ops.push(Box::pin(async move {
@@ -153,12 +155,12 @@ impl SemanticActor {
                         Some(DeferredImportEpochCommit { epoch, reply });
                 }
             }
-            SemanticRequest::CommitProjectionAction { result } => {
+            SemanticRequest::CommitProjectionAction { result, reply } => {
                 let context = self.runtime_state.validate_projection_action(&result);
                 let op_id = self.next_op_id();
                 self.pending_ops.insert(
                     op_id,
-                    PendingSemanticOp::new(PendingSemanticOpKind::CommitProjectionAction),
+                    PendingSemanticOp::new(PendingSemanticOpKind::CommitProjectionAction { reply }),
                 );
                 let service = self.service.clone();
                 self.running_ops.push(Box::pin(async move {
@@ -330,11 +332,20 @@ impl SemanticActor {
             }
             (
                 SemanticTaskResult::CommitImportAction { result, .. },
-                PendingSemanticOpKind::CommitImportAction,
+                PendingSemanticOpKind::CommitImportAction { reply },
             ) => {
-                let action_id = result?.action_id;
-                self.runtime_state.finish_import_action(action_id);
-                self.start_ready_deferred_import_epoch_commit();
+                let result = result.map(|outcome| {
+                    self.runtime_state.finish_import_action(outcome.action_id);
+                });
+                let is_ok = result.is_ok();
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                } else {
+                    result?;
+                }
+                if is_ok {
+                    self.start_ready_deferred_import_epoch_commit();
+                }
             }
             (
                 SemanticTaskResult::ApplySharedMessageBatch { result, .. },
@@ -355,11 +366,20 @@ impl SemanticActor {
             }
             (
                 SemanticTaskResult::CommitProjectionAction { result, .. },
-                PendingSemanticOpKind::CommitProjectionAction,
+                PendingSemanticOpKind::CommitProjectionAction { reply },
             ) => {
-                let result = result?;
-                self.runtime_state.finish_projection_action(result);
-                self.start_ready_deferred_projection_epoch_commit();
+                let result = result.map(|result| {
+                    self.runtime_state.finish_projection_action(result);
+                });
+                let is_ok = result.is_ok();
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                } else {
+                    result?;
+                }
+                if is_ok {
+                    self.start_ready_deferred_projection_epoch_commit();
+                }
             }
             (
                 SemanticTaskResult::CommitProjectionEpoch { result, .. },
@@ -513,9 +533,12 @@ impl SemanticActor {
     }
 
     fn projection_action_commits_in_flight(&self) -> bool {
-        self.pending_ops
-            .values()
-            .any(|op| matches!(&op.kind, PendingSemanticOpKind::CommitProjectionAction))
+        self.pending_ops.values().any(|op| {
+            matches!(
+                &op.kind,
+                PendingSemanticOpKind::CommitProjectionAction { .. }
+            )
+        })
     }
 }
 
@@ -957,8 +980,12 @@ enum PendingSemanticOpKind {
     CommitImportEpoch {
         reply: oneshot::Sender<eyre::Result<()>>,
     },
-    CommitImportAction,
-    CommitProjectionAction,
+    CommitImportAction {
+        reply: Option<oneshot::Sender<eyre::Result<()>>>,
+    },
+    CommitProjectionAction {
+        reply: Option<oneshot::Sender<eyre::Result<()>>>,
+    },
     CommitProjectionEpoch {
         reply: oneshot::Sender<eyre::Result<()>>,
     },

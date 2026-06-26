@@ -79,7 +79,8 @@ pub async fn run(config: CloneConfig) -> eyre::Result<CloneResult> {
                 fs.apply_projection_action(action)?;
                 let result = await_projection_action(&mut fs).await?;
                 fail_if_projection_action_invalidated(&result)?;
-                semantic.commit_projection_action(result)?;
+                semantic.commit_projection_action_checked(result)?;
+                await_commit_projection_action(&mut semantic).await?;
                 projected_actions += 1;
             }
 
@@ -303,6 +304,17 @@ async fn await_get_next_work(semantic: &mut SemanticClient) -> eyre::Result<Next
         SemanticClientResponse::GetNextWork { result, .. } => result,
         _ => Err(eyre!(
             "unexpected semantic response while clone waited for next work"
+        )),
+    }
+}
+
+async fn await_commit_projection_action(semantic: &mut SemanticClient) -> eyre::Result<()> {
+    match semantic.next().await.ok_or_else(|| {
+        eyre!("semantic actor stopped while clone waited for commit_projection_action")
+    })? {
+        SemanticClientResponse::CommitProjectionAction(result) => result,
+        _ => Err(eyre!(
+            "unexpected semantic response while clone waited for commit_projection_action"
         )),
     }
 }
