@@ -1146,13 +1146,20 @@ fn run_config(workspace: bool, command: ConfigCommand) -> eyre::Result<()> {
 
 async fn run_start(sync_root: Option<PathBuf>) -> eyre::Result<()> {
     let root = find_workspace_root(&root_or_current(sync_root)?)?;
-    if let Ok(status) = request_valid_status(&root).await {
-        print_daemon_status(
-            "opbox daemon already running",
-            &status,
-            CliStyle::for_stdout(),
-        );
-        return Ok(());
+    match request_valid_status(&root).await {
+        Ok(status) => {
+            print_daemon_status(
+                "opbox daemon already running",
+                &status,
+                CliStyle::for_stdout(),
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            if let Some(mismatch) = error.downcast_ref::<ipc::DaemonBuildMismatch>() {
+                eyre::bail!("{mismatch}");
+            }
+        }
     }
     let (_db_path, daemon_row) = load_configured_daemon_state(&root).await?;
 
@@ -1171,16 +1178,23 @@ async fn run_start(sync_root: Option<PathBuf>) -> eyre::Result<()> {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok(status) = request_valid_status(&root).await
-            && status.workspace_id == daemon_row.workspace_id.0
-        {
-            print_daemon_status("opbox daemon started", &status, CliStyle::for_stdout());
-            println!(
-                "  {}  {}",
-                CliStyle::for_stdout().dim(format!("{:<13}", "log")),
-                log_path.display()
-            );
-            return Ok(());
+        match request_valid_status(&root).await {
+            Ok(status) if status.workspace_id == daemon_row.workspace_id.0 => {
+                print_daemon_status("opbox daemon started", &status, CliStyle::for_stdout());
+                println!(
+                    "  {}  {}",
+                    CliStyle::for_stdout().dim(format!("{:<13}", "log")),
+                    log_path.display()
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                if let Some(mismatch) = error.downcast_ref::<ipc::DaemonBuildMismatch>() {
+                    let _ = child.kill().await;
+                    eyre::bail!("{mismatch}");
+                }
+            }
+            _ => {}
         }
 
         if let Some(status) = child.try_wait()? {
