@@ -18,6 +18,22 @@ impl DaemonWriterId {
     }
 }
 
+pub fn crockford_base32_lower(bytes: &[u8]) -> String {
+    base32::CROCKFORD_LOWER.encode(bytes)
+}
+
+pub fn short_crockford_base32_lower(bytes: &[u8]) -> String {
+    let encoded = crockford_base32_lower(bytes);
+    encoded[..6.min(encoded.len())].to_string()
+}
+
+pub fn short_crockford_base32_lower_from_b64(value: &str) -> String {
+    match base64::engine::general_purpose::STANDARD.decode(value) {
+        Ok(bytes) => short_crockford_base32_lower(&bytes),
+        Err(_) => value.chars().take(8).collect(),
+    }
+}
+
 /// ID for a message within the durable operation outbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OutboxId(u64);
@@ -49,7 +65,7 @@ impl Display for WorkspaceId {
 impl WorkspaceId {
     pub fn generate() -> Self {
         let workspace_id_bytes = rand::random::<[u8; 20]>();
-        let workspace_str = base32::CROCKFORD_LOWER.encode(workspace_id_bytes.as_ref());
+        let workspace_str = crockford_base32_lower(workspace_id_bytes.as_ref());
         assert_eq!(workspace_str.len(), 32);
         Self(workspace_str)
     }
@@ -77,6 +93,30 @@ impl FromStr for WorkspaceId {
 pub struct SharedMessageBatch {
     pub sequence_range: RangeInclusive<SequenceNumber>,
     pub messages: Vec<SharedMessageEnvelope>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_crockford_base32_decodes_b64_ids() {
+        let bytes = [7u8; 16];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+
+        assert_eq!(
+            short_crockford_base32_lower_from_b64(&b64),
+            &crockford_base32_lower(&bytes)[..6]
+        );
+    }
+
+    #[test]
+    fn short_crockford_base32_falls_back_for_non_b64_values() {
+        assert_eq!(
+            short_crockford_base32_lower_from_b64("not actually base64"),
+            "not actu"
+        );
+    }
 }
 
 impl TryFrom<Vec<SharedMessageEnvelope>> for SharedMessageBatch {

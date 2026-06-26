@@ -25,7 +25,9 @@ use opbox_core::log::types::LogReadStop;
 use opbox_core::semantic::service::SemanticService;
 use opbox_core::semantic::table::daemon_state;
 use opbox_core::spy::{NamespaceSpyTracker, SpyEvent, SpySharedMessageKind};
-use opbox_core::types::{DaemonWriterId, OutboxId, WorkspaceId};
+use opbox_core::types::{
+    DaemonWriterId, OutboxId, WorkspaceId, short_crockford_base32_lower_from_b64,
+};
 use s2_sdk::{
     S2Basin,
     types::{AccountEndpoint, BasinEndpoint, BasinName},
@@ -575,7 +577,7 @@ impl SpyPrintState {
     }
 
     fn format_origin_writer(&self, origin_writer_id_b64: &str, style: CliStyle) -> String {
-        let short = short_id(origin_writer_id_b64);
+        let short = short_crockford_base32_lower_from_b64(origin_writer_id_b64);
         match &self.daemon_writer_id_b64 {
             Some(daemon_writer_id_b64) if daemon_writer_id_b64 == origin_writer_id_b64 => {
                 format_kv("from", format!("{short}{}", style.green("(you)")), style)
@@ -598,7 +600,11 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, state: &mut SpyPrintState) 
             println!(
                 "{}  {}",
                 style.dim("session"),
-                format_kv("daemon", short_id(&daemon_writer_id_b64), style),
+                format_kv(
+                    "daemon",
+                    short_crockford_base32_lower_from_b64(&daemon_writer_id_b64),
+                    style
+                ),
             );
             state.daemon_writer_id_b64 = Some(daemon_writer_id_b64);
         }
@@ -621,7 +627,16 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, state: &mut SpyPrintState) 
                 let summary = summary.as_ref().or(local_summary.as_ref());
                 let shared_object_id = summary.and_then(namespace_summary_single_object_id);
                 let shared_object_field = shared_object_id
-                    .map(|object_id| format!("  {}", format_kv("obj", short_id(object_id), style)))
+                    .map(|object_id| {
+                        format!(
+                            "  {}",
+                            format_kv(
+                                "obj",
+                                short_crockford_base32_lower_from_b64(object_id),
+                                style
+                            )
+                        )
+                    })
                     .unwrap_or_default();
                 let summary_field = format_namespace_summary(summary, shared_object_id, style);
                 println!(
@@ -644,7 +659,11 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, state: &mut SpyPrintState) 
                     style.spy_bytes(message.payload_size_bytes),
                     style.cyan(format!("{:<10}", "text")),
                     state.format_origin_writer(&message.origin_writer_id_b64, style),
-                    format_kv("obj", short_id(&object_id_b64), style),
+                    format_kv(
+                        "obj",
+                        short_crockford_base32_lower_from_b64(&object_id_b64),
+                        style
+                    ),
                     format_text_summary(summary.as_ref(), style),
                 );
             }
@@ -659,8 +678,16 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, state: &mut SpyPrintState) 
                     style.spy_bytes(message.payload_size_bytes),
                     style.magenta(format!("{:<10}", "binary")),
                     state.format_origin_writer(&message.origin_writer_id_b64, style),
-                    format_kv("obj", short_id(&object_id_b64), style),
-                    format_kv("writer", short_id(&writer_id_b64), style),
+                    format_kv(
+                        "obj",
+                        short_crockford_base32_lower_from_b64(&object_id_b64),
+                        style
+                    ),
+                    format_kv(
+                        "writer",
+                        short_crockford_base32_lower_from_b64(&writer_id_b64),
+                        style
+                    ),
                     format_kv("wall", wall_time_ns, style),
                 );
             }
@@ -687,7 +714,7 @@ fn format_namespace_summary(
             out.push_str(&style.green(format!(
                 "=(\"{}\", obj={}, {})",
                 claim.path,
-                short_id(&claim.object_id_b64),
+                short_crockford_base32_lower_from_b64(&claim.object_id_b64),
                 claim.kind
             )));
         }
@@ -701,7 +728,7 @@ fn format_namespace_summary(
             out.push_str(&style.red(format!(
                 "=(\"{}\", obj={}, {})",
                 claim.path,
-                short_id(&claim.object_id_b64),
+                short_crockford_base32_lower_from_b64(&claim.object_id_b64),
                 claim.kind
             )));
         }
@@ -751,10 +778,6 @@ fn format_text_summary(
 
 fn format_kv(label: &str, value: impl std::fmt::Display, style: CliStyle) -> String {
     format!("{}={}", style.dim(label), value)
-}
-
-fn short_id(value: &str) -> &str {
-    if value.len() <= 8 { value } else { &value[..8] }
 }
 
 struct BootstrapProgress {
