@@ -8,10 +8,13 @@ const CONFIG_FILE_NAME: &str = "config.toml";
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
 #[strum(serialize_all = "kebab-case")]
 pub enum UserConfigKey {
+    Basin,
     DefaultBasin,
     AccessToken,
     AccountEndpoint,
     BasinEndpoint,
+    DaemonLogLevel,
+    ClientLogLevel,
 }
 
 impl UserConfigKey {
@@ -23,46 +26,61 @@ impl UserConfigKey {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UserConfig {
+    pub basin: Option<String>,
     pub default_basin: Option<String>,
     pub access_token: Option<String>,
     pub account_endpoint: Option<String>,
     pub basin_endpoint: Option<String>,
+    pub daemon_log_level: Option<String>,
+    pub client_log_level: Option<String>,
 }
 
 impl UserConfig {
     pub fn get(&self, key: UserConfigKey) -> Option<&str> {
         match key {
+            UserConfigKey::Basin => self.basin.as_deref(),
             UserConfigKey::DefaultBasin => self.default_basin.as_deref(),
             UserConfigKey::AccessToken => self.access_token.as_deref(),
             UserConfigKey::AccountEndpoint => self.account_endpoint.as_deref(),
             UserConfigKey::BasinEndpoint => self.basin_endpoint.as_deref(),
+            UserConfigKey::DaemonLogLevel => self.daemon_log_level.as_deref(),
+            UserConfigKey::ClientLogLevel => self.client_log_level.as_deref(),
         }
     }
 
     pub fn set(&mut self, key: UserConfigKey, value: String) {
         match key {
+            UserConfigKey::Basin => self.basin = Some(value),
             UserConfigKey::DefaultBasin => self.default_basin = Some(value),
             UserConfigKey::AccessToken => self.access_token = Some(value),
             UserConfigKey::AccountEndpoint => self.account_endpoint = Some(value),
             UserConfigKey::BasinEndpoint => self.basin_endpoint = Some(value),
+            UserConfigKey::DaemonLogLevel => self.daemon_log_level = Some(value),
+            UserConfigKey::ClientLogLevel => self.client_log_level = Some(value),
         }
     }
 
     pub fn unset(&mut self, key: UserConfigKey) {
         match key {
+            UserConfigKey::Basin => self.basin = None,
             UserConfigKey::DefaultBasin => self.default_basin = None,
             UserConfigKey::AccessToken => self.access_token = None,
             UserConfigKey::AccountEndpoint => self.account_endpoint = None,
             UserConfigKey::BasinEndpoint => self.basin_endpoint = None,
+            UserConfigKey::DaemonLogLevel => self.daemon_log_level = None,
+            UserConfigKey::ClientLogLevel => self.client_log_level = None,
         }
     }
 
     pub fn entries(&self) -> impl Iterator<Item = (UserConfigKey, &str)> {
         [
+            UserConfigKey::Basin,
             UserConfigKey::DefaultBasin,
             UserConfigKey::AccessToken,
             UserConfigKey::AccountEndpoint,
             UserConfigKey::BasinEndpoint,
+            UserConfigKey::DaemonLogLevel,
+            UserConfigKey::ClientLogLevel,
         ]
         .into_iter()
         .filter_map(|key| self.get(key).map(|value| (key, value)))
@@ -159,18 +177,24 @@ mod tests {
             std::env::temp_dir().join(format!("opbox-user-config-test-{}", rand::random::<u64>()));
         let path = root.join("config.toml");
         let config = UserConfig {
+            basin: Some("workspace-basin".to_string()),
             default_basin: Some("test-basin".to_string()),
             access_token: Some("tok-123".to_string()),
             account_endpoint: Some("account.s2.test".to_string()),
             basin_endpoint: Some("{basin}.s2.test".to_string()),
+            daemon_log_level: Some("opbox_core=debug".to_string()),
+            client_log_level: Some("warn".to_string()),
         };
 
         save_user_config_to_path(&config, &path)?;
         let loaded = load_user_config_from_path(&path)?;
+        assert_eq!(loaded.basin.as_deref(), Some("workspace-basin"));
         assert_eq!(loaded.default_basin.as_deref(), Some("test-basin"));
         assert_eq!(loaded.access_token.as_deref(), Some("tok-123"));
         assert_eq!(loaded.account_endpoint.as_deref(), Some("account.s2.test"));
         assert_eq!(loaded.basin_endpoint.as_deref(), Some("{basin}.s2.test"));
+        assert_eq!(loaded.daemon_log_level.as_deref(), Some("opbox_core=debug"));
+        assert_eq!(loaded.client_log_level.as_deref(), Some("warn"));
 
         #[cfg(unix)]
         {

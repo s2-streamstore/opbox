@@ -9,7 +9,7 @@ use std::num::NonZeroU32;
 use std::str::FromStr;
 use tracing::warn;
 
-use super::{user_config::UserConfig, workspace::WorkspaceEnv};
+use super::user_config::UserConfig;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct S2ConnectionConfig {
@@ -19,78 +19,37 @@ pub struct S2ConnectionConfig {
 }
 
 impl S2ConnectionConfig {
-    pub fn from_env() -> eyre::Result<Self> {
-        let access_token = required_env("S2_ACCESS_TOKEN")?;
-        Ok(Self {
-            access_token,
-            account_endpoint: optional_env("S2_ACCOUNT_ENDPOINT")?,
-            basin_endpoint: optional_env("S2_BASIN_ENDPOINT")?,
-        })
+    pub fn from_user_config(user_config: &UserConfig) -> eyre::Result<Self> {
+        Self::from_workspace_or_user_config(&UserConfig::default(), None, None, user_config)
     }
 
-    pub fn from_env_or_user_config(user_config: &UserConfig) -> eyre::Result<Self> {
-        let access_token = optional_env("S2_ACCESS_TOKEN")?
-            .or_else(|| user_config.access_token.clone())
-            .ok_or_else(|| {
-                eyre!(
-                    "S2_ACCESS_TOKEN is not set and opbox user config has no access-token; \
-                     run `ob config set access-token <token>` or export S2_ACCESS_TOKEN"
-                )
-            })?;
-        Ok(Self {
-            access_token,
-            account_endpoint: optional_env("S2_ACCOUNT_ENDPOINT")?
-                .or_else(|| user_config.account_endpoint.clone()),
-            basin_endpoint: optional_env("S2_BASIN_ENDPOINT")?
-                .or_else(|| user_config.basin_endpoint.clone()),
-        })
-    }
-
-    pub fn from_env_workspace_or_user_config(
-        workspace_account_endpoint: Option<&str>,
-        workspace_basin_endpoint: Option<&str>,
+    pub fn from_workspace_or_user_config(
+        workspace_config: &UserConfig,
+        metadata_account_endpoint: Option<&str>,
+        metadata_basin_endpoint: Option<&str>,
         user_config: &UserConfig,
     ) -> eyre::Result<Self> {
-        let access_token = optional_env("S2_ACCESS_TOKEN")?
+        let access_token = workspace_config
+            .access_token
+            .clone()
             .or_else(|| user_config.access_token.clone())
             .ok_or_else(|| {
                 eyre!(
-                    "S2_ACCESS_TOKEN is not set and opbox user config has no access-token; \
-                     run `ob config set access-token <token>` or export S2_ACCESS_TOKEN"
+                    "no S2 access token configured; run `ob config set access-token <token>` \
+                     or `ob config --workspace set access-token <token>`"
                 )
             })?;
         Ok(Self {
             access_token,
-            account_endpoint: optional_env("S2_ACCOUNT_ENDPOINT")?
-                .or_else(|| workspace_account_endpoint.map(str::to_owned))
+            account_endpoint: workspace_config
+                .account_endpoint
+                .clone()
+                .or_else(|| metadata_account_endpoint.map(str::to_owned))
                 .or_else(|| user_config.account_endpoint.clone()),
-            basin_endpoint: optional_env("S2_BASIN_ENDPOINT")?
-                .or_else(|| workspace_basin_endpoint.map(str::to_owned))
-                .or_else(|| user_config.basin_endpoint.clone()),
-        })
-    }
-
-    pub fn from_env_overrides_workspace_or_user_config(
-        env_overrides: &WorkspaceEnv,
-        workspace_account_endpoint: Option<&str>,
-        workspace_basin_endpoint: Option<&str>,
-        user_config: &UserConfig,
-    ) -> eyre::Result<Self> {
-        let access_token = optional_override_or_env(env_overrides, "S2_ACCESS_TOKEN")?
-            .or_else(|| user_config.access_token.clone())
-            .ok_or_else(|| {
-                eyre!(
-                    "S2_ACCESS_TOKEN is not set and opbox user config has no access-token; \
-                     run `ob config set access-token <token>` or export S2_ACCESS_TOKEN"
-                )
-            })?;
-        Ok(Self {
-            access_token,
-            account_endpoint: optional_override_or_env(env_overrides, "S2_ACCOUNT_ENDPOINT")?
-                .or_else(|| workspace_account_endpoint.map(str::to_owned))
-                .or_else(|| user_config.account_endpoint.clone()),
-            basin_endpoint: optional_override_or_env(env_overrides, "S2_BASIN_ENDPOINT")?
-                .or_else(|| workspace_basin_endpoint.map(str::to_owned))
+            basin_endpoint: workspace_config
+                .basin_endpoint
+                .clone()
+                .or_else(|| metadata_basin_endpoint.map(str::to_owned))
                 .or_else(|| user_config.basin_endpoint.clone()),
         })
     }
@@ -102,31 +61,6 @@ impl S2ConnectionConfig {
             }
             _ => (None, None),
         }
-    }
-}
-
-fn required_env(key: &str) -> eyre::Result<String> {
-    optional_env(key)?.ok_or_else(|| {
-        eyre!("{key} is not set; export it or run `ob config set access-token <token>`")
-    })
-}
-
-fn optional_env(key: &str) -> eyre::Result<Option<String>> {
-    match std::env::var(key) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => eyre::bail!("{key} is not valid unicode"),
-    }
-}
-
-fn optional_override_or_env(
-    env_overrides: &WorkspaceEnv,
-    key: &str,
-) -> eyre::Result<Option<String>> {
-    if let Some(value) = env_overrides.get(key) {
-        Ok(Some(value.to_string()))
-    } else {
-        optional_env(key)
     }
 }
 
@@ -196,25 +130,12 @@ pub fn report_is_s2_connectivity(error: &eyre::Report) -> bool {
         .is_some_and(s2_error_is_connectivity)
 }
 
-pub fn s2_client_from_env(access_token: &str) -> eyre::Result<S2> {
-    s2_client_from_config(&S2ConnectionConfig {
-        access_token: access_token.to_string(),
-        account_endpoint: optional_env("S2_ACCOUNT_ENDPOINT")?,
-        basin_endpoint: optional_env("S2_BASIN_ENDPOINT")?,
-    })
-}
-
 pub async fn s2_basin_from_config(
     basin: BasinName,
     connection: &S2ConnectionConfig,
 ) -> eyre::Result<S2Basin> {
     let s2 = s2_client_from_config(connection)?;
     Ok(s2.basin(basin))
-}
-
-pub async fn s2_basin_from_env(basin: BasinName) -> eyre::Result<S2Basin> {
-    let connection = S2ConnectionConfig::from_env()?;
-    s2_basin_from_config(basin, &connection).await
 }
 
 pub fn ops_stream_name(workspace_id: &WorkspaceId) -> eyre::Result<StreamName> {
@@ -255,5 +176,60 @@ pub async fn ensure_workspace_stream_exists(
             Err(eyre!("workspace {} does not exist", workspace_id.0))
         }
         Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_config_prefers_workspace_then_metadata_then_user_config() -> eyre::Result<()> {
+        let user_config = UserConfig {
+            access_token: Some("global-token".to_string()),
+            account_endpoint: Some("global-account.s2.test".to_string()),
+            basin_endpoint: Some("{basin}.global.s2.test".to_string()),
+            ..UserConfig::default()
+        };
+        let workspace_config = UserConfig {
+            access_token: Some("workspace-token".to_string()),
+            account_endpoint: Some("workspace-account.s2.test".to_string()),
+            ..UserConfig::default()
+        };
+
+        let connection = S2ConnectionConfig::from_workspace_or_user_config(
+            &workspace_config,
+            Some("metadata-account.s2.test"),
+            Some("{basin}.metadata.s2.test"),
+            &user_config,
+        )?;
+
+        assert_eq!(connection.access_token, "workspace-token");
+        assert_eq!(
+            connection.account_endpoint.as_deref(),
+            Some("workspace-account.s2.test")
+        );
+        assert_eq!(
+            connection.basin_endpoint.as_deref(),
+            Some("{basin}.metadata.s2.test")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn connection_config_requires_access_token() {
+        let error = S2ConnectionConfig::from_workspace_or_user_config(
+            &UserConfig::default(),
+            None,
+            None,
+            &UserConfig::default(),
+        )
+        .expect_err("missing access token should fail");
+
+        assert!(
+            error.to_string().contains("no S2 access token configured"),
+            "unexpected error: {error}"
+        );
     }
 }

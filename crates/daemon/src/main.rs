@@ -6,16 +6,17 @@ use opbox_core::app::s2::{
     S2ConnectionConfig, ensure_workspace_stream_exists, report_is_s2_connectivity,
     s2_basin_from_config,
 };
-use opbox_core::app::user_config::{UserConfig, load_user_config};
+use opbox_core::app::user_config::{UserConfig, load_user_config, load_user_config_from_path};
 use opbox_core::app::workspace::{
-    DaemonLock, WorkspaceEnv, canonicalize_existing_dir, load_configured_daemon_state,
-    load_workspace_env, remove_pid, workspace_env_path, write_pid,
+    DaemonLock, canonicalize_existing_dir, load_configured_daemon_state, remove_pid,
+    workspace_config_path, write_pid,
 };
 use opbox_core::engine::actor::EngineStatusConfig;
 use opbox_core::fs::fio::local::LocalFileIO;
 use opbox_core::notify::nio::LocalNotifyIO;
 use opbox_core::semantic::service::SemanticService;
-use std::path::PathBuf;
+use opbox_core::semantic::table::daemon_state;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
@@ -29,17 +30,27 @@ struct Args {
     root: PathBuf,
 }
 
-fn init_tracing(sync_root: &PathBuf, workspace_env: &WorkspaceEnv) -> eyre::Result<()> {
-    let filter = if let Some(rust_log) = workspace_env.get("RUST_LOG") {
-        tracing_subscriber::EnvFilter::try_new(rust_log).map_err(|err| {
+fn load_workspace_config(sync_root: &Path) -> eyre::Result<UserConfig> {
+    load_user_config_from_path(&workspace_config_path(sync_root))
+}
+
+fn init_tracing(
+    sync_root: &Path,
+    workspace_config: &UserConfig,
+    user_config: &UserConfig,
+) -> eyre::Result<()> {
+    let filter = if let Some(log_level) = workspace_config.daemon_log_level.as_deref() {
+        tracing_subscriber::EnvFilter::try_new(log_level).map_err(|err| {
             eyre::eyre!(
-                "invalid RUST_LOG in {}: {err}",
-                workspace_env_path(sync_root).display()
+                "invalid daemon-log-level in {}: {err}",
+                workspace_config_path(sync_root).display()
             )
         })?
+    } else if let Some(log_level) = user_config.daemon_log_level.as_deref() {
+        tracing_subscriber::EnvFilter::try_new(log_level)
+            .map_err(|err| eyre::eyre!("invalid user daemon-log-level: {err}"))?
     } else {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        tracing_subscriber::EnvFilter::new("info")
     };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -48,23 +59,36 @@ fn init_tracing(sync_root: &PathBuf, workspace_env: &WorkspaceEnv) -> eyre::Resu
     Ok(())
 }
 
+fn apply_workspace_basin(
+    workspace_config: &UserConfig,
+    daemon_row: &mut daemon_state::Row,
+) -> eyre::Result<()> {
+    let Some(basin) = workspace_config.basin.as_deref() else {
+        return Ok(());
+    };
+    daemon_row.s2_basin = basin
+        .parse()
+        .map_err(|err| eyre::eyre!("invalid basin in workspace config {basin:?}: {err}"))?;
+    Ok(())
+}
+
 fn main() -> eyre::Result<()> {
     let args = Args::parse();
     let sync_root = canonicalize_existing_dir(&args.root)?;
-    let workspace_env = load_workspace_env(&sync_root)?;
-    init_tracing(&sync_root, &workspace_env)?;
     let user_config = load_user_config()?;
+    let workspace_config = load_workspace_config(&sync_root)?;
+    init_tracing(&sync_root, &workspace_config, &user_config)?;
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run(sync_root, user_config, workspace_env))
+        .block_on(run(sync_root, user_config, workspace_config))
 }
 
 async fn run(
     sync_root: PathBuf,
     user_config: UserConfig,
-    workspace_env: WorkspaceEnv,
+    workspace_config: UserConfig,
 ) -> eyre::Result<()> {
     let _lock = DaemonLock::acquire(&sync_root)?;
     write_pid(&sync_root)?;
@@ -72,9 +96,10 @@ async fn run(
         sync_root: sync_root.clone(),
     };
 
-    let (db_path, daemon_row) = load_configured_daemon_state(&sync_root).await?;
-    let s2_connection = S2ConnectionConfig::from_env_overrides_workspace_or_user_config(
-        &workspace_env,
+    let (db_path, mut daemon_row) = load_configured_daemon_state(&sync_root).await?;
+    apply_workspace_basin(&workspace_config, &mut daemon_row)?;
+    let s2_connection = S2ConnectionConfig::from_workspace_or_user_config(
+        &workspace_config,
         daemon_row.s2_account_endpoint.as_deref(),
         daemon_row.s2_basin_endpoint.as_deref(),
         &user_config,

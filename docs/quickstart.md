@@ -39,7 +39,7 @@ ob config set access-token "MY_TOKEN"
 ob config set default-basin "MY_BASIN"
 ```
 
-`ob config` writes to an OS user-level opbox config file, not to the current workspace. These values become the defaults for every opbox workspace you create or clone as this OS user. For one-off commands, exported environment variables such as `S2_ACCESS_TOKEN` and `S2_BASIN` take precedence.
+`ob config` writes to an OS user-level opbox config file by default. These values become the defaults for every opbox workspace you create or clone as this OS user. Use `ob config --workspace ...` inside a workspace when one workspace needs its own basin, access token, endpoints, or daemon log level.
 
 At this point, you're set.
 
@@ -82,12 +82,12 @@ ob start
 > [!TIP]
 > Most `ob` commands operate on the local workspace. If your `$PWD` is not in a workspace directory (or a subdirectory of it), they won't work. Similar to `git`.
 >
-> `ob config` is the exception: it is user-wide, not workspace-local.
+> `ob config` is user-wide by default. Add `--workspace` to read or write `.opbox/config.toml` for the current workspace.
 
 ## Cloning an existing workspace
 
 > [!NOTE]
-> Make sure your user-wide opbox config is correct. If you did the S2 setup steps, send the access token and basin to anyone you want to share your workspace with. They will need to set those values in their own user config with `ob config`.
+> Make sure your opbox config is correct. If you did the S2 setup steps, send the access token and basin to anyone you want to share your workspace with. They can set those values globally with `ob config`, or for one clone with `ob clone --workspace ... --basin ... --access-token ...`.
 
 This will likely be done on another computer.
 

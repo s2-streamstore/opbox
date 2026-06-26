@@ -2,7 +2,6 @@ use crate::app::db::load_daemon_state;
 use crate::fs::ignore::METADATA_DIR_NAME;
 use crate::semantic::table::daemon_state;
 use crate::types::{DaemonWriterId, WorkspaceId};
-use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,7 +11,7 @@ pub const SOCKET_LINK_FILE_NAME: &str = "socket";
 pub const PID_FILE_NAME: &str = "daemon.pid";
 pub const LOCK_FILE_NAME: &str = "daemon.lock";
 pub const DAEMON_LOG_FILE_NAME: &str = "daemon.log";
-pub const WORKSPACE_ENV_FILE_NAME: &str = "env";
+pub const WORKSPACE_CONFIG_FILE_NAME: &str = "config.toml";
 
 pub fn metadata_dir(sync_root: &Path) -> PathBuf {
     sync_root.join(METADATA_DIR_NAME)
@@ -38,8 +37,8 @@ pub fn daemon_log_path(sync_root: &Path) -> PathBuf {
     metadata_dir(sync_root).join(DAEMON_LOG_FILE_NAME)
 }
 
-pub fn workspace_env_path(sync_root: &Path) -> PathBuf {
-    metadata_dir(sync_root).join(WORKSPACE_ENV_FILE_NAME)
+pub fn workspace_config_path(sync_root: &Path) -> PathBuf {
+    metadata_dir(sync_root).join(WORKSPACE_CONFIG_FILE_NAME)
 }
 
 pub fn real_socket_path(workspace_id: &WorkspaceId, daemon_writer_id: &DaemonWriterId) -> PathBuf {
@@ -236,121 +235,6 @@ pub async fn load_configured_daemon_state(
     Ok((db_path, daemon_row))
 }
 
-#[derive(Clone, Default, Eq, PartialEq)]
-pub struct WorkspaceEnv {
-    entries: BTreeMap<String, String>,
-}
-
-impl WorkspaceEnv {
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.entries.get(key).map(String::as_str)
-    }
-}
-
-pub fn load_workspace_env(sync_root: &Path) -> eyre::Result<WorkspaceEnv> {
-    let path = workspace_env_path(sync_root);
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(WorkspaceEnv::default());
-        }
-        Err(error) => return Err(error.into()),
-    };
-
-    parse_workspace_env(&path, &contents)
-}
-
-fn parse_workspace_env(path: &Path, contents: &str) -> eyre::Result<WorkspaceEnv> {
-    let mut entries = BTreeMap::new();
-    for (line_index, raw_line) in contents.lines().enumerate() {
-        let line_number = line_index + 1;
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let assignment = line.strip_prefix("export ").unwrap_or(line);
-        let (key, value) = assignment
-            .split_once('=')
-            .ok_or_else(|| eyre::eyre!("{}:{line_number}: expected KEY=VALUE", path.display()))?;
-        let key = key.trim();
-        if !workspace_env_key_is_valid(key) {
-            eyre::bail!(
-                "{}:{line_number}: invalid environment key {key:?}",
-                path.display()
-            );
-        }
-
-        let value = parse_workspace_env_value(path, line_number, value.trim())?;
-        entries.insert(key.to_string(), value);
-    }
-
-    Ok(WorkspaceEnv { entries })
-}
-
-fn workspace_env_key_is_valid(key: &str) -> bool {
-    let mut chars = key.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-}
-
-fn parse_workspace_env_value(path: &Path, line_number: usize, value: &str) -> eyre::Result<String> {
-    let Some(quote) = value.as_bytes().first().copied() else {
-        return Ok(String::new());
-    };
-    if quote != b'\'' && quote != b'"' {
-        return Ok(value.to_string());
-    }
-
-    if !value.as_bytes().ends_with(&[quote]) || value.len() == 1 {
-        eyre::bail!(
-            "{}:{line_number}: unterminated quoted environment value",
-            path.display()
-        );
-    }
-
-    let inner = &value[1..value.len() - 1];
-    if quote == b'\'' {
-        Ok(inner.to_string())
-    } else {
-        parse_double_quoted_workspace_env_value(path, line_number, inner)
-    }
-}
-
-fn parse_double_quoted_workspace_env_value(
-    path: &Path,
-    line_number: usize,
-    value: &str,
-) -> eyre::Result<String> {
-    let mut parsed = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            parsed.push(ch);
-            continue;
-        }
-
-        let escaped = chars.next().ok_or_else(|| {
-            eyre::eyre!(
-                "{}:{line_number}: trailing escape in quoted environment value",
-                path.display()
-            )
-        })?;
-        parsed.push(match escaped {
-            'n' => '\n',
-            'r' => '\r',
-            't' => '\t',
-            '\\' | '"' | '$' => escaped,
-            _ => escaped,
-        });
-    }
-
-    Ok(parsed)
-}
-
 pub struct DaemonLock {
     path: PathBuf,
     pid: u32,
@@ -424,46 +308,6 @@ fn process_is_alive(pid: u32) -> bool {
 mod tests {
     use super::*;
     use bytes::Bytes;
-
-    #[test]
-    fn workspace_env_parses_supported_assignment_forms() -> eyre::Result<()> {
-        let env = parse_workspace_env(
-            Path::new(".opbox/env"),
-            r#"
-# daemon-local overrides
-RUST_LOG=opbox_core=debug,opbox_daemon=trace
-export S2_ACCOUNT_ENDPOINT = "http://127.0.0.1:8080"
-S2_BASIN_ENDPOINT='http://127.0.0.1:8081'
-EMPTY=
-"#,
-        )?;
-
-        assert_eq!(
-            env.get("RUST_LOG"),
-            Some("opbox_core=debug,opbox_daemon=trace")
-        );
-        assert_eq!(
-            env.get("S2_ACCOUNT_ENDPOINT"),
-            Some("http://127.0.0.1:8080")
-        );
-        assert_eq!(env.get("S2_BASIN_ENDPOINT"), Some("http://127.0.0.1:8081"));
-        assert_eq!(env.get("EMPTY"), Some(""));
-
-        Ok(())
-    }
-
-    #[test]
-    fn workspace_env_rejects_non_assignments() {
-        let error = match parse_workspace_env(Path::new(".opbox/env"), "RUST_LOG\n") {
-            Ok(_) => panic!("missing assignment should be rejected"),
-            Err(error) => error,
-        };
-
-        assert!(
-            error.to_string().contains("expected KEY=VALUE"),
-            "unexpected error: {error}"
-        );
-    }
 
     #[tokio::test]
     async fn partial_init_is_detected_and_reported() -> eyre::Result<()> {
