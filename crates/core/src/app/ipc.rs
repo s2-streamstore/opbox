@@ -3,6 +3,7 @@ use crate::engine::actor::EngineCommand;
 use crate::semantic::table::daemon_state;
 use crate::spy::{SpyEvent, SpyOpen};
 use bytes::Bytes;
+use eyre::WrapErr;
 use futures::{StreamExt, stream};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
@@ -14,6 +15,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -147,18 +149,21 @@ async fn send_request(
     let stream = match UnixStream::connect(&socket_path).await {
         Ok(stream) => stream,
         Err(error) => {
-            let _ = remove_stale_socket_files(sync_root);
-            return Err(error.into());
+            if matches!(
+                error.kind(),
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused
+            ) {
+                let _ = remove_stale_socket_files(sync_root);
+            }
+            return Err(error).wrap_err_with(|| {
+                format!("connect to daemon control socket {}", socket_path.display())
+            });
         }
     };
     let io = TokioIo::new(stream);
-    let (mut sender, connection) = match client_http1::handshake(io).await {
-        Ok(parts) => parts,
-        Err(error) => {
-            let _ = remove_stale_socket_files(sync_root);
-            return Err(error.into());
-        }
-    };
+    let (mut sender, connection) = client_http1::handshake(io)
+        .await
+        .wrap_err("handshake with daemon control socket")?;
     let connection_task = tokio::spawn(async move {
         if let Err(error) = connection.await {
             debug!(?error, "ipc client connection failed");
@@ -167,9 +172,8 @@ async fn send_request(
     let response = match sender.send_request(request).await {
         Ok(response) => response,
         Err(error) => {
-            let _ = remove_stale_socket_files(sync_root);
             connection_task.abort();
-            return Err(error.into());
+            return Err(error).wrap_err("send IPC request to daemon");
         }
     };
     Ok((response, connection_task))
@@ -627,6 +631,42 @@ mod tests {
         token.cancel();
         server.await??;
         engine.await?;
+        let _ = std::fs::remove_dir_all(&sync_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipc_request_error_after_connect_does_not_unlink_socket() -> eyre::Result<()> {
+        let sync_root =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&sync_root)?;
+        std::fs::create_dir(metadata_dir(&sync_root))?;
+        let socket_path =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}.sock", rand::random::<u64>()));
+        let listener = UnixListener::bind(&socket_path)?;
+        std::os::unix::fs::symlink(&socket_path, socket_link_path(&sync_root))?;
+
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        let error = request_status(&sync_root)
+            .await
+            .expect_err("server drops connection before response");
+        assert!(
+            error.to_string().contains("send IPC request")
+                || error
+                    .to_string()
+                    .contains("handshake with daemon control socket"),
+            "unexpected error: {error:?}"
+        );
+        assert!(socket_link_path(&sync_root).exists());
+        assert!(socket_path.exists());
+
+        server.await?;
+        let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_dir_all(&sync_root);
         Ok(())
     }

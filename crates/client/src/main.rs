@@ -14,7 +14,7 @@ use opbox_core::app::user_config::{
 use opbox_core::app::workspace::{
     NotInWorkspace, canonicalize_existing_dir, create_metadata_dir, current_dir, daemon_log_path,
     ensure_clean_clone_root, ensure_sync_root_unconfigured, find_workspace_root,
-    load_configured_daemon_state, remove_socket_pointer, storage_db_path,
+    load_configured_daemon_state, remove_socket_pointer, socket_link_path, storage_db_path,
 };
 use opbox_core::fs::fio::local::LocalFileIO;
 use opbox_core::fs::ignore::{IGNORE_FILE_NAME, default_ignore_file_contents};
@@ -399,7 +399,7 @@ async fn run_status(sync_root: Option<PathBuf>) -> eyre::Result<()> {
     let root = find_workspace_root(&root_or_current(sync_root)?)?;
     let status = match request_valid_status(&root).await {
         Ok(status) => status,
-        Err(_) => exit_daemon_not_running(&root),
+        Err(error) => exit_daemon_not_running_or_report(&root, error),
     };
 
     print_daemon_status("opbox daemon running", &status, CliStyle::for_stdout());
@@ -410,7 +410,7 @@ async fn run_spy(sync_root: Option<PathBuf>) -> eyre::Result<()> {
     let root = find_workspace_root(&root_or_current(sync_root)?)?;
     let status = match request_valid_status(&root).await {
         Ok(status) => status,
-        Err(_) => exit_daemon_not_running(&root),
+        Err(error) => exit_daemon_not_running_or_report(&root, error),
     };
     eprintln!(
         "spying on opbox workspace {} (pid {})",
@@ -900,12 +900,12 @@ async fn run_start(sync_root: Option<PathBuf>) -> eyre::Result<()> {
 
 async fn run_stop(sync_root: Option<PathBuf>) -> eyre::Result<()> {
     let root = find_workspace_root(&root_or_current(sync_root)?)?;
-    if request_valid_status(&root).await.is_err() {
-        exit_daemon_not_running(&root);
+    if let Err(error) = request_valid_status(&root).await {
+        exit_daemon_not_running_or_report(&root, error);
     }
     let response = match ipc::request_stop(&root).await {
         Ok(response) => response,
-        Err(_) => exit_daemon_not_running(&root),
+        Err(error) => exit_daemon_not_running_or_report(&root, error),
     };
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -976,6 +976,23 @@ fn exit_daemon_not_running(root: &Path) -> ! {
         "run {} to start it",
         style.bold(format!("{CLIENT_COMMAND} start"))
     );
+    std::process::exit(1);
+}
+
+fn exit_daemon_not_running_or_report(root: &Path, error: eyre::Report) -> ! {
+    if !socket_link_path(root).exists() {
+        exit_daemon_not_running(root);
+    }
+
+    let style = CliStyle::for_stderr();
+    eprintln!(
+        "{}",
+        style.red(format!(
+            "failed to contact opbox daemon for {}",
+            root.display()
+        ))
+    );
+    eprintln!("{error:#}");
     std::process::exit(1);
 }
 
