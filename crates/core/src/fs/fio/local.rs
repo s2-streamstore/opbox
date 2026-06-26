@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use compact_str::CompactString;
 use std::io::ErrorKind;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use time::OffsetDateTime;
@@ -78,17 +79,72 @@ impl LocalFileIO {
             return Ok(None);
         }
 
+        let abs_path = self.absolute_path(&path);
         Ok(Some(TreeEntry {
             path,
             kind: TreeEntryKind::File {
-                fingerprint: FileFingerprint::StatOnly(Self::stat_fingerprint(&metadata)?),
+                fingerprint: FileFingerprint::StatOnly(Self::stat_fingerprint(
+                    &metadata, &abs_path,
+                )?),
             },
         }))
     }
 
-    fn stat_fingerprint(metadata: &std::fs::Metadata) -> eyre::Result<FileStatFingerprint> {
+    #[cfg(unix)]
+    fn stat_fingerprint(
+        metadata: &std::fs::Metadata,
+        _path: &std::path::Path,
+    ) -> eyre::Result<FileStatFingerprint> {
         Ok(FileStatFingerprint::new(
             FileKey::new(metadata.dev(), metadata.ino()),
+            metadata.len(),
+            OffsetDateTime::from(metadata.modified()?),
+        ))
+    }
+
+    #[cfg(windows)]
+    fn stat_fingerprint(
+        metadata: &std::fs::Metadata,
+        path: &std::path::Path,
+    ) -> eyre::Result<FileStatFingerprint> {
+        use std::os::windows::io::AsRawHandle;
+
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct BY_HANDLE_FILE_INFORMATION {
+            dwFileAttributes: u32,
+            ftCreationTime: [u32; 2],
+            ftLastAccessTime: [u32; 2],
+            ftLastWriteTime: [u32; 2],
+            dwVolumeSerialNumber: u32,
+            nFileSizeHigh: u32,
+            nFileSizeLow: u32,
+            nNumberOfLinks: u32,
+            nFileIndexHigh: u32,
+            nFileIndexLow: u32,
+        }
+
+        unsafe extern "system" {
+            fn GetFileInformationByHandle(
+                h_file: *mut std::ffi::c_void,
+                lp_file_information: *mut BY_HANDLE_FILE_INFORMATION,
+            ) -> i32;
+        }
+
+        let file = std::fs::File::open(path)?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ret =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle() as *mut _, &mut info) };
+        if ret == 0 {
+            eyre::bail!(
+                "GetFileInformationByHandle failed for {}",
+                path.display()
+            );
+        }
+
+        let file_index = ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64);
+        Ok(FileStatFingerprint::new(
+            FileKey::new(info.dwVolumeSerialNumber as u64, file_index),
             metadata.len(),
             OffsetDateTime::from(metadata.modified()?),
         ))

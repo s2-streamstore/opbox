@@ -1,4 +1,6 @@
-use crate::app::workspace::{real_socket_path, remove_stale_socket_files, socket_link_path};
+#[cfg(unix)]
+use crate::app::workspace::real_socket_path;
+use crate::app::workspace::{remove_stale_socket_files, socket_link_path};
 use crate::engine::actor::EngineCommand;
 use crate::semantic::table::daemon_state;
 use crate::spy::{SpyEvent, SpyOpen};
@@ -18,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -273,22 +276,42 @@ async fn send_request(
     sync_root: &Path,
     request: Request<Empty<Bytes>>,
 ) -> eyre::Result<(Response<Incoming>, JoinHandle<()>)> {
-    let socket_path = resolve_socket_path(sync_root)?;
-    let stream = match UnixStream::connect(&socket_path).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            if matches!(
-                error.kind(),
-                ErrorKind::NotFound | ErrorKind::ConnectionRefused
-            ) {
-                let _ = remove_stale_socket_files(sync_root);
+    #[cfg(unix)]
+    let io = {
+        let socket_path = resolve_socket_path(sync_root)?;
+        let stream = match UnixStream::connect(&socket_path).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::ConnectionRefused
+                ) {
+                    let _ = remove_stale_socket_files(sync_root);
+                }
+                return Err(error).wrap_err_with(|| {
+                    format!("connect to daemon control socket {}", socket_path.display())
+                });
             }
-            return Err(error).wrap_err_with(|| {
-                format!("connect to daemon control socket {}", socket_path.display())
-            });
-        }
+        };
+        TokioIo::new(stream)
     };
-    let io = TokioIo::new(stream);
+
+    #[cfg(windows)]
+    let io = {
+        let addr = resolve_socket_address(sync_root)?;
+        let stream = match tokio::net::TcpStream::connect(&addr).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                if matches!(error.kind(), ErrorKind::ConnectionRefused) {
+                    let _ = remove_stale_socket_files(sync_root);
+                }
+                return Err(error)
+                    .wrap_err_with(|| format!("connect to daemon control socket at {addr}"));
+            }
+        };
+        TokioIo::new(stream)
+    };
+
     let (mut sender, connection) = client_http1::handshake(io)
         .await
         .wrap_err("handshake with daemon control socket")?;
@@ -307,6 +330,7 @@ async fn send_request(
     Ok((response, connection_task))
 }
 
+#[cfg(unix)]
 fn resolve_socket_path(sync_root: &Path) -> eyre::Result<PathBuf> {
     let link_path = socket_link_path(sync_root);
     match std::fs::read_link(&link_path) {
@@ -316,47 +340,106 @@ fn resolve_socket_path(sync_root: &Path) -> eyre::Result<PathBuf> {
     }
 }
 
+#[cfg(windows)]
+fn resolve_socket_address(sync_root: &Path) -> eyre::Result<std::net::SocketAddr> {
+    let link_path = socket_link_path(sync_root);
+    let contents = std::fs::read_to_string(&link_path).map_err(|error| {
+        eyre::eyre!(
+            "failed to read daemon address from {}: {error}",
+            link_path.display()
+        )
+    })?;
+    contents.trim().parse().map_err(|error| {
+        eyre::eyre!(
+            "invalid daemon address in {}: {error}",
+            link_path.display()
+        )
+    })
+}
+
 pub async fn serve_control(
     config: ControlServerConfig,
     token: CancellationToken,
 ) -> eyre::Result<()> {
-    let socket_path = real_socket_path(
-        &config.daemon_state.workspace_id,
-        &config.daemon_state.daemon_writer_id,
-    );
-    remove_stale_socket(&socket_path)?;
-    let listener = UnixListener::bind(&socket_path)?;
-    replace_socket_symlink(&socket_path, &socket_link_path(&config.sync_root))?;
-    let _guard = SocketGuard {
-        socket_path,
-        link_path: socket_link_path(&config.sync_root),
-    };
+    #[cfg(unix)]
+    {
+        let socket_path = real_socket_path(
+            &config.daemon_state.workspace_id,
+            &config.daemon_state.daemon_writer_id,
+        );
+        remove_stale_socket(&socket_path)?;
+        let listener = UnixListener::bind(&socket_path)?;
+        replace_socket_symlink(&socket_path, &socket_link_path(&config.sync_root))?;
+        let _guard = SocketGuard {
+            socket_path,
+            link_path: socket_link_path(&config.sync_root),
+        };
 
-    loop {
-        tokio::select! {
-            () = token.cancelled() => {
-                debug!("status server cancelled");
-                return Ok(());
-            }
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                let config = config.clone();
-                let token = token.clone();
-                tokio::spawn(async move {
-                    let service = service_fn(move |request| {
-                        handle_control_request(
-                            request,
-                            config.clone(),
-                            token.clone(),
-                        )
+        loop {
+            tokio::select! {
+                () = token.cancelled() => {
+                    debug!("status server cancelled");
+                    return Ok(());
+                }
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted?;
+                    let config = config.clone();
+                    let token = token.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |request| {
+                            handle_control_request(
+                                request,
+                                config.clone(),
+                                token.clone(),
+                            )
+                        });
+                        if let Err(error) = server_http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await
+                        {
+                            warn!(?error, "control connection failed");
+                        }
                     });
-                    if let Err(error) = server_http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await
-                    {
-                        warn!(?error, "control connection failed");
-                    }
-                });
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        write_socket_address(&socket_link_path(&config.sync_root), &addr)?;
+        let _guard = SocketGuard {
+            link_path: socket_link_path(&config.sync_root),
+        };
+
+        loop {
+            tokio::select! {
+                () = token.cancelled() => {
+                    debug!("status server cancelled");
+                    return Ok(());
+                }
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted?;
+                    let config = config.clone();
+                    let token = token.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |request| {
+                            handle_control_request(
+                                request,
+                                config.clone(),
+                                token.clone(),
+                            )
+                        });
+                        if let Err(error) = server_http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await
+                        {
+                            warn!(?error, "control connection failed");
+                        }
+                    });
+                }
             }
         }
     }
@@ -578,6 +661,7 @@ fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
 }
 
+#[cfg(unix)]
 fn remove_stale_socket(socket_path: &Path) -> eyre::Result<()> {
     match std::fs::remove_file(socket_path) {
         Ok(()) => Ok(()),
@@ -597,17 +681,47 @@ fn replace_socket_symlink(socket_path: &Path, link_path: &Path) -> eyre::Result<
     Ok(())
 }
 
+#[cfg(windows)]
+fn write_socket_address(
+    link_path: &Path,
+    addr: &std::net::SocketAddr,
+) -> eyre::Result<()> {
+    use std::io::Write;
+    match std::fs::remove_file(link_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut file = std::fs::File::create(link_path)?;
+    write!(file, "{addr}")?;
+    Ok(())
+}
+
+#[cfg(unix)]
 struct SocketGuard {
     socket_path: PathBuf,
     link_path: PathBuf,
 }
 
+#[cfg(unix)]
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
         if std::fs::read_link(&self.link_path).ok().as_ref() == Some(&self.socket_path) {
             let _ = std::fs::remove_file(&self.link_path);
         }
+    }
+}
+
+#[cfg(windows)]
+struct SocketGuard {
+    link_path: PathBuf,
+}
+
+#[cfg(windows)]
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.link_path);
     }
 }
 
@@ -836,6 +950,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_allows_daemon_build_mismatch_response() -> eyre::Result<()> {
         let sync_root =
@@ -956,6 +1071,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn ipc_request_error_after_connect_does_not_unlink_socket() -> eyre::Result<()> {
         let sync_root =
@@ -1049,6 +1165,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn legacy_daemon_response_reports_metadata_error_without_unlinking_socket()
     -> eyre::Result<()> {

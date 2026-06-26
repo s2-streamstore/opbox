@@ -42,7 +42,7 @@ pub fn workspace_config_path(sync_root: &Path) -> PathBuf {
 }
 
 pub fn real_socket_path(workspace_id: &WorkspaceId, daemon_writer_id: &DaemonWriterId) -> PathBuf {
-    PathBuf::from("/tmp").join(format!(
+    std::env::temp_dir().join(format!(
         "opbox-{}-{}.sock",
         workspace_id.0,
         hex_component(daemon_writer_id.0.as_ref())
@@ -296,12 +296,25 @@ fn read_pid_file(path: &Path) -> eyre::Result<Option<u32>> {
     Ok(contents.trim().parse().ok())
 }
 
+#[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .map(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.contains(&pid.to_string())
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -378,6 +391,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_path_stays_short_for_unix_socket_limits() {
         let workspace_id = WorkspaceId("0123456789abcdefghijklmnopqrstuv".to_string());
