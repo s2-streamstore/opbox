@@ -1,5 +1,6 @@
 use clap::builder::styling;
 use clap::{Parser, Subcommand, ValueEnum};
+use indicatif::{ProgressBar, ProgressStyle};
 use opbox_core::app::connectivity::{ConnectivityOverallState, LinkState, LinkStatus};
 use opbox_core::app::db::{open_database, semantic_pool};
 use opbox_core::app::ipc;
@@ -362,16 +363,22 @@ async fn bootstrap_init(
     sync_root: Option<PathBuf>,
     user_config: &UserConfig,
     overrides: &WorkspaceConfigOverrides,
+    progress: &BootstrapProgress,
 ) -> eyre::Result<Bootstrap> {
+    progress.set("resolving configuration");
     let (workspace_config, basin, s2_connection) =
         workspace_config_from_overrides(overrides, user_config)?;
+    progress.set("checking workspace root");
     let sync_root = canonicalize_existing_dir(&root_or_current(sync_root)?)?;
     ensure_sync_root_unconfigured(&sync_root).await?;
+    progress.set(format!("connecting to basin {}", basin.as_ref()));
     let s2_basin = s2_basin_from_config(basin.clone(), &s2_connection).await?;
     let workspace_id = WorkspaceId::generate();
     debug!(?workspace_id, "generated workspace id");
+    progress.set("creating shared log stream");
     create_workspace_stream(&s2_basin, &workspace_id).await?;
     let daemon_row = fresh_daemon_state_row(workspace_id, basin, &s2_connection);
+    progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
     save_workspace_config(&sync_root, &workspace_config)?;
     create_default_ignore_file(&sync_root)?;
@@ -392,18 +399,24 @@ async fn bootstrap_clone(
     clone_log_read_stop: Option<LogReadStop>,
     user_config: &UserConfig,
     overrides: &WorkspaceConfigOverrides,
+    progress: &BootstrapProgress,
 ) -> eyre::Result<Bootstrap> {
+    progress.set("resolving configuration");
     let (workspace_config, basin, s2_connection) =
         workspace_config_from_overrides(overrides, user_config)?;
+    progress.set("checking destination");
     let requested_root = root_or_current(sync_root)?;
     if requested_root.try_exists()? && requested_root.is_dir() {
         ensure_sync_root_unconfigured(&requested_root).await?;
     }
     let sync_root = ensure_clean_clone_root(&requested_root)?;
     ensure_sync_root_unconfigured(&sync_root).await?;
+    progress.set(format!("connecting to basin {}", basin.as_ref()));
     let s2_basin = s2_basin_from_config(basin.clone(), &s2_connection).await?;
+    progress.set("checking shared log stream");
     ensure_workspace_stream_exists(&s2_basin, &workspace).await?;
     let daemon_row = fresh_daemon_state_row(workspace, basin, &s2_connection);
+    progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
     save_workspace_config(&sync_root, &workspace_config)?;
     create_initialized_database(&sync_root, &daemon_row).await?;
@@ -417,12 +430,17 @@ async fn bootstrap_clone(
     })
 }
 
-async fn run_bootstrap(bootstrap: Bootstrap) -> eyre::Result<()> {
+async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> eyre::Result<()> {
     let mode = bootstrap.mode;
     let sync_root = bootstrap.sync_root.clone();
     let workspace_id = bootstrap.daemon_row.workspace_id.clone();
     let basin = bootstrap.daemon_row.s2_basin.clone();
 
+    progress.set(match mode {
+        RunMode::Init => "uploading initial workspace snapshot",
+        RunMode::Clone => "downloading shared log and materializing files",
+        RunMode::Sync => unreachable!("bootstrap never runs in sync mode"),
+    });
     let db = open_database(&bootstrap.db_path).await?;
     let pool = semantic_pool(db).await?;
     let semantic_service = SemanticService::new(pool);
@@ -442,9 +460,11 @@ async fn run_bootstrap(bootstrap: Bootstrap) -> eyre::Result<()> {
     .await?;
 
     if mode == RunMode::Clone {
+        progress.set("writing local ignore rules");
         create_default_ignore_file(&sync_root)?;
     }
 
+    progress.finish();
     let style = CliStyle::for_stdout();
     let title = match mode {
         RunMode::Init => "initialized opbox workspace",
@@ -708,6 +728,51 @@ fn format_kv(label: &str, value: impl std::fmt::Display, style: CliStyle) -> Str
 
 fn short_id(value: &str) -> &str {
     if value.len() <= 8 { value } else { &value[..8] }
+}
+
+struct BootstrapProgress {
+    bar: Option<ProgressBar>,
+}
+
+impl BootstrapProgress {
+    fn new(mode: RunMode) -> eyre::Result<Self> {
+        if !std::io::stderr().is_terminal() {
+            return Ok(Self { bar: None });
+        }
+
+        let bar = ProgressBar::new_spinner();
+        let template = if std::env::var_os("NO_COLOR").is_some() {
+            "{spinner} {prefix} {msg}"
+        } else {
+            "{spinner:.green} {prefix:.cyan} {msg}"
+        };
+        bar.set_style(ProgressStyle::with_template(template)?);
+        bar.set_prefix(match mode {
+            RunMode::Init => "init",
+            RunMode::Clone => "clone",
+            RunMode::Sync => unreachable!("bootstrap never runs in sync mode"),
+        });
+        bar.enable_steady_tick(Duration::from_millis(120));
+        Ok(Self { bar: Some(bar) })
+    }
+
+    fn set(&self, message: impl Into<String>) {
+        if let Some(bar) = &self.bar {
+            bar.set_message(message.into());
+        }
+    }
+
+    fn finish(&self) {
+        if let Some(bar) = &self.bar {
+            bar.finish_and_clear();
+        }
+    }
+}
+
+impl Drop for BootstrapProgress {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1336,8 +1401,10 @@ async fn main() {
         Command::Init { config, sync_root } => with_failure_banner(
             "init",
             async {
+                let progress = BootstrapProgress::new(RunMode::Init)?;
                 let user_config = load_user_config()?;
-                run_bootstrap(bootstrap_init(sync_root, &user_config, &config).await?).await
+                let bootstrap = bootstrap_init(sync_root, &user_config, &config, &progress).await?;
+                run_bootstrap(bootstrap, &progress).await
             }
             .await,
         ),
@@ -1349,18 +1416,18 @@ async fn main() {
         } => with_failure_banner(
             "clone",
             async {
+                let progress = BootstrapProgress::new(RunMode::Clone)?;
                 let user_config = load_user_config()?;
-                run_bootstrap(
-                    bootstrap_clone(
-                        workspace,
-                        sync_root,
-                        as_of.map(CloneAsOf::log_read_stop),
-                        &user_config,
-                        &config,
-                    )
-                    .await?,
+                let bootstrap = bootstrap_clone(
+                    workspace,
+                    sync_root,
+                    as_of.map(CloneAsOf::log_read_stop),
+                    &user_config,
+                    &config,
+                    &progress,
                 )
-                .await
+                .await?;
+                run_bootstrap(bootstrap, &progress).await
             }
             .await,
         ),
