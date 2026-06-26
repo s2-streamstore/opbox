@@ -28,6 +28,9 @@ enum Fault {
         path: String,
         replacement: Bytes,
     },
+    GuardedReadPermissionDenied {
+        path: String,
+    },
     GuardedWriteConflictBeforeSwap {
         path: String,
         replacement: Bytes,
@@ -93,6 +96,12 @@ impl FaultInjectingFileIO {
     pub fn stats(&self) -> InMemoryFileIOStats {
         let state = self.state.lock().expect("fault-injecting file io poisoned");
         self.inner.stats().combine(state.stats)
+    }
+
+    pub fn inject_guarded_read_permission_denied(&self, path: impl AsRef<str>) -> eyre::Result<()> {
+        let path = validate_path(path)?;
+        self.push_fault(Fault::GuardedReadPermissionDenied { path });
+        Ok(())
     }
 
     pub fn inject_guarded_read_changed_between_stats(
@@ -189,6 +198,20 @@ impl FileIO for FaultInjectingFileIO {
         path: RelativePath,
         expected: FileFingerprint,
     ) -> eyre::Result<GuardedReadResult> {
+        if let Some(Fault::GuardedReadPermissionDenied { .. }) = self.take_fault(|fault| {
+            matches!(
+                fault,
+                Fault::GuardedReadPermissionDenied { path: fault_path, .. }
+                    if fault_path == &path.to_string()
+            )
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("permission denied: {path}"),
+            )
+            .into());
+        }
+
         if let Some(Fault::GuardedReadChangedBetweenStats { replacement, .. }) =
             self.take_fault(|fault| {
                 matches!(

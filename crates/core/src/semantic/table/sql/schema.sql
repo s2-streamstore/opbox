@@ -188,7 +188,7 @@ CREATE INDEX IF NOT EXISTS outbox_object_id_idx
 -- avoiding expensive re-reads of large binary files on every scan cycle.
 CREATE TABLE IF NOT EXISTS ignored_files (
     path        TEXT PRIMARY KEY,
-    reason      TEXT NOT NULL CHECK (reason IN ('non_utf8')),
+    reason      TEXT NOT NULL CHECK (reason IN ('non_utf8', 'permission_denied', 'too_large')),
     file_key    TEXT NOT NULL,
     size_bytes  INTEGER NOT NULL CHECK (size_bytes >= 0),
     mtime_ns    INTEGER NOT NULL,

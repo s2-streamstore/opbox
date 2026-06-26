@@ -5,18 +5,24 @@ use time::OffsetDateTime;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     NonUtf8,
+    PermissionDenied,
+    TooLarge,
 }
 
 impl Reason {
     pub fn as_str(&self) -> &'static str {
         match self {
             Reason::NonUtf8 => "non_utf8",
+            Reason::PermissionDenied => "permission_denied",
+            Reason::TooLarge => "too_large",
         }
     }
 
     pub fn parse(s: &str) -> eyre::Result<Self> {
         match s {
             "non_utf8" => Ok(Reason::NonUtf8),
+            "permission_denied" => Ok(Reason::PermissionDenied),
+            "too_large" => Ok(Reason::TooLarge),
             other => eyre::bail!("unknown ignored_files reason: {other:?}"),
         }
     }

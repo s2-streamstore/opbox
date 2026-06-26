@@ -31,6 +31,8 @@ use tracing::{debug, instrument, trace, warn};
 use turso::{Connection, Database};
 use xxhash_rust::xxh3::xxh3_64;
 
+const MAX_SYNC_FILE_SIZE: u64 = 20 * 1024 * 1024; // 20 MiB
+
 const TURSO_RETRY_ATTEMPTS: usize = 25;
 const TURSO_RETRY_BASE_DELAY: Duration = Duration::from_millis(10);
 const TURSO_RETRY_MAX_DELAY: Duration = Duration::from_millis(250);
@@ -146,7 +148,7 @@ impl SemanticService {
                 let ignored = tx.select_all_ignored_files().await?;
                 let ignored_map: BTreeMap<_, _> = ignored
                     .into_iter()
-                    .map(|row| (row.path, row.stat))
+                    .map(|row| (row.path, (row.stat, row.reason)))
                     .collect();
 
                 let mut actions = Vec::new();
@@ -157,10 +159,31 @@ impl SemanticService {
                             // not handled
                         }
                         TreeEntryKind::File { fingerprint } => {
-                            if let Some(ignored_stat) = ignored_map.get(&entry.path) {
-                                if fingerprint.stat() == ignored_stat {
+                            if let Some((ignored_stat, reason)) = ignored_map.get(&entry.path) {
+                                // Always re-attempt PermissionDenied entries
+                                // because changing permissions doesn't alter
+                                // the stat fingerprint (file_key, size, mtime).
+                                if fingerprint.stat() == ignored_stat
+                                    && *reason != crate::semantic::table::ignored_files::Reason::PermissionDenied
+                                {
                                     continue;
                                 }
+                            }
+                            if fingerprint.stat().size > MAX_SYNC_FILE_SIZE {
+                                debug!(
+                                    path = %entry.path,
+                                    size = fingerprint.stat().size,
+                                    "skipping file exceeding size limit during init"
+                                );
+                                let now = time::OffsetDateTime::now_utc();
+                                tx.upsert_ignored_file(
+                                    &entry.path,
+                                    crate::semantic::table::ignored_files::Reason::TooLarge,
+                                    fingerprint.stat(),
+                                    now,
+                                )
+                                .await?;
+                                continue;
                             }
                             let action_id = ImportActionId::new(epoch, next_seq);
                             next_seq += 1;
@@ -217,7 +240,7 @@ impl SemanticService {
                 let ignored_in_scope: BTreeMap<_, _> = ignored
                     .into_iter()
                     .filter(|row| scan.scope.contains_path(&row.path))
-                    .map(|row| (row.path, row.stat))
+                    .map(|row| (row.path, (row.stat, row.reason)))
                     .collect();
 
                 let mut actions = Vec::new();
@@ -234,10 +257,30 @@ impl SemanticService {
                         Some(observed) => {
                             // If the file's current stat matches a known ignored
                             // entry, skip re-reading (e.g. text→binary overwrite).
-                            if let Some(ignored_stat) = ignored_in_scope.get(&prior.path) {
-                                if observed.stat() == ignored_stat {
-                                    continue;
-                                }
+                            // Always re-attempt PermissionDenied entries because
+                            // changing permissions doesn't alter the stat
+                            // fingerprint.
+                            if let Some((ignored_stat, reason)) = ignored_in_scope.get(&prior.path)
+                                && observed.stat() == ignored_stat
+                                && *reason != crate::semantic::table::ignored_files::Reason::PermissionDenied
+                            {
+                                continue;
+                            }
+                            if observed.stat().size > MAX_SYNC_FILE_SIZE {
+                                debug!(
+                                    path = %prior.path,
+                                    size = observed.stat().size,
+                                    "skipping file exceeding size limit during sync"
+                                );
+                                let now = time::OffsetDateTime::now_utc();
+                                tx.upsert_ignored_file(
+                                    &prior.path,
+                                    crate::semantic::table::ignored_files::Reason::TooLarge,
+                                    observed.stat(),
+                                    now,
+                                )
+                                .await?;
+                                continue;
                             }
                             let action_id = ImportActionId::new(epoch, next_seq);
                             next_seq += 1;
@@ -255,10 +298,29 @@ impl SemanticService {
                 for (path, fingerprint) in observed_files {
                     // If this file was previously ignored and its stat
                     // fingerprint hasn't changed, skip it — no point re-reading.
-                    if let Some(ignored_stat) = ignored_in_scope.get(&path) {
-                        if fingerprint.stat() == ignored_stat {
-                            continue;
-                        }
+                    // Always re-attempt PermissionDenied entries because
+                    // changing permissions doesn't alter the stat fingerprint.
+                    if let Some((ignored_stat, reason)) = ignored_in_scope.get(&path)
+                        && fingerprint.stat() == ignored_stat
+                        && *reason != crate::semantic::table::ignored_files::Reason::PermissionDenied
+                    {
+                        continue;
+                    }
+                    if fingerprint.stat().size > MAX_SYNC_FILE_SIZE {
+                        debug!(
+                            %path,
+                            size = fingerprint.stat().size,
+                            "skipping new file exceeding size limit during sync"
+                        );
+                        let now = time::OffsetDateTime::now_utc();
+                        tx.upsert_ignored_file(
+                            &path,
+                            crate::semantic::table::ignored_files::Reason::TooLarge,
+                            fingerprint.stat(),
+                            now,
+                        )
+                        .await?;
+                        continue;
                     }
                     let action_id = ImportActionId::new(epoch, next_seq);
                     next_seq += 1;
@@ -273,7 +335,7 @@ impl SemanticService {
 
                 // Clean up ignored_files entries for files that have been
                 // deleted from disk (no longer in the scan result).
-                for (ignored_path, _) in &ignored_in_scope {
+                for ignored_path in ignored_in_scope.keys() {
                     // If the path wasn't observed in the scan AND isn't in
                     // prior_tree (already handled by missing_prior), remove it.
                     // We simply check whether the scan tree contains it.
@@ -1707,6 +1769,22 @@ fn prepare_import_action_stage(
                     eyre::bail!("import read {action_id:?} returned stat-only fingerprint");
                 };
 
+                if fingerprint.stat().size > MAX_SYNC_FILE_SIZE {
+                    debug!(
+                        ?action_id,
+                        %path,
+                        ?epoch_kind,
+                        size = fingerprint.stat().size,
+                        "ignoring file exceeding size limit during import"
+                    );
+                    return Ok(ImportActionStageDecision::IgnorePersist {
+                        action_id,
+                        path,
+                        stat: fingerprint.stat().clone(),
+                        reason: crate::semantic::table::ignored_files::Reason::TooLarge,
+                    });
+                }
+
                 // v0 syncs text only: binary (non-UTF-8) files are skipped
                 // uniformly. Init must tolerate them too — a single binary
                 // file in the directory must not abort workspace creation.
@@ -1765,7 +1843,26 @@ fn prepare_import_action_stage(
                 );
                 Ok(ImportActionStageDecision::Ignore { action_id })
             }
-            ImportReadOutcome::Failed(err) => Err(err),
+            ImportReadOutcome::Failed(err) => {
+                if let Some(io_err) = err.downcast_ref::<std::io::Error>()
+                    && io_err.kind() == std::io::ErrorKind::PermissionDenied
+                {
+                    debug!(
+                        ?action_id,
+                        %path,
+                        ?epoch_kind,
+                        error = %err,
+                        "ignoring file with permission denied during import"
+                    );
+                    return Ok(ImportActionStageDecision::IgnorePersist {
+                        action_id,
+                        path,
+                        stat: expected_fingerprint.stat().clone(),
+                        reason: crate::semantic::table::ignored_files::Reason::PermissionDenied,
+                    });
+                }
+                Err(err)
+            }
         },
         (
             ImportEpochKind::Init | ImportEpochKind::Sync,
