@@ -169,6 +169,14 @@ enum Workload {
     ClearExistingFile,
     ClearViaSafeSave,
     ClearBeforeQuiescence,
+    PartitionBothDaemons,
+    FlappingConnectivity,
+    AsymmetricPartition,
+    PartitionDuringProjection,
+    MessageHoldAndRelease,
+    TransientHighPacketLoss,
+    SustainedEditingStress,
+    DeleteWhileOffline,
 }
 
 impl Workload {
@@ -275,6 +283,30 @@ fn run_single(args: SingleArgs) -> eyre::Result<()> {
         }
         Workload::ClearBeforeQuiescence => {
             run_clear_before_quiescence_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::PartitionBothDaemons => {
+            run_partition_both_daemons_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::FlappingConnectivity => {
+            run_flapping_connectivity_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::AsymmetricPartition => {
+            run_asymmetric_partition_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::PartitionDuringProjection => {
+            run_partition_during_projection_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::MessageHoldAndRelease => {
+            run_message_hold_and_release_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::TransientHighPacketLoss => {
+            run_transient_high_packet_loss_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::SustainedEditingStress => {
+            run_sustained_editing_stress_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::DeleteWhileOffline => {
+            run_delete_while_offline_workload(&mut sim, seed, args.common.max_steps)?
         }
     }
 
@@ -3394,6 +3426,605 @@ async fn ensure_basin_exists() -> Result<(), Box<dyn std::error::Error>> {
         Err(S2Error::Server(err)) if err.code == "resource_already_exists" => Ok(()),
         Err(err) => Err(io_err(err)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// New network-fault-injection and stress workloads
+// ---------------------------------------------------------------------------
+
+fn run_partition_both_daemons_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000014".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "shared.txt";
+        let initial = format!("partition-both seed {seed}\n");
+        daemon_a
+            .write_file(path, Bytes::from(initial.clone()))
+            .await?;
+        daemon_a.request_single_file_scan(path).await?;
+        wait_for_file_text(&daemon_a, &daemon_b, path, &initial, steps).await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+
+        // Partition BOTH daemons from s2
+        turmoil::partition("daemon-a", "s2-lite");
+        turmoil::partition("daemon-b", "s2-lite");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // daemon-a writes markers while offline
+        let a_markers: Vec<String> = (0..4)
+            .map(|idx| format!("A-both-offline-{idx}-seed-{seed}"))
+            .collect();
+        for marker in &a_markers {
+            daemon_a
+                .append_file(path, Bytes::from(format!("{marker}\n")))
+                .await?;
+            daemon_a.request_single_file_scan(path).await?;
+        }
+
+        // daemon-b writes markers while offline
+        let b_markers: Vec<String> = (0..4)
+            .map(|idx| format!("B-both-offline-{idx}-seed-{seed}"))
+            .collect();
+        for marker in &b_markers {
+            daemon_b
+                .append_file(path, Bytes::from(format!("{marker}\n")))
+                .await?;
+            daemon_b.request_single_file_scan(path).await?;
+        }
+
+        // Wait for outbox accumulation on both
+        wait_for_outbox_at_least(&daemon_a, 1, steps).await?;
+        wait_for_outbox_at_least(&daemon_b, 1, steps).await?;
+
+        // Repair both simultaneously
+        turmoil::repair("daemon-a", "s2-lite");
+        turmoil::repair("daemon-b", "s2-lite");
+
+        wait_for_connectivity_online(&daemon_a, steps).await?;
+        wait_for_connectivity_online(&daemon_b, steps).await?;
+
+        let expected_markers: Vec<String> = a_markers
+            .iter()
+            .chain(b_markers.iter())
+            .cloned()
+            .collect();
+        let final_text =
+            wait_for_shared_text_with_markers(&daemon_a, &daemon_b, path, &expected_markers, steps)
+                .await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+
+        println!(
+            "SIM_OK workload=partition-both-daemons seed={seed} markers={} final_bytes={}",
+            expected_markers.len(),
+            final_text.len()
+        );
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
+fn run_flapping_connectivity_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000015".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "shared.txt";
+        let initial = format!("flapping seed {seed}\n");
+        daemon_a
+            .write_file(path, Bytes::from(initial.clone()))
+            .await?;
+        daemon_a.request_single_file_scan(path).await?;
+        wait_for_file_text(&daemon_a, &daemon_b, path, &initial, steps).await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+
+        let cycles = 5u64;
+        let mut all_markers: Vec<String> = Vec::new();
+
+        for cycle in 0..cycles {
+            // Partition daemon-b
+            turmoil::partition("daemon-b", "s2-lite");
+
+            // daemon-a writes during the partition
+            let marker = format!("A-flap-cycle-{cycle}-seed-{seed}");
+            daemon_a
+                .append_file(path, Bytes::from(format!("{marker}\n")))
+                .await?;
+            daemon_a.request_single_file_scan(path).await?;
+            all_markers.push(marker);
+
+            // Deterministic delay while partitioned
+            let delay = deterministic_delay_ms(seed, 0xF1A9_0000_0000_0001, cycle);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+
+            // Repair
+            turmoil::repair("daemon-b", "s2-lite");
+
+            // Brief pause after repair for reconnection
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            wait_for_connectivity_online(&daemon_b, steps).await?;
+        }
+
+        // After all cycles, wait for full convergence
+        let final_text =
+            wait_for_shared_text_with_markers(&daemon_a, &daemon_b, path, &all_markers, steps)
+                .await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+
+        println!(
+            "SIM_OK workload=flapping-connectivity seed={seed} cycles={cycles} markers={} final_bytes={}",
+            all_markers.len(),
+            final_text.len()
+        );
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
+fn run_asymmetric_partition_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000016".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "shared.txt";
+        let initial = format!("asymmetric seed {seed}\n");
+        daemon_a
+            .write_file(path, Bytes::from(initial.clone()))
+            .await?;
+        daemon_a.request_single_file_scan(path).await?;
+        wait_for_file_text(&daemon_a, &daemon_b, path, &initial, steps).await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+
+        // One-way partition: daemon-b cannot send to s2 but CAN receive
+        turmoil::partition_oneway("daemon-b", "s2-lite");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // daemon-a makes edits (should reach daemon-b via s2->daemon-b path)
+        let a_markers: Vec<String> = (0..3)
+            .map(|idx| format!("A-asym-{idx}-seed-{seed}"))
+            .collect();
+        for marker in &a_markers {
+            daemon_a
+                .append_file(path, Bytes::from(format!("{marker}\n")))
+                .await?;
+            daemon_a.request_single_file_scan(path).await?;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        // daemon-b makes edits (should queue in outbox since daemon-b->s2 blocked)
+        let b_markers: Vec<String> = (0..3)
+            .map(|idx| format!("B-asym-{idx}-seed-{seed}"))
+            .collect();
+        for marker in &b_markers {
+            daemon_b
+                .append_file(path, Bytes::from(format!("{marker}\n")))
+                .await?;
+            daemon_b.request_single_file_scan(path).await?;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        // Repair the one-way partition
+        turmoil::repair_oneway("daemon-b", "s2-lite");
+
+        wait_for_connectivity_online(&daemon_b, steps).await?;
+
+        let expected_markers: Vec<String> = a_markers
+            .iter()
+            .chain(b_markers.iter())
+            .cloned()
+            .collect();
+        let final_text =
+            wait_for_shared_text_with_markers(&daemon_a, &daemon_b, path, &expected_markers, steps)
+                .await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+
+        println!(
+            "SIM_OK workload=asymmetric-partition seed={seed} markers={} final_bytes={}",
+            expected_markers.len(),
+            final_text.len()
+        );
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
+fn run_partition_during_projection_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000017".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        // daemon-b creates a batch of files
+        let file_count = 8u64;
+        let mut expected_files: BTreeMap<String, String> = BTreeMap::new();
+        for i in 0..file_count {
+            let path = format!("batch-{i}.txt");
+            let content = format!("batch file {i} seed {seed}\n");
+            daemon_b
+                .write_file(&path, Bytes::from(content.clone()))
+                .await?;
+            expected_files.insert(path.clone(), content);
+            daemon_b.request_single_file_scan(&path).await?;
+        }
+
+        // Brief delay to let projection start arriving at daemon-a
+        let delay = deterministic_delay_ms(seed, 0xAD17_0000_0000_0001, 0);
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+
+        // Partition daemon-a mid-projection
+        turmoil::partition("daemon-a", "s2-lite");
+        tokio::time::sleep(Duration::from_millis(
+            deterministic_delay_ms(seed, 0xAD17_0000_0000_0002, 0) + 500,
+        ))
+        .await;
+
+        // Repair
+        turmoil::repair("daemon-a", "s2-lite");
+        wait_for_connectivity_online(&daemon_a, steps).await?;
+
+        // Verify all files eventually converge on both daemons
+        wait_for_text_files(&daemon_a, &daemon_b, &expected_files, steps).await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+
+        println!(
+            "SIM_OK workload=partition-during-projection seed={seed} files={file_count}",
+        );
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
+fn run_message_hold_and_release_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000018".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "shared.txt";
+        let initial = format!("hold-release seed {seed}\n");
+        daemon_a
+            .write_file(path, Bytes::from(initial.clone()))
+            .await?;
+        daemon_a.request_single_file_scan(path).await?;
+        wait_for_file_text(&daemon_a, &daemon_b, path, &initial, steps).await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+
+        // Hold messages from daemon-b to s2 (paused, not dropped)
+        turmoil::hold("daemon-b", "s2-lite");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // daemon-b makes several edits while held
+        let b_markers: Vec<String> = (0..4)
+            .map(|idx| format!("B-held-{idx}-seed-{seed}"))
+            .collect();
+        for marker in &b_markers {
+            daemon_b
+                .append_file(path, Bytes::from(format!("{marker}\n")))
+                .await?;
+            daemon_b.request_single_file_scan(path).await?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // daemon-a also makes edits concurrently
+        let a_markers: Vec<String> = (0..3)
+            .map(|idx| format!("A-concurrent-{idx}-seed-{seed}"))
+            .collect();
+        for marker in &a_markers {
+            daemon_a
+                .append_file(path, Bytes::from(format!("{marker}\n")))
+                .await?;
+            daemon_a.request_single_file_scan(path).await?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Release all paused messages at once
+        turmoil::release("daemon-b", "s2-lite");
+
+        let expected_markers: Vec<String> = a_markers
+            .iter()
+            .chain(b_markers.iter())
+            .cloned()
+            .collect();
+        let final_text =
+            wait_for_shared_text_with_markers(&daemon_a, &daemon_b, path, &expected_markers, steps)
+                .await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+
+        println!(
+            "SIM_OK workload=message-hold-and-release seed={seed} markers={} final_bytes={}",
+            expected_markers.len(),
+            final_text.len()
+        );
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
+fn run_transient_high_packet_loss_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000019".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    // Set packet loss on daemon-b <-> s2-lite links (applied for entire sim).
+    // Rate kept moderate so initial TCP connections still succeed across seeds.
+    sim.set_link_fail_rate("daemon-b", "s2-lite", 0.05);
+    sim.set_link_fail_rate("s2-lite", "daemon-b", 0.05);
+
+    sim.client("controller", async move {
+        // Each daemon edits its own file to avoid conflict copies under packet loss
+        let path_a = "lossy-a.txt";
+        let path_b = "lossy-b.txt";
+        let initial_a = format!("lossy-a seed {seed}\n");
+        let initial_b = format!("lossy-b seed {seed}\n");
+        daemon_a
+            .write_file(path_a, Bytes::from(initial_a.clone()))
+            .await?;
+        daemon_a.request_single_file_scan(path_a).await?;
+        daemon_b
+            .write_file(path_b, Bytes::from(initial_b.clone()))
+            .await?;
+        daemon_b.request_single_file_scan(path_b).await?;
+        wait_for_file_text(&daemon_a, &daemon_b, path_a, &initial_a, steps).await?;
+        wait_for_file_text(&daemon_a, &daemon_b, path_b, &initial_b, steps).await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+
+        // Both daemons make edits over several rounds under packet loss
+        let mut a_markers: Vec<String> = Vec::new();
+        let mut b_markers: Vec<String> = Vec::new();
+        for round in 0..3u64 {
+            let a_marker = format!("A-lossy-r{round}-seed-{seed}");
+            daemon_a
+                .append_file(path_a, Bytes::from(format!("{a_marker}\n")))
+                .await?;
+            daemon_a.request_single_file_scan(path_a).await?;
+            a_markers.push(a_marker);
+
+            let b_marker = format!("B-lossy-r{round}-seed-{seed}");
+            daemon_b
+                .append_file(path_b, Bytes::from(format!("{b_marker}\n")))
+                .await?;
+            daemon_b.request_single_file_scan(path_b).await?;
+            b_markers.push(b_marker);
+
+            let delay = deterministic_delay_ms(seed, 0x1055_0000_0000_0001, round);
+            tokio::time::sleep(Duration::from_millis(delay + 500)).await;
+        }
+
+        // Wait for convergence (may take longer due to retries under packet loss)
+        wait_for_shared_text_with_markers(&daemon_a, &daemon_b, path_a, &a_markers, steps)
+            .await?;
+        wait_for_shared_text_with_markers(&daemon_a, &daemon_b, path_b, &b_markers, steps)
+            .await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+
+        let total = a_markers.len() + b_markers.len();
+        println!(
+            "SIM_OK workload=transient-high-packet-loss seed={seed} markers={total} rounds=3",
+        );
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
+fn run_sustained_editing_stress_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("0000000000000000000000000000001a".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let rounds = 10u64;
+        let mut a_file_markers: Vec<String> = Vec::new();
+        let mut b_file_markers: Vec<String> = Vec::new();
+
+        for round in 0..rounds {
+            // daemon-a creates/edits files with unique markers
+            for file_idx in 0..4u64 {
+                let path = format!("stress-a-{file_idx}.txt");
+                let marker = format!("A-r{round}-f{file_idx}-seed-{seed}");
+                daemon_a
+                    .append_file(&path, Bytes::from(format!("{marker}\n")))
+                    .await?;
+                daemon_a.request_single_file_scan(&path).await?;
+                a_file_markers.push(marker);
+            }
+
+            // daemon-b creates/edits files with unique markers
+            for file_idx in 0..4u64 {
+                let path = format!("stress-b-{file_idx}.txt");
+                let marker = format!("B-r{round}-f{file_idx}-seed-{seed}");
+                daemon_b
+                    .append_file(&path, Bytes::from(format!("{marker}\n")))
+                    .await?;
+                daemon_b.request_single_file_scan(&path).await?;
+                b_file_markers.push(marker);
+            }
+
+            // Brief pause between rounds for convergence
+            let delay = deterministic_delay_ms(seed, 0x57AE_5500_0000_0001, round);
+            tokio::time::sleep(Duration::from_millis(delay + 200)).await;
+        }
+
+        // Verify all per-daemon file markers converge
+        for file_idx in 0..4u64 {
+            let path_a = format!("stress-a-{file_idx}.txt");
+            let markers_a: Vec<String> = a_file_markers
+                .iter()
+                .filter(|m| m.contains(&format!("-f{file_idx}-")))
+                .cloned()
+                .collect();
+            wait_for_shared_text_with_markers(&daemon_a, &daemon_b, &path_a, &markers_a, steps)
+                .await?;
+
+            let path_b = format!("stress-b-{file_idx}.txt");
+            let markers_b: Vec<String> = b_file_markers
+                .iter()
+                .filter(|m| m.contains(&format!("-f{file_idx}-")))
+                .cloned()
+                .collect();
+            wait_for_shared_text_with_markers(&daemon_a, &daemon_b, &path_b, &markers_b, steps)
+                .await?;
+        }
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+
+        let total = a_file_markers.len() + b_file_markers.len();
+        println!(
+            "SIM_OK workload=sustained-editing-stress seed={seed} rounds={rounds} total_markers={total}",
+        );
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
+fn run_delete_while_offline_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("0000000000000000000000000000001b".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "contested.txt";
+        let initial = format!("contested seed {seed}\n");
+        daemon_a
+            .write_file(path, Bytes::from(initial.clone()))
+            .await?;
+        daemon_a.request_single_file_scan(path).await?;
+        wait_for_file_text(&daemon_a, &daemon_b, path, &initial, steps).await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        wait_for_outbox_empty(&daemon_b, steps).await?;
+
+        // Partition daemon-b
+        turmoil::partition("daemon-b", "s2-lite");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // daemon-b appends to the file while offline
+        let b_marker = format!("B-offline-edit-seed-{seed}");
+        daemon_b
+            .append_file(path, Bytes::from(format!("{b_marker}\n")))
+            .await?;
+        daemon_b.request_single_file_scan(path).await?;
+        wait_for_outbox_at_least(&daemon_b, 1, steps).await?;
+
+        // daemon-a deletes the file while daemon-b is partitioned
+        daemon_a.delete_file(path).await?;
+        daemon_a.request_single_file_scan(path).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Repair daemon-b
+        turmoil::repair("daemon-b", "s2-lite");
+        wait_for_connectivity_online(&daemon_b, steps).await?;
+
+        // Wait for convergence — the CRDT should resolve the conflict
+        // Either: file is deleted, edit preserved as conflict copy, edit wins, etc.
+        let mut last_a = BTreeMap::new();
+        let mut last_b = BTreeMap::new();
+        for _ in 0..steps {
+            last_a = daemon_a.snapshot_text_files().await?;
+            last_b = daemon_b.snapshot_text_files().await?;
+            if last_a == last_b {
+                // Converged — determine resolution
+                let resolution = if last_a.is_empty() {
+                    "delete_won"
+                } else if last_a.get(path).is_some() {
+                    "edit_preserved"
+                } else {
+                    "conflict_copy"
+                };
+                wait_for_outbox_empty(&daemon_a, steps).await?;
+                wait_for_outbox_empty(&daemon_b, steps).await?;
+                println!(
+                    "SIM_OK workload=delete-while-offline seed={seed} resolution={resolution} files={}",
+                    last_a.len()
+                );
+                daemon_a.shutdown().await;
+                daemon_b.shutdown().await;
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Err(io_err(format!(
+            "delete-while-offline did not converge; a={last_a:?} b={last_b:?}"
+        )))
+    });
+
+    Ok(())
 }
 
 fn init_sim(seed: u64, failure_rate: f64) -> turmoil::Sim<'static> {
