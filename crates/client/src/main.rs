@@ -292,6 +292,32 @@ fn create_default_ignore_file(sync_root: &Path) -> eyre::Result<()> {
     }
 }
 
+fn add_metadata_dir_to_gitignore_if_present(sync_root: &Path) -> eyre::Result<()> {
+    const GITIGNORE_FILE_NAME: &str = ".gitignore";
+    const METADATA_IGNORE_PATTERN: &str = ".opbox";
+
+    let path = sync_root.join(GITIGNORE_FILE_NAME);
+    let mut contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+
+    if contents.lines().map(str::trim).any(|line| {
+        line == METADATA_IGNORE_PATTERN || line == format!("{METADATA_IGNORE_PATTERN}/")
+    }) {
+        return Ok(());
+    }
+
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(METADATA_IGNORE_PATTERN);
+    contents.push('\n');
+    std::fs::write(&path, contents)?;
+    Ok(())
+}
+
 async fn create_initialized_database(
     sync_root: &Path,
     daemon_row: &daemon_state::Row,
@@ -382,6 +408,7 @@ async fn bootstrap_init(
     create_metadata_dir(&sync_root)?;
     save_workspace_config(&sync_root, &workspace_config)?;
     create_default_ignore_file(&sync_root)?;
+    add_metadata_dir_to_gitignore_if_present(&sync_root)?;
     create_initialized_database(&sync_root, &daemon_row).await?;
     Ok(Bootstrap {
         mode: RunMode::Init,
@@ -1492,5 +1519,41 @@ mod tests {
 
         assert!("1969-12-31T23:59:59Z".parse::<CloneAsOf>().is_err());
         assert!("2026-06-18:01:30:00Z".parse::<CloneAsOf>().is_err());
+    }
+
+    #[test]
+    fn init_gitignore_update_appends_metadata_dir_once() -> eyre::Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("opbox-gitignore-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root)?;
+        let gitignore = root.join(".gitignore");
+        std::fs::write(&gitignore, "target")?;
+
+        add_metadata_dir_to_gitignore_if_present(&root)?;
+        assert_eq!(std::fs::read_to_string(&gitignore)?, "target\n.opbox\n");
+
+        add_metadata_dir_to_gitignore_if_present(&root)?;
+        assert_eq!(std::fs::read_to_string(&gitignore)?, "target\n.opbox\n");
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn init_gitignore_update_leaves_missing_or_existing_ignore_alone() -> eyre::Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("opbox-gitignore-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root)?;
+
+        add_metadata_dir_to_gitignore_if_present(&root)?;
+        assert!(!root.join(".gitignore").exists());
+
+        let gitignore = root.join(".gitignore");
+        std::fs::write(&gitignore, "  .opbox/  \n")?;
+        add_metadata_dir_to_gitignore_if_present(&root)?;
+        assert_eq!(std::fs::read_to_string(&gitignore)?, "  .opbox/  \n");
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 }
