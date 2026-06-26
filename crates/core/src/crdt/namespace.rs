@@ -5,10 +5,9 @@
 
 use crate::crdt::types::{NamespaceClaimId, ObjectId, ObjectKind};
 use crate::fs::types::RelativePath;
-use crate::types::DaemonWriterId;
+use crate::types::{DaemonWriterId, crockford_base32_lower};
 use bytes::Bytes;
 use eyre::{Result, WrapErr};
-use fast32::base32;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -475,9 +474,9 @@ fn next_available_conflict_path(
     claim: &MaterializationClaim,
     occupied_paths: &BTreeSet<RelativePath>,
 ) -> Result<RelativePath> {
-    let object_suffix = base32::CROCKFORD_LOWER.encode(claim.object_id.0.as_ref());
-    let writer_suffix = base32::CROCKFORD_LOWER.encode(claim.meta.creator_writer_id.0.as_ref());
-    let claim_suffix = base32::CROCKFORD_LOWER.encode(claim.claim_id.0.as_ref());
+    let object_suffix = crockford_base32_lower(claim.object_id.0.as_ref());
+    let writer_suffix = crockford_base32_lower(claim.meta.creator_writer_id.0.as_ref());
+    let claim_suffix = crockford_base32_lower(claim.claim_id.0.as_ref());
 
     let mut suffixes = vec![
         writer_suffix[..6.min(writer_suffix.len())].to_string(),

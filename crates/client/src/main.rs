@@ -25,7 +25,9 @@ use opbox_core::log::types::LogReadStop;
 use opbox_core::semantic::service::SemanticService;
 use opbox_core::semantic::table::daemon_state;
 use opbox_core::spy::{NamespaceSpyTracker, SpyEvent, SpySharedMessageKind};
-use opbox_core::types::{DaemonWriterId, OutboxId, WorkspaceId};
+use opbox_core::types::{
+    DaemonWriterId, OutboxId, WorkspaceId, short_crockford_base32_lower_from_b64,
+};
 use s2_sdk::{
     S2Basin,
     types::{AccountEndpoint, BasinEndpoint, BasinName},
@@ -292,6 +294,32 @@ fn create_default_ignore_file(sync_root: &Path) -> eyre::Result<()> {
     }
 }
 
+fn add_metadata_dir_to_gitignore_if_present(sync_root: &Path) -> eyre::Result<()> {
+    const GITIGNORE_FILE_NAME: &str = ".gitignore";
+    const METADATA_IGNORE_PATTERN: &str = ".opbox";
+
+    let path = sync_root.join(GITIGNORE_FILE_NAME);
+    let mut contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+
+    if contents.lines().map(str::trim).any(|line| {
+        line == METADATA_IGNORE_PATTERN || line == format!("{METADATA_IGNORE_PATTERN}/")
+    }) {
+        return Ok(());
+    }
+
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(METADATA_IGNORE_PATTERN);
+    contents.push('\n');
+    std::fs::write(&path, contents)?;
+    Ok(())
+}
+
 async fn create_initialized_database(
     sync_root: &Path,
     daemon_row: &daemon_state::Row,
@@ -382,6 +410,7 @@ async fn bootstrap_init(
     create_metadata_dir(&sync_root)?;
     save_workspace_config(&sync_root, &workspace_config)?;
     create_default_ignore_file(&sync_root)?;
+    add_metadata_dir_to_gitignore_if_present(&sync_root)?;
     create_initialized_database(&sync_root, &daemon_row).await?;
     Ok(Bootstrap {
         mode: RunMode::Init,
@@ -548,7 +577,7 @@ impl SpyPrintState {
     }
 
     fn format_origin_writer(&self, origin_writer_id_b64: &str, style: CliStyle) -> String {
-        let short = short_id(origin_writer_id_b64);
+        let short = short_crockford_base32_lower_from_b64(origin_writer_id_b64);
         match &self.daemon_writer_id_b64 {
             Some(daemon_writer_id_b64) if daemon_writer_id_b64 == origin_writer_id_b64 => {
                 format_kv("from", format!("{short}{}", style.green("(you)")), style)
@@ -571,7 +600,11 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, state: &mut SpyPrintState) 
             println!(
                 "{}  {}",
                 style.dim("session"),
-                format_kv("daemon", short_id(&daemon_writer_id_b64), style),
+                format_kv(
+                    "daemon",
+                    short_crockford_base32_lower_from_b64(&daemon_writer_id_b64),
+                    style
+                ),
             );
             state.daemon_writer_id_b64 = Some(daemon_writer_id_b64);
         }
@@ -594,7 +627,16 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, state: &mut SpyPrintState) 
                 let summary = summary.as_ref().or(local_summary.as_ref());
                 let shared_object_id = summary.and_then(namespace_summary_single_object_id);
                 let shared_object_field = shared_object_id
-                    .map(|object_id| format!("  {}", format_kv("obj", short_id(object_id), style)))
+                    .map(|object_id| {
+                        format!(
+                            "  {}",
+                            format_kv(
+                                "obj",
+                                short_crockford_base32_lower_from_b64(object_id),
+                                style
+                            )
+                        )
+                    })
                     .unwrap_or_default();
                 let summary_field = format_namespace_summary(summary, shared_object_id, style);
                 println!(
@@ -617,7 +659,11 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, state: &mut SpyPrintState) 
                     style.spy_bytes(message.payload_size_bytes),
                     style.cyan(format!("{:<10}", "text")),
                     state.format_origin_writer(&message.origin_writer_id_b64, style),
-                    format_kv("obj", short_id(&object_id_b64), style),
+                    format_kv(
+                        "obj",
+                        short_crockford_base32_lower_from_b64(&object_id_b64),
+                        style
+                    ),
                     format_text_summary(summary.as_ref(), style),
                 );
             }
@@ -632,8 +678,16 @@ fn print_spy_event(event: SpyEvent, style: CliStyle, state: &mut SpyPrintState) 
                     style.spy_bytes(message.payload_size_bytes),
                     style.magenta(format!("{:<10}", "binary")),
                     state.format_origin_writer(&message.origin_writer_id_b64, style),
-                    format_kv("obj", short_id(&object_id_b64), style),
-                    format_kv("writer", short_id(&writer_id_b64), style),
+                    format_kv(
+                        "obj",
+                        short_crockford_base32_lower_from_b64(&object_id_b64),
+                        style
+                    ),
+                    format_kv(
+                        "writer",
+                        short_crockford_base32_lower_from_b64(&writer_id_b64),
+                        style
+                    ),
                     format_kv("wall", wall_time_ns, style),
                 );
             }
@@ -660,7 +714,7 @@ fn format_namespace_summary(
             out.push_str(&style.green(format!(
                 "=(\"{}\", obj={}, {})",
                 claim.path,
-                short_id(&claim.object_id_b64),
+                short_crockford_base32_lower_from_b64(&claim.object_id_b64),
                 claim.kind
             )));
         }
@@ -674,7 +728,7 @@ fn format_namespace_summary(
             out.push_str(&style.red(format!(
                 "=(\"{}\", obj={}, {})",
                 claim.path,
-                short_id(&claim.object_id_b64),
+                short_crockford_base32_lower_from_b64(&claim.object_id_b64),
                 claim.kind
             )));
         }
@@ -724,10 +778,6 @@ fn format_text_summary(
 
 fn format_kv(label: &str, value: impl std::fmt::Display, style: CliStyle) -> String {
     format!("{}={}", style.dim(label), value)
-}
-
-fn short_id(value: &str) -> &str {
-    if value.len() <= 8 { value } else { &value[..8] }
 }
 
 struct BootstrapProgress {
@@ -1154,19 +1204,10 @@ async fn run_start(sync_root: Option<PathBuf>) -> eyre::Result<()> {
 async fn run_stop(sync_root: Option<PathBuf>) -> eyre::Result<()> {
     let root = find_workspace_root(&root_or_current(sync_root)?)?;
     let response = match request_valid_status(&root).await {
-        Ok(_) => match ipc::request_stop(&root).await {
-            Ok(response) => response,
-            Err(error) => {
-                if error.downcast_ref::<ipc::DaemonBuildMismatch>().is_some() {
-                    stop_mismatched_daemon_by_signal(&root, &error).await?
-                } else {
-                    exit_daemon_not_running_or_report(&root, error);
-                }
-            }
-        },
+        Ok(_) => request_stop_with_mismatch_fallback(&root).await?,
         Err(error) => {
             if error.downcast_ref::<ipc::DaemonBuildMismatch>().is_some() {
-                stop_mismatched_daemon_by_signal(&root, &error).await?
+                request_stop_with_mismatch_fallback(&root).await?
             } else {
                 exit_daemon_not_running_or_report(&root, error);
             }
@@ -1176,6 +1217,19 @@ async fn run_stop(sync_root: Option<PathBuf>) -> eyre::Result<()> {
     wait_for_daemon_process_exit(&root, &response).await
 }
 
+async fn request_stop_with_mismatch_fallback(root: &Path) -> eyre::Result<ipc::StopResponse> {
+    match ipc::request_stop(root).await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            if error.downcast_ref::<ipc::DaemonBuildMismatch>().is_some() {
+                stop_mismatched_daemon_by_signal(root, &error).await
+            } else {
+                exit_daemon_not_running_or_report(root, error);
+            }
+        }
+    }
+}
+
 async fn stop_mismatched_daemon_by_signal(
     root: &Path,
     error: &eyre::Report,
@@ -1183,15 +1237,15 @@ async fn stop_mismatched_daemon_by_signal(
     let style = CliStyle::for_stderr();
     eprintln!("{}", style.yellow(error));
     let pid = read_daemon_pid(root)?;
+    let workspace_id = load_configured_daemon_state(root)
+        .await
+        .map(|(_, row)| row.workspace_id.0)
+        .unwrap_or_else(|_| "unknown".to_string());
     terminate_daemon_process(pid)?;
     eprintln!(
         "{}",
         style.yellow(format!("sent SIGTERM to mismatched opbox daemon pid {pid}"))
     );
-    let workspace_id = load_configured_daemon_state(root)
-        .await
-        .map(|(_, row)| row.workspace_id.0)
-        .unwrap_or_else(|_| "unknown".to_string());
     Ok(ipc::StopResponse { workspace_id, pid })
 }
 
@@ -1250,6 +1304,8 @@ fn daemon_process_is_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
 }
@@ -1492,5 +1548,41 @@ mod tests {
 
         assert!("1969-12-31T23:59:59Z".parse::<CloneAsOf>().is_err());
         assert!("2026-06-18:01:30:00Z".parse::<CloneAsOf>().is_err());
+    }
+
+    #[test]
+    fn init_gitignore_update_appends_metadata_dir_once() -> eyre::Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("opbox-gitignore-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root)?;
+        let gitignore = root.join(".gitignore");
+        std::fs::write(&gitignore, "target")?;
+
+        add_metadata_dir_to_gitignore_if_present(&root)?;
+        assert_eq!(std::fs::read_to_string(&gitignore)?, "target\n.opbox\n");
+
+        add_metadata_dir_to_gitignore_if_present(&root)?;
+        assert_eq!(std::fs::read_to_string(&gitignore)?, "target\n.opbox\n");
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn init_gitignore_update_leaves_missing_or_existing_ignore_alone() -> eyre::Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("opbox-gitignore-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root)?;
+
+        add_metadata_dir_to_gitignore_if_present(&root)?;
+        assert!(!root.join(".gitignore").exists());
+
+        let gitignore = root.join(".gitignore");
+        std::fs::write(&gitignore, "  .opbox/  \n")?;
+        add_metadata_dir_to_gitignore_if_present(&root)?;
+        assert_eq!(std::fs::read_to_string(&gitignore)?, "  .opbox/  \n");
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 }
