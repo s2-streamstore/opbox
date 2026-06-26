@@ -3,17 +3,20 @@ use crate::engine::actor::EngineCommand;
 use crate::semantic::table::daemon_state;
 use crate::spy::{SpyEvent, SpyOpen};
 use bytes::Bytes;
+use eyre::WrapErr;
 use futures::{StreamExt, stream};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::client::conn::http1 as client_http1;
+use hyper::header::HeaderMap;
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -25,11 +28,49 @@ type IpcBody = UnsyncBoxBody<Bytes, Infallible>;
 
 pub use crate::app::control::{DaemonStatus, EnginePhaseStatus};
 
+pub const IPC_PROTOCOL_VERSION: u32 = 1;
+
+const IPC_PROTOCOL_VERSION_HEADER_VALUE: &str = "1";
+const HEADER_IPC_PROTOCOL: &str = "x-opbox-ipc-protocol";
+const HEADER_VERSION: &str = "x-opbox-version";
+const HEADER_BUILD: &str = "x-opbox-build";
+const HEADER_CLIENT_IPC_PROTOCOL: &str = "x-opbox-client-ipc-protocol";
+const HEADER_CLIENT_VERSION: &str = "x-opbox-client-version";
+const HEADER_CLIENT_BUILD: &str = "x-opbox-client-build";
+
+pub fn package_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+pub fn build_hash() -> &'static str {
+    env!("OPBOX_BUILD_HASH")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StopResponse {
     pub workspace_id: String,
     pub pid: u32,
 }
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DaemonBuildMismatch {
+    pub client_version: String,
+    pub client_build: String,
+    pub daemon_version: String,
+    pub daemon_build: String,
+}
+
+impl std::fmt::Display for DaemonBuildMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "opbox daemon build does not match ob\n  ob:     {} {}\n  daemon: {} {}\nrestart the daemon with the current opbox build",
+            self.client_version, self.client_build, self.daemon_version, self.daemon_build
+        )
+    }
+}
+
+impl std::error::Error for DaemonBuildMismatch {}
 
 #[derive(Debug, Clone)]
 pub struct ControlServerConfig {
@@ -39,21 +80,32 @@ pub struct ControlServerConfig {
 }
 
 pub async fn request_status(sync_root: &Path) -> eyre::Result<DaemonStatus> {
-    request_json(sync_root, Method::GET, "/status").await
+    request_json(
+        sync_root,
+        Method::GET,
+        "/status",
+        DaemonMetadataPolicy::Strict,
+    )
+    .await
 }
 
 pub async fn request_stop(sync_root: &Path) -> eyre::Result<StopResponse> {
-    request_json(sync_root, Method::POST, "/stop").await
+    request_json(
+        sync_root,
+        Method::POST,
+        "/stop",
+        DaemonMetadataPolicy::AllowBuildMismatch,
+    )
+    .await
 }
 
 pub async fn open_spy_stream(sync_root: &Path) -> eyre::Result<SpyStream> {
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri("/spy")
+    let request = ipc_request_builder(Method::GET, "/spy")
         .header(hyper::header::HOST, "opbox")
         .header(hyper::header::ACCEPT, "text/event-stream")
         .body(Empty::<Bytes>::new())?;
     let (response, connection_task) = send_request(sync_root, request).await?;
+    validate_daemon_metadata(&response, DaemonMetadataPolicy::Strict)?;
     if response.status() != StatusCode::OK {
         eyre::bail!("daemon returned non-200 status: {}", response.status());
     }
@@ -121,22 +173,100 @@ impl Drop for SpyStream {
     }
 }
 
-async fn request_json<T>(sync_root: &Path, method: Method, uri: &str) -> eyre::Result<T>
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonMetadataPolicy {
+    Strict,
+    AllowBuildMismatch,
+}
+
+async fn request_json<T>(
+    sync_root: &Path,
+    method: Method,
+    uri: &str,
+    metadata_policy: DaemonMetadataPolicy,
+) -> eyre::Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
-    let request = Request::builder()
-        .method(method)
-        .uri(uri)
+    let request = ipc_request_builder(method, uri)
         .header(hyper::header::HOST, "opbox")
         .body(Empty::<Bytes>::new())?;
     let (response, connection_task) = send_request(sync_root, request).await?;
+    validate_daemon_metadata(&response, metadata_policy)?;
     if response.status() != StatusCode::OK {
+        if metadata_policy == DaemonMetadataPolicy::AllowBuildMismatch
+            && response.status() == StatusCode::CONFLICT
+            && let Some(mismatch) = daemon_build_mismatch(response.headers())
+        {
+            connection_task.abort();
+            return Err(mismatch.into());
+        }
         eyre::bail!("daemon returned non-200 status: {}", response.status());
     }
     let body = response.into_body().collect().await?.to_bytes();
     connection_task.abort();
     Ok(serde_json::from_slice(&body)?)
+}
+
+fn ipc_request_builder(method: Method, uri: &str) -> hyper::http::request::Builder {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(
+            HEADER_CLIENT_IPC_PROTOCOL,
+            IPC_PROTOCOL_VERSION_HEADER_VALUE,
+        )
+        .header(HEADER_CLIENT_VERSION, package_version())
+        .header(HEADER_CLIENT_BUILD, build_hash())
+}
+
+fn validate_daemon_metadata(
+    response: &Response<Incoming>,
+    policy: DaemonMetadataPolicy,
+) -> eyre::Result<()> {
+    let headers = response.headers();
+    let Some(protocol) = header_value(headers, HEADER_IPC_PROTOCOL) else {
+        eyre::bail!(
+            "daemon did not include opbox IPC metadata; it is likely from an older build. Restart the daemon with the current opbox build."
+        );
+    };
+    if protocol != IPC_PROTOCOL_VERSION_HEADER_VALUE {
+        eyre::bail!(
+            "opbox daemon IPC protocol mismatch\n  ob protocol: {}\n  daemon protocol: {protocol}\nrestart the daemon with the current opbox build",
+            IPC_PROTOCOL_VERSION
+        );
+    }
+
+    let Some(daemon_build) = header_value(headers, HEADER_BUILD) else {
+        eyre::bail!(
+            "daemon did not include opbox build metadata; it is likely from an older build. Restart the daemon with the current opbox build."
+        );
+    };
+    if daemon_build != build_hash()
+        && let Some(mismatch) = daemon_build_mismatch(headers)
+    {
+        if policy == DaemonMetadataPolicy::AllowBuildMismatch {
+            return Ok(());
+        }
+        return Err(mismatch.into());
+    }
+
+    Ok(())
+}
+
+fn daemon_build_mismatch(headers: &HeaderMap) -> Option<DaemonBuildMismatch> {
+    let daemon_build = header_value(headers, HEADER_BUILD)?;
+    if daemon_build == build_hash() {
+        return None;
+    }
+    Some(DaemonBuildMismatch {
+        client_version: package_version().to_string(),
+        client_build: build_hash().to_string(),
+        daemon_version: header_value(headers, HEADER_VERSION)
+            .unwrap_or("unknown")
+            .to_string(),
+        daemon_build: daemon_build.to_string(),
+    })
 }
 
 async fn send_request(
@@ -147,18 +277,21 @@ async fn send_request(
     let stream = match UnixStream::connect(&socket_path).await {
         Ok(stream) => stream,
         Err(error) => {
-            let _ = remove_stale_socket_files(sync_root);
-            return Err(error.into());
+            if matches!(
+                error.kind(),
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused
+            ) {
+                let _ = remove_stale_socket_files(sync_root);
+            }
+            return Err(error).wrap_err_with(|| {
+                format!("connect to daemon control socket {}", socket_path.display())
+            });
         }
     };
     let io = TokioIo::new(stream);
-    let (mut sender, connection) = match client_http1::handshake(io).await {
-        Ok(parts) => parts,
-        Err(error) => {
-            let _ = remove_stale_socket_files(sync_root);
-            return Err(error.into());
-        }
-    };
+    let (mut sender, connection) = client_http1::handshake(io)
+        .await
+        .wrap_err("handshake with daemon control socket")?;
     let connection_task = tokio::spawn(async move {
         if let Err(error) = connection.await {
             debug!(?error, "ipc client connection failed");
@@ -167,9 +300,8 @@ async fn send_request(
     let response = match sender.send_request(request).await {
         Ok(response) => response,
         Err(error) => {
-            let _ = remove_stale_socket_files(sync_root);
             connection_task.abort();
-            return Err(error.into());
+            return Err(error).wrap_err("send IPC request to daemon");
         }
     };
     Ok((response, connection_task))
@@ -235,6 +367,12 @@ async fn handle_control_request(
     config: ControlServerConfig,
     token: CancellationToken,
 ) -> Result<Response<IpcBody>, Infallible> {
+    if let Some(response) =
+        client_metadata_error(request.method(), request.uri().path(), request.headers())
+    {
+        return Ok(response);
+    }
+
     let response = match (request.method(), request.uri().path()) {
         (&Method::GET, "/status") => match request_engine_status(&config).await {
             Ok(status) => json_response(StatusCode::OK, &status),
@@ -276,6 +414,62 @@ async fn handle_control_request(
             )
         }
     }
+}
+
+fn client_metadata_error(
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+) -> Option<Response<IpcBody>> {
+    let allow_build_mismatch = method == Method::POST && path == "/stop";
+
+    let Some(protocol) = header_value(headers, HEADER_CLIENT_IPC_PROTOCOL) else {
+        return Some(
+            text_response(
+                StatusCode::UPGRADE_REQUIRED,
+                "opbox IPC client metadata is missing; upgrade ob and restart the daemon",
+            )
+            .expect("metadata error response is valid"),
+        );
+    };
+    if protocol != IPC_PROTOCOL_VERSION_HEADER_VALUE {
+        return Some(
+            text_response(
+                StatusCode::UPGRADE_REQUIRED,
+                format!(
+                    "opbox IPC protocol mismatch; daemon protocol is {}, client protocol is {protocol}",
+                    IPC_PROTOCOL_VERSION
+                ),
+            )
+            .expect("protocol mismatch response is valid"),
+        );
+    }
+
+    let Some(client_build) = header_value(headers, HEADER_CLIENT_BUILD) else {
+        return Some(
+            text_response(
+                StatusCode::UPGRADE_REQUIRED,
+                "opbox IPC client build metadata is missing; upgrade ob and restart the daemon",
+            )
+            .expect("build metadata response is valid"),
+        );
+    };
+    if client_build != build_hash() && !allow_build_mismatch {
+        let client_version = header_value(headers, HEADER_CLIENT_VERSION).unwrap_or("unknown");
+        return Some(
+            text_response(
+                StatusCode::CONFLICT,
+                format!(
+                    "opbox client build does not match daemon\n  client: {client_version} {client_build}\n  daemon: {} {}",
+                    package_version(),
+                    build_hash()
+                ),
+            )
+            .expect("build mismatch response is valid"),
+        );
+    }
+
+    None
 }
 
 async fn request_engine_status(config: &ControlServerConfig) -> eyre::Result<DaemonStatus> {
@@ -339,6 +533,9 @@ fn spy_response(open: SpyOpen, token: CancellationToken) -> Response<IpcBody> {
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "text/event-stream")
         .header(hyper::header::CACHE_CONTROL, "no-cache")
+        .header(HEADER_IPC_PROTOCOL, IPC_PROTOCOL_VERSION_HEADER_VALUE)
+        .header(HEADER_VERSION, package_version())
+        .header(HEADER_BUILD, build_hash())
         .body(StreamBody::new(event_stream).boxed_unsync())
         .expect("spy response is valid")
 }
@@ -358,11 +555,11 @@ where
     ))
 }
 
-fn text_response(status: StatusCode, body: &'static str) -> eyre::Result<Response<IpcBody>> {
+fn text_response(status: StatusCode, body: impl Into<String>) -> eyre::Result<Response<IpcBody>> {
     Ok(response(
         status,
         "text/plain; charset=utf-8",
-        Bytes::from_static(body.as_bytes()),
+        Bytes::from(body.into()),
     ))
 }
 
@@ -370,8 +567,15 @@ fn response(status: StatusCode, content_type: &'static str, body: Bytes) -> Resp
     Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, content_type)
+        .header(HEADER_IPC_PROTOCOL, IPC_PROTOCOL_VERSION_HEADER_VALUE)
+        .header(HEADER_VERSION, package_version())
+        .header(HEADER_BUILD, build_hash())
         .body(Full::new(body).boxed_unsync())
         .expect("control response is valid")
+}
+
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name)?.to_str().ok()
 }
 
 fn remove_stale_socket(socket_path: &Path) -> eyre::Result<()> {
@@ -416,6 +620,7 @@ mod tests {
     use crate::engine::actor::EngineCommand;
     use crate::types::{DaemonWriterId, OutboxId, WorkspaceId};
     use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn status_round_trips_through_engine_mailbox() -> eyre::Result<()> {
@@ -627,6 +832,259 @@ mod tests {
         token.cancel();
         server.await??;
         engine.await?;
+        let _ = std::fs::remove_dir_all(&sync_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_allows_daemon_build_mismatch_response() -> eyre::Result<()> {
+        let sync_root =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&sync_root)?;
+        std::fs::create_dir(metadata_dir(&sync_root))?;
+        let socket_path =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}.sock", rand::random::<u64>()));
+        let listener = UnixListener::bind(&socket_path)?;
+        std::os::unix::fs::symlink(&socket_path, socket_link_path(&sync_root))?;
+
+        let expected = StopResponse {
+            workspace_id: "0123456789abcdefghijklmnopqrstuv".to_string(),
+            pid: 123,
+        };
+        let body = serde_json::to_vec(&expected)?;
+        let response_head = format!(
+            "HTTP/1.1 200 OK\r\n{HEADER_IPC_PROTOCOL}: {IPC_PROTOCOL_VERSION_HEADER_VALUE}\r\n{HEADER_VERSION}: {}\r\n{HEADER_BUILD}: old-build\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            package_version(),
+            body.len()
+        );
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.write_all(response_head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            }
+        });
+
+        let response = request_stop(&sync_root).await?;
+        assert_eq!(response.workspace_id, expected.workspace_id);
+        assert_eq!(response.pid, expected.pid);
+
+        server.await?;
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&sync_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn daemon_allows_stop_with_client_build_mismatch() -> eyre::Result<()> {
+        let sync_root =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&sync_root)?;
+        std::fs::create_dir(metadata_dir(&sync_root))?;
+        let writer_bytes = rand::random::<[u8; 16]>();
+
+        let daemon_row = daemon_state::Row {
+            workspace_id: WorkspaceId("0123456789abcdefghijklmnopqrstuv".to_string()),
+            s2_basin: "test-basin".parse()?,
+            s2_account_endpoint: None,
+            s2_basin_endpoint: None,
+            daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
+            stable_cursor: ..0,
+            next_outbox_id: OutboxId::new(0),
+        };
+
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+        let expected_status = DaemonStatus {
+            workspace_id: daemon_row.workspace_id.0.clone(),
+            root: sync_root.display().to_string(),
+            pid: 123,
+            stable_cursor_end: 42,
+            daemon_writer_id_b64: daemon_row.daemon_writer_id.encode_b64(),
+            started_at_ns: 0,
+            engine_phase: EnginePhaseStatus::Scanning,
+            connectivity: ConnectivitySnapshot::starting(),
+        };
+        let engine = tokio::spawn({
+            let expected_status = expected_status.clone();
+            async move {
+                match engine_rx.recv().await {
+                    Some(EngineCommand::Stop { reply }) => {
+                        let _ = reply.send(expected_status);
+                    }
+                    Some(EngineCommand::Status { .. }) => panic!("unexpected status command"),
+                    Some(EngineCommand::Scan(_)) => panic!("unexpected scan command"),
+                    Some(EngineCommand::OpenSpy { .. }) => panic!("unexpected open-spy command"),
+                    None => panic!("engine command channel closed"),
+                }
+            }
+        });
+        let token = CancellationToken::new();
+        let server = tokio::spawn({
+            let token = token.clone();
+            let config = ControlServerConfig {
+                sync_root: sync_root.clone(),
+                daemon_state: daemon_row,
+                engine_tx,
+            };
+            async move { serve_control(config, token).await }
+        });
+
+        wait_for_socket(&sync_root).await?;
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/stop")
+            .header(hyper::header::HOST, "opbox")
+            .header(
+                HEADER_CLIENT_IPC_PROTOCOL,
+                IPC_PROTOCOL_VERSION_HEADER_VALUE,
+            )
+            .header(HEADER_CLIENT_VERSION, package_version())
+            .header(HEADER_CLIENT_BUILD, format!("{}-other", build_hash()))
+            .body(Empty::<Bytes>::new())?;
+        let (response, connection_task) = send_request(&sync_root, request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await?.to_bytes();
+        connection_task.abort();
+        let stop_response: StopResponse = serde_json::from_slice(&body)?;
+        assert_eq!(stop_response.workspace_id, expected_status.workspace_id);
+        assert_eq!(stop_response.pid, expected_status.pid);
+
+        token.cancel();
+        server.await??;
+        engine.await?;
+        let _ = std::fs::remove_dir_all(&sync_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipc_request_error_after_connect_does_not_unlink_socket() -> eyre::Result<()> {
+        let sync_root =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&sync_root)?;
+        std::fs::create_dir(metadata_dir(&sync_root))?;
+        let socket_path =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}.sock", rand::random::<u64>()));
+        let listener = UnixListener::bind(&socket_path)?;
+        std::os::unix::fs::symlink(&socket_path, socket_link_path(&sync_root))?;
+
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        let error = request_status(&sync_root)
+            .await
+            .expect_err("server drops connection before response");
+        assert!(
+            error.to_string().contains("send IPC request")
+                || error
+                    .to_string()
+                    .contains("handshake with daemon control socket"),
+            "unexpected error: {error:?}"
+        );
+        assert!(socket_link_path(&sync_root).exists());
+        assert!(socket_path.exists());
+
+        server.await?;
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&sync_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn daemon_rejects_request_without_client_metadata() -> eyre::Result<()> {
+        let sync_root =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&sync_root)?;
+        std::fs::create_dir(metadata_dir(&sync_root))?;
+        let writer_bytes = rand::random::<[u8; 16]>();
+
+        let daemon_row = daemon_state::Row {
+            workspace_id: WorkspaceId("0123456789abcdefghijklmnopqrstuv".to_string()),
+            s2_basin: "test-basin".parse()?,
+            s2_account_endpoint: None,
+            s2_basin_endpoint: None,
+            daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
+            stable_cursor: ..0,
+            next_outbox_id: OutboxId::new(0),
+        };
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+        let engine = tokio::spawn(async move {
+            assert!(
+                engine_rx.recv().await.is_none(),
+                "metadata rejection should not reach engine"
+            );
+        });
+        let token = CancellationToken::new();
+        let server = tokio::spawn({
+            let token = token.clone();
+            let config = ControlServerConfig {
+                sync_root: sync_root.clone(),
+                daemon_state: daemon_row,
+                engine_tx,
+            };
+            async move { serve_control(config, token).await }
+        });
+
+        wait_for_socket(&sync_root).await?;
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/status")
+            .header(hyper::header::HOST, "opbox")
+            .body(Empty::<Bytes>::new())?;
+        let (response, connection_task) = send_request(&sync_root, request).await?;
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(
+            header_value(response.headers(), HEADER_IPC_PROTOCOL),
+            Some(IPC_PROTOCOL_VERSION_HEADER_VALUE)
+        );
+
+        connection_task.abort();
+        token.cancel();
+        server.await??;
+        engine.await?;
+        let _ = std::fs::remove_dir_all(&sync_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_daemon_response_reports_metadata_error_without_unlinking_socket()
+    -> eyre::Result<()> {
+        let sync_root =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&sync_root)?;
+        std::fs::create_dir(metadata_dir(&sync_root))?;
+        let socket_path =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}.sock", rand::random::<u64>()));
+        let listener = UnixListener::bind(&socket_path)?;
+        std::os::unix::fs::symlink(&socket_path, socket_link_path(&sync_root))?;
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}",
+                    )
+                    .await;
+            }
+        });
+
+        let error = request_status(&sync_root)
+            .await
+            .expect_err("legacy daemon response should fail metadata validation");
+        assert!(
+            error
+                .to_string()
+                .contains("did not include opbox IPC metadata"),
+            "unexpected error: {error:?}"
+        );
+        assert!(socket_link_path(&sync_root).exists());
+        assert!(socket_path.exists());
+
+        server.await?;
+        let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_dir_all(&sync_root);
         Ok(())
     }
