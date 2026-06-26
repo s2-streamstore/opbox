@@ -9,6 +9,7 @@ use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::client::conn::http1 as client_http1;
+use hyper::header::HeaderMap;
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -26,6 +27,24 @@ use tracing::{debug, warn};
 type IpcBody = UnsyncBoxBody<Bytes, Infallible>;
 
 pub use crate::app::control::{DaemonStatus, EnginePhaseStatus};
+
+pub const IPC_PROTOCOL_VERSION: u32 = 1;
+
+const IPC_PROTOCOL_VERSION_HEADER_VALUE: &str = "1";
+const HEADER_IPC_PROTOCOL: &str = "x-opbox-ipc-protocol";
+const HEADER_VERSION: &str = "x-opbox-version";
+const HEADER_BUILD: &str = "x-opbox-build";
+const HEADER_CLIENT_IPC_PROTOCOL: &str = "x-opbox-client-ipc-protocol";
+const HEADER_CLIENT_VERSION: &str = "x-opbox-client-version";
+const HEADER_CLIENT_BUILD: &str = "x-opbox-client-build";
+
+pub fn package_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+pub fn build_hash() -> &'static str {
+    env!("OPBOX_BUILD_HASH")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StopResponse {
@@ -49,13 +68,12 @@ pub async fn request_stop(sync_root: &Path) -> eyre::Result<StopResponse> {
 }
 
 pub async fn open_spy_stream(sync_root: &Path) -> eyre::Result<SpyStream> {
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri("/spy")
+    let request = ipc_request_builder(Method::GET, "/spy")
         .header(hyper::header::HOST, "opbox")
         .header(hyper::header::ACCEPT, "text/event-stream")
         .body(Empty::<Bytes>::new())?;
     let (response, connection_task) = send_request(sync_root, request).await?;
+    validate_daemon_metadata(&response)?;
     if response.status() != StatusCode::OK {
         eyre::bail!("daemon returned non-200 status: {}", response.status());
     }
@@ -127,18 +145,60 @@ async fn request_json<T>(sync_root: &Path, method: Method, uri: &str) -> eyre::R
 where
     T: serde::de::DeserializeOwned,
 {
-    let request = Request::builder()
-        .method(method)
-        .uri(uri)
+    let request = ipc_request_builder(method, uri)
         .header(hyper::header::HOST, "opbox")
         .body(Empty::<Bytes>::new())?;
     let (response, connection_task) = send_request(sync_root, request).await?;
+    validate_daemon_metadata(&response)?;
     if response.status() != StatusCode::OK {
         eyre::bail!("daemon returned non-200 status: {}", response.status());
     }
     let body = response.into_body().collect().await?.to_bytes();
     connection_task.abort();
     Ok(serde_json::from_slice(&body)?)
+}
+
+fn ipc_request_builder(method: Method, uri: &str) -> hyper::http::request::Builder {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(
+            HEADER_CLIENT_IPC_PROTOCOL,
+            IPC_PROTOCOL_VERSION_HEADER_VALUE,
+        )
+        .header(HEADER_CLIENT_VERSION, package_version())
+        .header(HEADER_CLIENT_BUILD, build_hash())
+}
+
+fn validate_daemon_metadata(response: &Response<Incoming>) -> eyre::Result<()> {
+    let headers = response.headers();
+    let Some(protocol) = header_value(headers, HEADER_IPC_PROTOCOL) else {
+        eyre::bail!(
+            "daemon did not include opbox IPC metadata; it is likely from an older build. Restart the daemon with the current opbox build."
+        );
+    };
+    if protocol != IPC_PROTOCOL_VERSION_HEADER_VALUE {
+        eyre::bail!(
+            "opbox daemon IPC protocol mismatch\n  ob protocol: {}\n  daemon protocol: {protocol}\nrestart the daemon with the current opbox build",
+            IPC_PROTOCOL_VERSION
+        );
+    }
+
+    let Some(daemon_build) = header_value(headers, HEADER_BUILD) else {
+        eyre::bail!(
+            "daemon did not include opbox build metadata; it is likely from an older build. Restart the daemon with the current opbox build."
+        );
+    };
+    if daemon_build != build_hash() {
+        let daemon_version = header_value(headers, HEADER_VERSION).unwrap_or("unknown");
+        eyre::bail!(
+            "opbox daemon build does not match ob\n  ob:     {} {}\n  daemon: {daemon_version} {daemon_build}\nrestart the daemon with the current opbox build",
+            package_version(),
+            build_hash()
+        );
+    }
+
+    Ok(())
 }
 
 async fn send_request(
@@ -239,6 +299,10 @@ async fn handle_control_request(
     config: ControlServerConfig,
     token: CancellationToken,
 ) -> Result<Response<IpcBody>, Infallible> {
+    if let Some(response) = client_metadata_error(request.headers()) {
+        return Ok(response);
+    }
+
     let response = match (request.method(), request.uri().path()) {
         (&Method::GET, "/status") => match request_engine_status(&config).await {
             Ok(status) => json_response(StatusCode::OK, &status),
@@ -280,6 +344,56 @@ async fn handle_control_request(
             )
         }
     }
+}
+
+fn client_metadata_error(headers: &HeaderMap) -> Option<Response<IpcBody>> {
+    let Some(protocol) = header_value(headers, HEADER_CLIENT_IPC_PROTOCOL) else {
+        return Some(
+            text_response(
+                StatusCode::UPGRADE_REQUIRED,
+                "opbox IPC client metadata is missing; upgrade ob and restart the daemon",
+            )
+            .expect("metadata error response is valid"),
+        );
+    };
+    if protocol != IPC_PROTOCOL_VERSION_HEADER_VALUE {
+        return Some(
+            text_response(
+                StatusCode::UPGRADE_REQUIRED,
+                format!(
+                    "opbox IPC protocol mismatch; daemon protocol is {}, client protocol is {protocol}",
+                    IPC_PROTOCOL_VERSION
+                ),
+            )
+            .expect("protocol mismatch response is valid"),
+        );
+    }
+
+    let Some(client_build) = header_value(headers, HEADER_CLIENT_BUILD) else {
+        return Some(
+            text_response(
+                StatusCode::UPGRADE_REQUIRED,
+                "opbox IPC client build metadata is missing; upgrade ob and restart the daemon",
+            )
+            .expect("build metadata response is valid"),
+        );
+    };
+    if client_build != build_hash() {
+        let client_version = header_value(headers, HEADER_CLIENT_VERSION).unwrap_or("unknown");
+        return Some(
+            text_response(
+                StatusCode::CONFLICT,
+                format!(
+                    "opbox client build does not match daemon\n  client: {client_version} {client_build}\n  daemon: {} {}",
+                    package_version(),
+                    build_hash()
+                ),
+            )
+            .expect("build mismatch response is valid"),
+        );
+    }
+
+    None
 }
 
 async fn request_engine_status(config: &ControlServerConfig) -> eyre::Result<DaemonStatus> {
@@ -343,6 +457,9 @@ fn spy_response(open: SpyOpen, token: CancellationToken) -> Response<IpcBody> {
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "text/event-stream")
         .header(hyper::header::CACHE_CONTROL, "no-cache")
+        .header(HEADER_IPC_PROTOCOL, IPC_PROTOCOL_VERSION_HEADER_VALUE)
+        .header(HEADER_VERSION, package_version())
+        .header(HEADER_BUILD, build_hash())
         .body(StreamBody::new(event_stream).boxed_unsync())
         .expect("spy response is valid")
 }
@@ -362,11 +479,11 @@ where
     ))
 }
 
-fn text_response(status: StatusCode, body: &'static str) -> eyre::Result<Response<IpcBody>> {
+fn text_response(status: StatusCode, body: impl Into<String>) -> eyre::Result<Response<IpcBody>> {
     Ok(response(
         status,
         "text/plain; charset=utf-8",
-        Bytes::from_static(body.as_bytes()),
+        Bytes::from(body.into()),
     ))
 }
 
@@ -374,8 +491,15 @@ fn response(status: StatusCode, content_type: &'static str, body: Bytes) -> Resp
     Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, content_type)
+        .header(HEADER_IPC_PROTOCOL, IPC_PROTOCOL_VERSION_HEADER_VALUE)
+        .header(HEADER_VERSION, package_version())
+        .header(HEADER_BUILD, build_hash())
         .body(Full::new(body).boxed_unsync())
         .expect("control response is valid")
+}
+
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name)?.to_str().ok()
 }
 
 fn remove_stale_socket(socket_path: &Path) -> eyre::Result<()> {
@@ -420,6 +544,7 @@ mod tests {
     use crate::engine::actor::EngineCommand;
     use crate::types::{DaemonWriterId, OutboxId, WorkspaceId};
     use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn status_round_trips_through_engine_mailbox() -> eyre::Result<()> {
@@ -660,6 +785,103 @@ mod tests {
                 || error
                     .to_string()
                     .contains("handshake with daemon control socket"),
+            "unexpected error: {error:?}"
+        );
+        assert!(socket_link_path(&sync_root).exists());
+        assert!(socket_path.exists());
+
+        server.await?;
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&sync_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn daemon_rejects_request_without_client_metadata() -> eyre::Result<()> {
+        let sync_root =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&sync_root)?;
+        std::fs::create_dir(metadata_dir(&sync_root))?;
+        let writer_bytes = rand::random::<[u8; 16]>();
+
+        let daemon_row = daemon_state::Row {
+            workspace_id: WorkspaceId("0123456789abcdefghijklmnopqrstuv".to_string()),
+            s2_basin: "test-basin".parse()?,
+            s2_account_endpoint: None,
+            s2_basin_endpoint: None,
+            daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
+            stable_cursor: ..0,
+            next_outbox_id: OutboxId::new(0),
+        };
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+        let engine = tokio::spawn(async move {
+            assert!(
+                engine_rx.recv().await.is_none(),
+                "metadata rejection should not reach engine"
+            );
+        });
+        let token = CancellationToken::new();
+        let server = tokio::spawn({
+            let token = token.clone();
+            let config = ControlServerConfig {
+                sync_root: sync_root.clone(),
+                daemon_state: daemon_row,
+                engine_tx,
+            };
+            async move { serve_control(config, token).await }
+        });
+
+        wait_for_socket(&sync_root).await?;
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/status")
+            .header(hyper::header::HOST, "opbox")
+            .body(Empty::<Bytes>::new())?;
+        let (response, connection_task) = send_request(&sync_root, request).await?;
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(
+            header_value(response.headers(), HEADER_IPC_PROTOCOL),
+            Some(IPC_PROTOCOL_VERSION_HEADER_VALUE)
+        );
+
+        connection_task.abort();
+        token.cancel();
+        server.await??;
+        engine.await?;
+        let _ = std::fs::remove_dir_all(&sync_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_daemon_response_reports_metadata_error_without_unlinking_socket()
+    -> eyre::Result<()> {
+        let sync_root =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&sync_root)?;
+        std::fs::create_dir(metadata_dir(&sync_root))?;
+        let socket_path =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}.sock", rand::random::<u64>()));
+        let listener = UnixListener::bind(&socket_path)?;
+        std::os::unix::fs::symlink(&socket_path, socket_link_path(&sync_root))?;
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}",
+                    )
+                    .await;
+            }
+        });
+
+        let error = request_status(&sync_root)
+            .await
+            .expect_err("legacy daemon response should fail metadata validation");
+        assert!(
+            error
+                .to_string()
+                .contains("did not include opbox IPC metadata"),
             "unexpected error: {error:?}"
         );
         assert!(socket_link_path(&sync_root).exists());
