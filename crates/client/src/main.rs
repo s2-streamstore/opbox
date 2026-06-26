@@ -1,5 +1,6 @@
 use clap::builder::styling;
 use clap::{Parser, Subcommand, ValueEnum};
+use indicatif::{ProgressBar, ProgressStyle};
 use opbox_core::app::connectivity::{ConnectivityOverallState, LinkState, LinkStatus};
 use opbox_core::app::db::{open_database, semantic_pool};
 use opbox_core::app::ipc;
@@ -9,13 +10,14 @@ use opbox_core::app::s2::{
     s2_basin_from_config,
 };
 use opbox_core::app::user_config::{
-    UserConfig, UserConfigKey, load_user_config, save_user_config, user_config_path,
+    UserConfig, UserConfigKey, load_user_config, load_user_config_from_path, save_user_config,
+    save_user_config_to_path, user_config_path,
 };
 use opbox_core::app::workspace::{
     NotInWorkspace, canonicalize_existing_dir, create_metadata_dir, current_dir, daemon_log_path,
     ensure_clean_clone_root, ensure_sync_root_unconfigured, find_workspace_root,
     load_configured_daemon_state, pid_path, remove_pid, remove_socket_pointer,
-    remove_stale_socket_files, socket_link_path, storage_db_path,
+    remove_stale_socket_files, socket_link_path, storage_db_path, workspace_config_path,
 };
 use opbox_core::fs::fio::local::LocalFileIO;
 use opbox_core::fs::ignore::{IGNORE_FILE_NAME, default_ignore_file_contents};
@@ -55,21 +57,32 @@ struct Args {
 
 #[derive(Subcommand, Clone, Debug)]
 enum Command {
-    /// Manage user-wide opbox configuration.
-    #[command(subcommand)]
-    Config(ConfigCommand),
+    /// Manage opbox configuration.
+    Config {
+        /// Manage the current workspace config instead of the user-wide config.
+        #[arg(long)]
+        workspace: bool,
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
 
-    /// Initialize a new opbox workspace in the basin named by $S2_BASIN.
+    /// Initialize a new opbox workspace.
     /// Uses the $PWD unless a sync root is specified.
-    Init { sync_root: Option<PathBuf> },
+    Init {
+        #[command(flatten)]
+        config: WorkspaceConfigOverrides,
+        sync_root: Option<PathBuf>,
+    },
 
-    /// Clone an existing workspace from the basin named by $S2_BASIN.
+    /// Clone an existing workspace.
     Clone {
         #[arg(long)]
         workspace: WorkspaceId,
         /// Clone only shared log records at or before this RFC3339 timestamp.
         #[arg(long, value_name = "RFC3339")]
         as_of: Option<CloneAsOf>,
+        #[command(flatten)]
+        config: WorkspaceConfigOverrides,
         sync_root: Option<PathBuf>,
     },
 
@@ -94,9 +107,25 @@ enum Command {
     },
 }
 
+#[derive(clap::Args, Clone, Debug, Default)]
+struct WorkspaceConfigOverrides {
+    /// Persist a workspace-local basin override.
+    #[arg(long)]
+    basin: Option<String>,
+    /// Persist a workspace-local S2 access token override.
+    #[arg(long)]
+    access_token: Option<String>,
+    /// Persist a workspace-local S2 account endpoint override.
+    #[arg(long)]
+    account_endpoint: Option<String>,
+    /// Persist a workspace-local S2 basin endpoint override.
+    #[arg(long)]
+    basin_endpoint: Option<String>,
+}
+
 #[derive(Subcommand, Clone, Debug)]
 enum ConfigCommand {
-    /// Print the user config file path.
+    /// Print the config file path.
     Path,
 
     /// List configured values.
@@ -125,6 +154,7 @@ enum ConfigCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 #[clap(rename_all = "kebab-case")]
 enum ConfigKey {
+    Basin,
     #[value(alias = "default_basin")]
     DefaultBasin,
     #[value(alias = "access_token")]
@@ -133,15 +163,22 @@ enum ConfigKey {
     AccountEndpoint,
     #[value(alias = "basin_endpoint")]
     BasinEndpoint,
+    #[value(alias = "daemon_log_level")]
+    DaemonLogLevel,
+    #[value(alias = "client_log_level")]
+    ClientLogLevel,
 }
 
 impl ConfigKey {
     fn user_config_key(self) -> UserConfigKey {
         match self {
+            Self::Basin => UserConfigKey::Basin,
             Self::DefaultBasin => UserConfigKey::DefaultBasin,
             Self::AccessToken => UserConfigKey::AccessToken,
             Self::AccountEndpoint => UserConfigKey::AccountEndpoint,
             Self::BasinEndpoint => UserConfigKey::BasinEndpoint,
+            Self::DaemonLogLevel => UserConfigKey::DaemonLogLevel,
+            Self::ClientLogLevel => UserConfigKey::ClientLogLevel,
         }
     }
 }
@@ -197,15 +234,15 @@ impl FromStr for CloneAsOf {
     }
 }
 
-fn init_tracing() {
+fn init_tracing(client_log_level: Option<&str>) -> eyre::Result<()> {
     // The CLI communicates through stdout, not logs; default to warnings only.
-    // RUST_LOG still overrides for debugging.
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let filter = tracing_subscriber::EnvFilter::try_new(client_log_level.unwrap_or("warn"))
+        .map_err(|err| eyre::eyre!("invalid client-log-level: {err}"))?;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
         .try_init();
+    Ok(())
 }
 
 fn root_or_current(sync_root: Option<PathBuf>) -> eyre::Result<PathBuf> {
@@ -213,6 +250,10 @@ fn root_or_current(sync_root: Option<PathBuf>) -> eyre::Result<PathBuf> {
         Some(path) => Ok(path),
         None => current_dir(),
     }
+}
+
+fn save_workspace_config(root: &Path, config: &UserConfig) -> eyre::Result<()> {
+    save_user_config_to_path(config, &workspace_config_path(root))
 }
 
 fn fresh_daemon_state_row(
@@ -263,42 +304,83 @@ async fn create_initialized_database(
     Ok(())
 }
 
-fn optional_env(key: &str) -> eyre::Result<Option<String>> {
-    match std::env::var(key) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => eyre::bail!("{key} is not valid unicode"),
-    }
-}
-
-fn basin_from_config(user_config: &UserConfig) -> eyre::Result<BasinName> {
-    let value = optional_env("S2_BASIN")?
-        .or_else(|| user_config.default_basin.clone())
-        .ok_or_else(|| {
-            eyre::eyre!(
-                "S2_BASIN is not set and opbox user config has no default-basin; \
-                 run `ob config set default-basin <basin>` or export S2_BASIN"
-            )
-        })?;
+fn parse_basin_config_value(key: &str, value: &str) -> eyre::Result<BasinName> {
     value
         .parse()
-        .map_err(|err| eyre::eyre!("invalid basin {value:?}: {err}"))
+        .map_err(|err| eyre::eyre!("invalid {key} {value:?}: {err}"))
+}
+
+fn basin_from_config_stack(
+    workspace_config: &UserConfig,
+    user_config: &UserConfig,
+) -> eyre::Result<BasinName> {
+    if let Some(value) = &workspace_config.basin {
+        return parse_basin_config_value("basin", value);
+    }
+    if let Some(value) = &user_config.default_basin {
+        return parse_basin_config_value("default-basin", value);
+    }
+    eyre::bail!(
+        "no basin configured; run `ob config set default-basin <basin>` \
+         or pass `--basin <basin>`"
+    );
+}
+
+fn workspace_config_from_overrides(
+    overrides: &WorkspaceConfigOverrides,
+    user_config: &UserConfig,
+) -> eyre::Result<(UserConfig, BasinName, S2ConnectionConfig)> {
+    let mut workspace_config = UserConfig::default();
+    if let Some(value) = &overrides.basin {
+        validate_config_value(ConfigKey::Basin, value)?;
+        workspace_config.basin = Some(value.clone());
+    }
+    if let Some(value) = &overrides.access_token {
+        validate_config_value(ConfigKey::AccessToken, value)?;
+        workspace_config.access_token = Some(value.clone());
+    }
+    if let Some(value) = &overrides.account_endpoint {
+        validate_config_value(ConfigKey::AccountEndpoint, value)?;
+        workspace_config.account_endpoint = Some(value.clone());
+    }
+    if let Some(value) = &overrides.basin_endpoint {
+        validate_config_value(ConfigKey::BasinEndpoint, value)?;
+        workspace_config.basin_endpoint = Some(value.clone());
+    }
+
+    let basin = basin_from_config_stack(&workspace_config, user_config)?;
+    workspace_config.basin = Some(basin.as_ref().to_string());
+    let s2_connection = S2ConnectionConfig::from_workspace_or_user_config(
+        &workspace_config,
+        None,
+        None,
+        user_config,
+    )?;
+    Ok((workspace_config, basin, s2_connection))
 }
 
 async fn bootstrap_init(
     sync_root: Option<PathBuf>,
     user_config: &UserConfig,
+    overrides: &WorkspaceConfigOverrides,
+    progress: &BootstrapProgress,
 ) -> eyre::Result<Bootstrap> {
-    let basin = basin_from_config(user_config)?;
-    let s2_connection = S2ConnectionConfig::from_env_or_user_config(user_config)?;
+    progress.set("resolving configuration");
+    let (workspace_config, basin, s2_connection) =
+        workspace_config_from_overrides(overrides, user_config)?;
+    progress.set("checking workspace root");
     let sync_root = canonicalize_existing_dir(&root_or_current(sync_root)?)?;
     ensure_sync_root_unconfigured(&sync_root).await?;
+    progress.set(format!("connecting to basin {}", basin.as_ref()));
     let s2_basin = s2_basin_from_config(basin.clone(), &s2_connection).await?;
     let workspace_id = WorkspaceId::generate();
     debug!(?workspace_id, "generated workspace id");
+    progress.set("creating shared log stream");
     create_workspace_stream(&s2_basin, &workspace_id).await?;
     let daemon_row = fresh_daemon_state_row(workspace_id, basin, &s2_connection);
+    progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
+    save_workspace_config(&sync_root, &workspace_config)?;
     create_default_ignore_file(&sync_root)?;
     create_initialized_database(&sync_root, &daemon_row).await?;
     Ok(Bootstrap {
@@ -316,19 +398,27 @@ async fn bootstrap_clone(
     sync_root: Option<PathBuf>,
     clone_log_read_stop: Option<LogReadStop>,
     user_config: &UserConfig,
+    overrides: &WorkspaceConfigOverrides,
+    progress: &BootstrapProgress,
 ) -> eyre::Result<Bootstrap> {
-    let basin = basin_from_config(user_config)?;
-    let s2_connection = S2ConnectionConfig::from_env_or_user_config(user_config)?;
+    progress.set("resolving configuration");
+    let (workspace_config, basin, s2_connection) =
+        workspace_config_from_overrides(overrides, user_config)?;
+    progress.set("checking destination");
     let requested_root = root_or_current(sync_root)?;
     if requested_root.try_exists()? && requested_root.is_dir() {
         ensure_sync_root_unconfigured(&requested_root).await?;
     }
     let sync_root = ensure_clean_clone_root(&requested_root)?;
     ensure_sync_root_unconfigured(&sync_root).await?;
+    progress.set(format!("connecting to basin {}", basin.as_ref()));
     let s2_basin = s2_basin_from_config(basin.clone(), &s2_connection).await?;
+    progress.set("checking shared log stream");
     ensure_workspace_stream_exists(&s2_basin, &workspace).await?;
     let daemon_row = fresh_daemon_state_row(workspace, basin, &s2_connection);
+    progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
+    save_workspace_config(&sync_root, &workspace_config)?;
     create_initialized_database(&sync_root, &daemon_row).await?;
     Ok(Bootstrap {
         mode: RunMode::Clone,
@@ -340,12 +430,17 @@ async fn bootstrap_clone(
     })
 }
 
-async fn run_bootstrap(bootstrap: Bootstrap) -> eyre::Result<()> {
+async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> eyre::Result<()> {
     let mode = bootstrap.mode;
     let sync_root = bootstrap.sync_root.clone();
     let workspace_id = bootstrap.daemon_row.workspace_id.clone();
     let basin = bootstrap.daemon_row.s2_basin.clone();
 
+    progress.set(match mode {
+        RunMode::Init => "uploading initial workspace snapshot",
+        RunMode::Clone => "downloading shared log and materializing files",
+        RunMode::Sync => unreachable!("bootstrap never runs in sync mode"),
+    });
     let db = open_database(&bootstrap.db_path).await?;
     let pool = semantic_pool(db).await?;
     let semantic_service = SemanticService::new(pool);
@@ -365,9 +460,11 @@ async fn run_bootstrap(bootstrap: Bootstrap) -> eyre::Result<()> {
     .await?;
 
     if mode == RunMode::Clone {
+        progress.set("writing local ignore rules");
         create_default_ignore_file(&sync_root)?;
     }
 
+    progress.finish();
     let style = CliStyle::for_stdout();
     let title = match mode {
         RunMode::Init => "initialized opbox workspace",
@@ -633,6 +730,51 @@ fn short_id(value: &str) -> &str {
     if value.len() <= 8 { value } else { &value[..8] }
 }
 
+struct BootstrapProgress {
+    bar: Option<ProgressBar>,
+}
+
+impl BootstrapProgress {
+    fn new(mode: RunMode) -> eyre::Result<Self> {
+        if !std::io::stderr().is_terminal() {
+            return Ok(Self { bar: None });
+        }
+
+        let bar = ProgressBar::new_spinner();
+        let template = if std::env::var_os("NO_COLOR").is_some() {
+            "{spinner} {prefix} {msg}"
+        } else {
+            "{spinner:.green} {prefix:.cyan} {msg}"
+        };
+        bar.set_style(ProgressStyle::with_template(template)?);
+        bar.set_prefix(match mode {
+            RunMode::Init => "init",
+            RunMode::Clone => "clone",
+            RunMode::Sync => unreachable!("bootstrap never runs in sync mode"),
+        });
+        bar.enable_steady_tick(Duration::from_millis(120));
+        Ok(Self { bar: Some(bar) })
+    }
+
+    fn set(&self, message: impl Into<String>) {
+        if let Some(bar) = &self.bar {
+            bar.set_message(message.into());
+        }
+    }
+
+    fn finish(&self) {
+        if let Some(bar) = &self.bar {
+            bar.finish_and_clear();
+        }
+    }
+}
+
+impl Drop for BootstrapProgress {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CliStyle {
     enabled: bool,
@@ -764,6 +906,104 @@ fn retry_after_text(status: &LinkStatus, now: time::OffsetDateTime) -> Option<St
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigScope {
+    Global,
+    Workspace,
+}
+
+impl ConfigScope {
+    fn from_workspace_flag(workspace: bool) -> Self {
+        if workspace {
+            Self::Workspace
+        } else {
+            Self::Global
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Global => "user config",
+            Self::Workspace => "workspace config",
+        }
+    }
+
+    fn keys(self) -> &'static [ConfigKey] {
+        match self {
+            Self::Global => &[
+                ConfigKey::DefaultBasin,
+                ConfigKey::AccessToken,
+                ConfigKey::AccountEndpoint,
+                ConfigKey::BasinEndpoint,
+                ConfigKey::DaemonLogLevel,
+                ConfigKey::ClientLogLevel,
+            ],
+            Self::Workspace => &[
+                ConfigKey::Basin,
+                ConfigKey::AccessToken,
+                ConfigKey::AccountEndpoint,
+                ConfigKey::BasinEndpoint,
+                ConfigKey::DaemonLogLevel,
+            ],
+        }
+    }
+
+    fn contains(self, key: ConfigKey) -> bool {
+        self.keys().contains(&key)
+    }
+}
+
+fn config_scope_path(scope: ConfigScope) -> eyre::Result<PathBuf> {
+    match scope {
+        ConfigScope::Global => user_config_path(),
+        ConfigScope::Workspace => {
+            let root = find_workspace_root(&current_dir()?)?;
+            Ok(workspace_config_path(&root))
+        }
+    }
+}
+
+fn load_scoped_config(scope: ConfigScope) -> eyre::Result<(UserConfig, PathBuf)> {
+    let path = config_scope_path(scope)?;
+    Ok((load_user_config_from_path(&path)?, path))
+}
+
+fn save_scoped_config(scope: ConfigScope, config: &UserConfig) -> eyre::Result<PathBuf> {
+    let path = config_scope_path(scope)?;
+    match scope {
+        ConfigScope::Global => save_user_config(config).map(|_| path),
+        ConfigScope::Workspace => {
+            save_user_config_to_path(config, &path)?;
+            Ok(path)
+        }
+    }
+}
+
+fn ensure_config_key_allowed(scope: ConfigScope, key: ConfigKey) -> eyre::Result<()> {
+    if scope.contains(key) {
+        return Ok(());
+    }
+
+    match scope {
+        ConfigScope::Global if key == ConfigKey::Basin => {
+            eyre::bail!("basin is workspace-local; use `ob config --workspace set basin <basin>`")
+        }
+        ConfigScope::Workspace if key == ConfigKey::DefaultBasin => {
+            eyre::bail!("default-basin is user-wide; use `ob config set default-basin <basin>`")
+        }
+        ConfigScope::Workspace if key == ConfigKey::ClientLogLevel => {
+            eyre::bail!(
+                "client-log-level is user-wide; use `ob config set client-log-level <filter>`"
+            )
+        }
+        _ => eyre::bail!(
+            "{} is not supported in {}",
+            key.user_config_key().as_str(),
+            scope.label()
+        ),
+    }
+}
+
 fn validate_config_value(key: ConfigKey, value: &str) -> eyre::Result<()> {
     if value.is_empty() {
         eyre::bail!("{} cannot be empty", key.user_config_key().as_str());
@@ -773,10 +1013,8 @@ fn validate_config_value(key: ConfigKey, value: &str) -> eyre::Result<()> {
     }
 
     match key {
-        ConfigKey::DefaultBasin => {
-            value
-                .parse::<BasinName>()
-                .map_err(|err| eyre::eyre!("invalid default-basin {value:?}: {err}"))?;
+        ConfigKey::Basin | ConfigKey::DefaultBasin => {
+            parse_basin_config_value(key.user_config_key().as_str(), value)?;
         }
         ConfigKey::AccessToken => {}
         ConfigKey::AccountEndpoint => {
@@ -786,6 +1024,14 @@ fn validate_config_value(key: ConfigKey, value: &str) -> eyre::Result<()> {
         ConfigKey::BasinEndpoint => {
             BasinEndpoint::new(value)
                 .map_err(|err| eyre::eyre!("invalid basin-endpoint {value:?}: {err}"))?;
+        }
+        ConfigKey::DaemonLogLevel | ConfigKey::ClientLogLevel => {
+            tracing_subscriber::EnvFilter::try_new(value).map_err(|err| {
+                eyre::eyre!(
+                    "invalid {} {value:?}: {err}",
+                    key.user_config_key().as_str()
+                )
+            })?;
         }
     }
 
@@ -800,41 +1046,47 @@ fn config_display_value(key: UserConfigKey, value: &str, reveal_secret: bool) ->
     }
 }
 
-fn run_config(command: ConfigCommand) -> eyre::Result<()> {
+fn run_config(workspace: bool, command: ConfigCommand) -> eyre::Result<()> {
+    let scope = ConfigScope::from_workspace_flag(workspace);
     match command {
         ConfigCommand::Path => {
-            println!("{}", user_config_path()?.display());
+            println!("{}", config_scope_path(scope)?.display());
         }
         ConfigCommand::List => {
-            let config = load_user_config()?;
-            for (key, value) in config.entries() {
-                println!(
-                    "{} = {}",
-                    key.as_str(),
-                    config_display_value(key, value, false)
-                );
+            let (config, _) = load_scoped_config(scope)?;
+            for key in scope.keys().iter().copied().map(ConfigKey::user_config_key) {
+                if let Some(value) = config.get(key) {
+                    println!(
+                        "{} = {}",
+                        key.as_str(),
+                        config_display_value(key, value, false)
+                    );
+                }
             }
         }
         ConfigCommand::Get { key } => {
-            let config = load_user_config()?;
+            ensure_config_key_allowed(scope, key)?;
+            let (config, _) = load_scoped_config(scope)?;
             let key = key.user_config_key();
             if let Some(value) = config.get(key) {
                 println!("{}", config_display_value(key, value, true));
             }
         }
         ConfigCommand::Set { key, value } => {
+            ensure_config_key_allowed(scope, key)?;
             validate_config_value(key, &value)?;
-            let mut config = load_user_config()?;
+            let (mut config, _) = load_scoped_config(scope)?;
             let user_key = key.user_config_key();
             config.set(user_key, value);
-            let path = save_user_config(&config)?;
+            let path = save_scoped_config(scope, &config)?;
             println!("set {} in {}", user_key.as_str(), path.display());
         }
         ConfigCommand::Unset { key } => {
-            let mut config = load_user_config()?;
+            ensure_config_key_allowed(scope, key)?;
+            let (mut config, _) = load_scoped_config(scope)?;
             let user_key = key.user_config_key();
             config.unset(user_key);
-            let path = save_user_config(&config)?;
+            let path = save_scoped_config(scope, &config)?;
             println!("unset {} in {}", user_key.as_str(), path.display());
         }
     }
@@ -1131,36 +1383,51 @@ fn daemon_command(root: &Path) -> eyre::Result<TokioCommand> {
 
 #[tokio::main]
 async fn main() {
-    init_tracing();
+    let args = Args::parse();
+    let tracing_config = load_user_config().ok();
+    let client_log_level = match &args.command {
+        Command::Config { .. } => None,
+        _ => tracing_config
+            .as_ref()
+            .and_then(|config| config.client_log_level.as_deref()),
+    };
+    if let Err(error) = init_tracing(client_log_level) {
+        render_error(&error);
+        std::process::exit(1);
+    }
 
-    let result = match Args::parse().command {
-        Command::Config(command) => run_config(command),
-        Command::Init { sync_root } => with_failure_banner(
+    let result = match args.command {
+        Command::Config { workspace, command } => run_config(workspace, command),
+        Command::Init { config, sync_root } => with_failure_banner(
             "init",
             async {
+                let progress = BootstrapProgress::new(RunMode::Init)?;
                 let user_config = load_user_config()?;
-                run_bootstrap(bootstrap_init(sync_root, &user_config).await?).await
+                let bootstrap = bootstrap_init(sync_root, &user_config, &config, &progress).await?;
+                run_bootstrap(bootstrap, &progress).await
             }
             .await,
         ),
         Command::Clone {
             workspace,
             as_of,
+            config,
             sync_root,
         } => with_failure_banner(
             "clone",
             async {
+                let progress = BootstrapProgress::new(RunMode::Clone)?;
                 let user_config = load_user_config()?;
-                run_bootstrap(
-                    bootstrap_clone(
-                        workspace,
-                        sync_root,
-                        as_of.map(CloneAsOf::log_read_stop),
-                        &user_config,
-                    )
-                    .await?,
+                let bootstrap = bootstrap_clone(
+                    workspace,
+                    sync_root,
+                    as_of.map(CloneAsOf::log_read_stop),
+                    &user_config,
+                    &config,
+                    &progress,
                 )
-                .await
+                .await?;
+                run_bootstrap(bootstrap, &progress).await
             }
             .await,
         ),
@@ -1179,7 +1446,7 @@ async fn main() {
 
 /// Render CLI failures for humans: known situations get guidance, everything
 /// else gets a single `error:` line with the cause chain (no report/Location
-/// noise; set RUST_LOG for diagnostics).
+/// noise; set client-log-level or daemon-log-level for diagnostics).
 fn render_error(error: &eyre::Report) {
     let style = CliStyle::for_stderr();
     if let Some(not_in_workspace) = error.downcast_ref::<NotInWorkspace>() {

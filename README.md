@@ -50,17 +50,24 @@ spying on opbox workspace e4wtker801s559vp97drk6xbnfkq6ez7 (pid 41152)
 
 ### configuration
 
-You can override selected daemon environment values by creating a `.opbox/env` file in your workspace root. The file is read by the daemon at startup and is never written by `ob`.
-
-This is also useful for increasing the log level of the daemon:
+`ob config` manages typed opbox configuration. By default it writes user-wide defaults, such as the S2 access token and default basin:
 
 ```bash
-# in workspace root
-echo "RUST_LOG=opbox_core=trace,opbox_daemon=trace,info" >> .opbox/env
+ob config set access-token "MY_TOKEN"
+ob config set default-basin "MY_BASIN"
+```
 
-# restart the daemon
+You can override selected values for just the current workspace:
+
+```bash
+ob config --workspace set basin "WORKSPACE_BASIN"
+ob config --workspace set daemon-log-level "opbox_core=trace,opbox_daemon=trace,info"
+```
+
+Workspace config lives in `.opbox/config.toml` and takes precedence over the user-wide config for that workspace. Restart the daemon after changing daemon settings:
+
+```bash
 ob stop && ob start
 
-# tail the log file
 ob logs --follow
 ```
