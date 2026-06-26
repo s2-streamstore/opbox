@@ -55,6 +55,7 @@ pub struct SemanticDebugSnapshot {
     pub stable_paths: BTreeMap<String, ObjectId>,
     pub outbox_rows: u64,
     pub outbox_inflight_rows: u64,
+    pub ignored_files_count: u64,
 }
 
 impl SemanticService {
@@ -82,11 +83,13 @@ impl SemanticService {
                     .collect();
                 let outbox_rows = tx.count_table("outbox").await?;
                 let outbox_inflight_rows = tx.count_outbox_inflight().await?;
+                let ignored_files_count = tx.count_table("ignored_files").await?;
                 Ok(SemanticDebugSnapshot {
                     prior_live_paths,
                     stable_paths,
                     outbox_rows,
                     outbox_inflight_rows,
+                    ignored_files_count,
                 })
             })
         })
@@ -140,6 +143,12 @@ impl SemanticService {
                     ));
                 }
 
+                let ignored = tx.select_all_ignored_files().await?;
+                let ignored_map: BTreeMap<_, _> = ignored
+                    .into_iter()
+                    .map(|row| (row.path, row.stat))
+                    .collect();
+
                 let mut actions = Vec::new();
                 let mut next_seq = 0;
                 for entry in scan.tree.entries() {
@@ -148,6 +157,11 @@ impl SemanticService {
                             // not handled
                         }
                         TreeEntryKind::File { fingerprint } => {
+                            if let Some(ignored_stat) = ignored_map.get(&entry.path) {
+                                if fingerprint.stat() == ignored_stat {
+                                    continue;
+                                }
+                            }
                             let action_id = ImportActionId::new(epoch, next_seq);
                             next_seq += 1;
                             actions.push(ImportAction {
@@ -196,6 +210,16 @@ impl SemanticService {
                     }
                 }
 
+                // Load ignored file entries within this scan's scope so we can
+                // skip files whose stat fingerprint hasn't changed since the
+                // last failed import attempt.
+                let ignored = tx.select_all_ignored_files().await?;
+                let ignored_in_scope: BTreeMap<_, _> = ignored
+                    .into_iter()
+                    .filter(|row| scan.scope.contains_path(&row.path))
+                    .map(|row| (row.path, row.stat))
+                    .collect();
+
                 let mut actions = Vec::new();
                 let mut missing_prior = Vec::new();
                 let mut next_seq = 0;
@@ -208,6 +232,13 @@ impl SemanticService {
                         None => missing_prior.push(prior),
                         Some(observed) if observed.stat() == prior.fingerprint.stat() => {}
                         Some(observed) => {
+                            // If the file's current stat matches a known ignored
+                            // entry, skip re-reading (e.g. text→binary overwrite).
+                            if let Some(ignored_stat) = ignored_in_scope.get(&prior.path) {
+                                if observed.stat() == ignored_stat {
+                                    continue;
+                                }
+                            }
                             let action_id = ImportActionId::new(epoch, next_seq);
                             next_seq += 1;
                             actions.push(ImportAction {
@@ -222,6 +253,13 @@ impl SemanticService {
                 }
 
                 for (path, fingerprint) in observed_files {
+                    // If this file was previously ignored and its stat
+                    // fingerprint hasn't changed, skip it — no point re-reading.
+                    if let Some(ignored_stat) = ignored_in_scope.get(&path) {
+                        if fingerprint.stat() == ignored_stat {
+                            continue;
+                        }
+                    }
                     let action_id = ImportActionId::new(epoch, next_seq);
                     next_seq += 1;
                     actions.push(ImportAction {
@@ -231,6 +269,17 @@ impl SemanticService {
                             expected_fingerprint: fingerprint,
                         },
                     });
+                }
+
+                // Clean up ignored_files entries for files that have been
+                // deleted from disk (no longer in the scan result).
+                for (ignored_path, _) in &ignored_in_scope {
+                    // If the path wasn't observed in the scan AND isn't in
+                    // prior_tree (already handled by missing_prior), remove it.
+                    // We simply check whether the scan tree contains it.
+                    if !scan.tree.entries().iter().any(|e| &e.path == ignored_path) {
+                        tx.delete_ignored_file(ignored_path).await?;
+                    }
                 }
 
                 let delete_outbox_messages =
@@ -264,16 +313,36 @@ impl SemanticService {
         let decision = prepare_import_action_stage(context, result)?;
         let action_id = decision.action_id();
 
-        if let ImportActionStageDecision::Stage(plan) = decision {
-            let plan = Arc::new(plan);
-            self.exec_tx("commit_import_action", move |tx| {
-                let plan = plan.clone();
-                Box::pin(async move {
-                    stage_import_action_tx(tx, &plan).await?;
-                    Ok(())
+        match decision {
+            ImportActionStageDecision::Stage(plan) => {
+                let plan = Arc::new(plan);
+                self.exec_tx("commit_import_action", move |tx| {
+                    let plan = plan.clone();
+                    Box::pin(async move {
+                        stage_import_action_tx(tx, &plan).await?;
+                        // Clear any prior ignored entry for this path on
+                        // successful stage (file content changed to valid UTF-8).
+                        tx.delete_ignored_file(&plan.path).await?;
+                        Ok(())
+                    })
                 })
-            })
-            .await?;
+                .await?;
+            }
+            ImportActionStageDecision::IgnorePersist {
+                path, stat, reason, ..
+            } => {
+                let now = time::OffsetDateTime::now_utc();
+                self.exec_tx("persist_ignored_file", move |tx| {
+                    let path = path.clone();
+                    let stat = stat.clone();
+                    Box::pin(async move {
+                        tx.upsert_ignored_file(&path, reason, &stat, now).await?;
+                        Ok(())
+                    })
+                })
+                .await?;
+            }
+            ImportActionStageDecision::Ignore { .. } => {}
         }
 
         Ok(CommitImportActionOutcome { action_id })
@@ -1593,14 +1662,23 @@ struct ImportActionStagePlan {
 
 enum ImportActionStageDecision {
     Stage(ImportActionStagePlan),
-    Ignore { action_id: ImportActionId },
+    Ignore {
+        action_id: ImportActionId,
+    },
+    IgnorePersist {
+        action_id: ImportActionId,
+        path: crate::fs::types::RelativePath,
+        stat: crate::fs::types::FileStatFingerprint,
+        reason: crate::semantic::table::ignored_files::Reason,
+    },
 }
 
 impl ImportActionStageDecision {
     fn action_id(&self) -> ImportActionId {
         match self {
             ImportActionStageDecision::Stage(plan) => plan.action_id,
-            ImportActionStageDecision::Ignore { action_id } => *action_id,
+            ImportActionStageDecision::Ignore { action_id }
+            | ImportActionStageDecision::IgnorePersist { action_id, .. } => *action_id,
         }
     }
 }
@@ -1642,7 +1720,12 @@ fn prepare_import_action_stage(
                             error = %err,
                             "ignoring non-UTF-8 file during import"
                         );
-                        return Ok(ImportActionStageDecision::Ignore { action_id });
+                        return Ok(ImportActionStageDecision::IgnorePersist {
+                            action_id,
+                            path,
+                            stat: fingerprint.stat().clone(),
+                            reason: crate::semantic::table::ignored_files::Reason::NonUtf8,
+                        });
                     }
                 };
 
@@ -2067,7 +2150,7 @@ mod tests {
                 read_result(action_id, b"\x00\x01\xff\xfe\x80"),
             )?;
             assert!(
-                matches!(decision, ImportActionStageDecision::Ignore { .. }),
+                matches!(decision, ImportActionStageDecision::IgnorePersist { .. }),
                 "{epoch_kind:?} import must ignore non-UTF-8 content"
             );
         }

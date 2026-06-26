@@ -1254,6 +1254,99 @@ impl<'a> SemanticTransaction<'a> {
         Ok(())
     }
 
+    // -- ignored_files -----------------------------------------------------------
+
+    pub async fn select_ignored_file(
+        &self,
+        path: &RelativePath,
+    ) -> Result<Option<super::table::ignored_files::Row>, SemanticTransactionError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT path, reason, file_key, size_bytes, mtime_ns, ignored_at_ns
+                 FROM ignored_files
+                 WHERE path = ?1",
+                (path.to_db_path(),),
+            )
+            .await?;
+
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        Ok(Some(super::table::ignored_files::Row::from_sql_row(&row)?))
+    }
+
+    pub async fn select_all_ignored_files(
+        &self,
+    ) -> Result<Vec<super::table::ignored_files::Row>, SemanticTransactionError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT path, reason, file_key, size_bytes, mtime_ns, ignored_at_ns
+                 FROM ignored_files
+                 ORDER BY path ASC",
+                (),
+            )
+            .await?;
+
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await? {
+            result.push(super::table::ignored_files::Row::from_sql_row(&row)?);
+        }
+        Ok(result)
+    }
+
+    pub async fn upsert_ignored_file(
+        &self,
+        path: &RelativePath,
+        reason: super::table::ignored_files::Reason,
+        stat: &crate::fs::types::FileStatFingerprint,
+        ignored_at: OffsetDateTime,
+    ) -> Result<(), SemanticTransactionError> {
+        let mtime_ns = datetime_to_unix_ns("ignored_files.mtime", stat.mtime)?;
+        let ignored_at_ns = datetime_to_unix_ns("ignored_files.ignored_at", ignored_at)?;
+        self.conn
+            .execute(
+                "INSERT INTO ignored_files (path, reason, file_key, size_bytes, mtime_ns, ignored_at_ns)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(path) DO UPDATE SET
+                     reason = excluded.reason,
+                     file_key = excluded.file_key,
+                     size_bytes = excluded.size_bytes,
+                     mtime_ns = excluded.mtime_ns,
+                     ignored_at_ns = excluded.ignored_at_ns",
+                (
+                    path.to_db_path(),
+                    reason.as_str(),
+                    stat.file_key.encode(),
+                    i64::try_from(stat.size).map_err(|err| {
+                        SemanticTransactionError::InvariantViolation(format!(
+                            "ignored_files.size_bytes out of range: {err}"
+                        ))
+                    })?,
+                    mtime_ns,
+                    ignored_at_ns,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_ignored_file(
+        &self,
+        path: &RelativePath,
+    ) -> Result<(), SemanticTransactionError> {
+        self.conn
+            .execute(
+                "DELETE FROM ignored_files WHERE path = ?1",
+                (path.to_db_path(),),
+            )
+            .await?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------
+
     pub async fn count_table(&self, table: &'static str) -> Result<u64, SemanticTransactionError> {
         let sql = match table {
             "objects" => "SELECT COUNT(*) FROM objects",
@@ -1265,6 +1358,7 @@ impl<'a> SemanticTransaction<'a> {
             "prior_tree" => "SELECT COUNT(*) FROM prior_tree",
             "import_staged_files" => "SELECT COUNT(*) FROM import_staged_files",
             "outbox" => "SELECT COUNT(*) FROM outbox",
+            "ignored_files" => "SELECT COUNT(*) FROM ignored_files",
             _ => {
                 return Err(SemanticTransactionError::InvariantViolation(format!(
                     "unsupported table count: {table}"

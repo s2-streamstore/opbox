@@ -177,6 +177,7 @@ enum Workload {
     TransientHighPacketLoss,
     SustainedEditingStress,
     DeleteWhileOffline,
+    BinaryFileIgnore,
 }
 
 impl Workload {
@@ -307,6 +308,9 @@ fn run_single(args: SingleArgs) -> eyre::Result<()> {
         }
         Workload::DeleteWhileOffline => {
             run_delete_while_offline_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::BinaryFileIgnore => {
+            run_binary_file_ignore_workload(&mut sim, seed, args.common.max_steps)?
         }
     }
 
@@ -1109,6 +1113,72 @@ fn run_clear_before_quiescence_workload(
         .await?;
 
         println!("SIM_OK workload=clear-before-quiescence seed={seed}");
+        daemon_a.shutdown().await;
+        daemon_b.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
+fn run_binary_file_ignore_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000014".to_string());
+    let daemon_a = spawn_daemon(sim, "daemon-a", 0, workspace_id.clone())?;
+    let daemon_b = spawn_daemon(sim, "daemon-b", 1, workspace_id)?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        let path = "data.bin";
+
+        // Write a binary file (invalid UTF-8) from daemon B.
+        let binary_content: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x01, 0x80, 0x81, 0xAB, 0xCD];
+        daemon_b
+            .write_file(path, Bytes::from(binary_content))
+            .await?;
+
+        // Allow several scan cycles to run. The daemon should NOT enter an
+        // infinite retry loop — the file should land in the ignored_files table.
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        // Verify the binary file is tracked as ignored on daemon B.
+        let debug_b = daemon_b.semantic_debug_snapshot().await?;
+        assert!(
+            debug_b.ignored_files_count >= 1,
+            "expected ignored_files_count >= 1 on daemon B, got {}",
+            debug_b.ignored_files_count
+        );
+
+        // The binary file should NOT appear in daemon A's text snapshot (it was
+        // never successfully imported, so it was never synced).
+        let files_a = daemon_a.snapshot_utf8_text_files().await?;
+        assert!(
+            !files_a.contains_key(path),
+            "binary file should not sync to daemon A"
+        );
+
+        // Now overwrite the binary file with valid UTF-8 text content.
+        let text_content = format!("hello from seed {seed}\n");
+        daemon_b
+            .replace_file_contents(path, Bytes::from(text_content.clone()))
+            .await?;
+
+        // The fingerprint changed, so the daemon should retry the import and
+        // succeed. Both daemons should converge on the text content.
+        wait_for_text_files(
+            &daemon_a,
+            &daemon_b,
+            &BTreeMap::from([(path.to_string(), text_content)]),
+            steps,
+        )
+        .await?;
+
+        println!("SIM_OK workload=binary-file-ignore seed={seed}");
         daemon_a.shutdown().await;
         daemon_b.shutdown().await;
         Ok(())
@@ -2994,6 +3064,9 @@ async fn run_daemon_client(
                     SimDaemonCommand::SnapshotTextFiles { reply } => {
                         let _ = reply.send(file_io.snapshot_text_files().map_err(|err| err.to_string()));
                     }
+                    SimDaemonCommand::SnapshotUtf8TextFiles { reply } => {
+                        let _ = reply.send(file_io.snapshot_utf8_text_files());
+                    }
                     SimDaemonCommand::Stats { reply } => {
                         let _ = reply.send(file_io.stats());
                     }
@@ -3175,6 +3248,17 @@ impl SimDaemonHandle {
             .await
             .map_err(io_err)?;
         recv.await.map_err(io_err)?.map_err(io_err)
+    }
+
+    async fn snapshot_utf8_text_files(
+        &self,
+    ) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+        let (reply, recv) = oneshot::channel();
+        self.command_tx
+            .send(SimDaemonCommand::SnapshotUtf8TextFiles { reply })
+            .await
+            .map_err(io_err)?;
+        Ok(recv.await.map_err(io_err)?)
     }
 
     async fn stats(&self) -> Result<InMemoryFileIOStats, Box<dyn std::error::Error>> {
@@ -3361,6 +3445,9 @@ enum SimDaemonCommand {
     },
     SnapshotTextFiles {
         reply: oneshot::Sender<Result<BTreeMap<String, String>, String>>,
+    },
+    SnapshotUtf8TextFiles {
+        reply: oneshot::Sender<BTreeMap<String, String>>,
     },
     Stats {
         reply: oneshot::Sender<InMemoryFileIOStats>,

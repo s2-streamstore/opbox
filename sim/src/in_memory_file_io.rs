@@ -188,6 +188,19 @@ impl InMemoryFileIO {
             .collect()
     }
 
+    pub fn snapshot_utf8_text_files(&self) -> BTreeMap<String, String> {
+        let state = self.state.lock().expect("in-memory file io poisoned");
+        state
+            .files
+            .iter()
+            .filter_map(|(path, entry)| {
+                String::from_utf8(entry.bytes.to_vec())
+                    .ok()
+                    .map(|content| (path.to_string(), content))
+            })
+            .collect()
+    }
+
     pub fn stats(&self) -> InMemoryFileIOStats {
         let state = self.state.lock().expect("in-memory file io poisoned");
         state.stats

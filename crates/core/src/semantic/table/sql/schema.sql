@@ -181,6 +181,23 @@ CREATE TABLE IF NOT EXISTS outbox (
 CREATE INDEX IF NOT EXISTS outbox_object_id_idx
     ON outbox(object_id);
 
+-- Persistently ignored files: tracks files that failed import for a known
+-- reason (e.g. non-UTF-8 content). The stat fingerprint (file_key, size_bytes,
+-- mtime_ns) records the file state at the time of the last failure. A
+-- subsequent scan only retries the file if its stat fingerprint has changed,
+-- avoiding expensive re-reads of large binary files on every scan cycle.
+CREATE TABLE IF NOT EXISTS ignored_files (
+    path        TEXT PRIMARY KEY,
+    reason      TEXT NOT NULL CHECK (reason IN ('non_utf8')),
+    file_key    TEXT NOT NULL,
+    size_bytes  INTEGER NOT NULL CHECK (size_bytes >= 0),
+    mtime_ns    INTEGER NOT NULL,
+    ignored_at_ns INTEGER NOT NULL,
+
+    CHECK (path <> ''),
+    CHECK (file_key <> '')
+);
+
 -- Daemon-wide durable state.
 CREATE TABLE IF NOT EXISTS daemon_state (
     id             INTEGER PRIMARY KEY CHECK (id = 1),

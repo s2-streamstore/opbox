@@ -86,6 +86,10 @@ impl FaultInjectingFileIO {
         self.inner.snapshot_text_files()
     }
 
+    pub fn snapshot_utf8_text_files(&self) -> std::collections::BTreeMap<String, String> {
+        self.inner.snapshot_utf8_text_files()
+    }
+
     pub fn stats(&self) -> InMemoryFileIOStats {
         let state = self.state.lock().expect("fault-injecting file io poisoned");
         self.inner.stats().combine(state.stats)
