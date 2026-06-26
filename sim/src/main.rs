@@ -3491,11 +3491,8 @@ fn run_partition_both_daemons_workload(
         wait_for_connectivity_online(&daemon_a, steps).await?;
         wait_for_connectivity_online(&daemon_b, steps).await?;
 
-        let expected_markers: Vec<String> = a_markers
-            .iter()
-            .chain(b_markers.iter())
-            .cloned()
-            .collect();
+        let expected_markers: Vec<String> =
+            a_markers.iter().chain(b_markers.iter()).cloned().collect();
         let final_text =
             wait_for_shared_text_with_markers(&daemon_a, &daemon_b, path, &expected_markers, steps)
                 .await?;
@@ -3637,11 +3634,8 @@ fn run_asymmetric_partition_workload(
 
         wait_for_connectivity_online(&daemon_b, steps).await?;
 
-        let expected_markers: Vec<String> = a_markers
-            .iter()
-            .chain(b_markers.iter())
-            .cloned()
-            .collect();
+        let expected_markers: Vec<String> =
+            a_markers.iter().chain(b_markers.iter()).cloned().collect();
         let final_text =
             wait_for_shared_text_with_markers(&daemon_a, &daemon_b, path, &expected_markers, steps)
                 .await?;
@@ -3705,9 +3699,7 @@ fn run_partition_during_projection_workload(
         wait_for_outbox_empty(&daemon_a, steps).await?;
         wait_for_outbox_empty(&daemon_b, steps).await?;
 
-        println!(
-            "SIM_OK workload=partition-during-projection seed={seed} files={file_count}",
-        );
+        println!("SIM_OK workload=partition-during-projection seed={seed} files={file_count}",);
         daemon_a.shutdown().await;
         daemon_b.shutdown().await;
         Ok(())
@@ -3768,11 +3760,8 @@ fn run_message_hold_and_release_workload(
         // Release all paused messages at once
         turmoil::release("daemon-b", "s2-lite");
 
-        let expected_markers: Vec<String> = a_markers
-            .iter()
-            .chain(b_markers.iter())
-            .cloned()
-            .collect();
+        let expected_markers: Vec<String> =
+            a_markers.iter().chain(b_markers.iter()).cloned().collect();
         let final_text =
             wait_for_shared_text_with_markers(&daemon_a, &daemon_b, path, &expected_markers, steps)
                 .await?;
