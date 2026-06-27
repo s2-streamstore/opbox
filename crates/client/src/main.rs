@@ -53,7 +53,11 @@ const STYLES: styling::Styles = styling::Styles::styled()
     .placeholder(styling::AnsiColor::Cyan.on_default());
 
 #[derive(Parser, Debug)]
-#[command(name = "ob", version, styles = STYLES)]
+#[command(
+    name = "ob",
+    version = concat!(env!("CARGO_PKG_VERSION"), " ", env!("OPBOX_BUILD_HASH")),
+    styles = STYLES
+)]
 struct Args {
     #[clap(subcommand)]
     command: Command,
