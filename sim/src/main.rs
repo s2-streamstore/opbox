@@ -3171,6 +3171,7 @@ async fn run_daemon_client(
         daemon_writer_id: daemon_row.daemon_writer_id.clone(),
         stable_cursor: daemon_row.stable_cursor.clone(),
         started_at: time::OffsetDateTime::now_utc(),
+        warnings: Vec::new(),
     };
     let cancellation_token = CancellationToken::new();
     let runtime = AppRuntime::new(AppRuntimeConfig {

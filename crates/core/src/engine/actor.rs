@@ -1,6 +1,6 @@
 use super::shared_message_buffer::SharedMessageBuffer;
 use crate::app::connectivity::{ConnectivityRole, ConnectivitySnapshot, LinkStatus};
-use crate::app::control::{DaemonStatus, EnginePhaseStatus};
+use crate::app::control::{DaemonStatus, DaemonWarning, EnginePhaseStatus};
 use crate::crdt::types::SharedMessage;
 use crate::fs::client::{FsClient, FsClientResponse};
 use crate::fs::types::{GuardedWriteResult, RelativePath, ScanScope};
@@ -275,6 +275,7 @@ pub struct EngineStatusConfig {
     pub daemon_writer_id: DaemonWriterId,
     pub stable_cursor: RangeTo<SequenceNumber>,
     pub started_at: OffsetDateTime,
+    pub warnings: Vec<DaemonWarning>,
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +285,7 @@ struct EngineStatusState {
     daemon_writer_id: DaemonWriterId,
     denormalized_stable_cursor: RangeTo<SequenceNumber>,
     started_at: OffsetDateTime,
+    warnings: Vec<DaemonWarning>,
 }
 
 impl EngineStatusState {
@@ -294,6 +296,7 @@ impl EngineStatusState {
             daemon_writer_id: config.daemon_writer_id,
             denormalized_stable_cursor: config.stable_cursor,
             started_at: config.started_at,
+            warnings: config.warnings,
         }
     }
 
@@ -434,6 +437,7 @@ impl Engine {
                 .expect("started_at timestamp nanos fit in i64"),
             engine_phase: self.phase.status(),
             connectivity: self.connectivity.snapshot(),
+            warnings: self.status.warnings.clone(),
         }
     }
 

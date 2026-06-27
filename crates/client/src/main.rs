@@ -7,7 +7,7 @@ use opbox_core::app::ipc;
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::app::s2::{
     S2ConnectionConfig, create_workspace_stream, ensure_workspace_stream_exists,
-    s2_basin_from_config,
+    s2_basin_from_config, workspace_stream_retention_warning,
 };
 use opbox_core::app::user_config::{
     UserConfig, UserConfigKey, load_user_config, load_user_config_from_path, save_user_config,
@@ -449,6 +449,8 @@ async fn bootstrap_init(
     debug!(?workspace_id, "generated workspace id");
     progress.set("creating shared log stream");
     create_workspace_stream(&s2_basin, &workspace_id).await?;
+    progress.set("checking shared log retention");
+    warn_if_workspace_stream_retention_not_infinite(&s2_basin, &workspace_id, progress).await;
     let daemon_row = fresh_daemon_state_row(workspace_id, basin, &s2_connection);
     progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
@@ -488,6 +490,8 @@ async fn bootstrap_clone(
     let s2_basin = s2_basin_from_config(basin.clone(), &s2_connection).await?;
     progress.set("checking shared log stream");
     ensure_workspace_stream_exists(&s2_basin, &workspace).await?;
+    progress.set("checking shared log retention");
+    warn_if_workspace_stream_retention_not_infinite(&s2_basin, &workspace, progress).await;
     let daemon_row = fresh_daemon_state_row(workspace, basin, &s2_connection);
     progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
@@ -501,6 +505,22 @@ async fn bootstrap_clone(
         s2_basin,
         clone_log_read_stop,
     })
+}
+
+async fn warn_if_workspace_stream_retention_not_infinite(
+    s2_basin: &S2Basin,
+    workspace_id: &WorkspaceId,
+    progress: &BootstrapProgress,
+) {
+    match workspace_stream_retention_warning(s2_basin, workspace_id).await {
+        Ok(Some(warning)) => {
+            progress.suspend(|| print_warning(&warning, CliStyle::for_stderr()));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            progress.suspend(|| print_retention_check_warning(&error, CliStyle::for_stderr()));
+        }
+    }
 }
 
 async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> eyre::Result<()> {
@@ -856,6 +876,14 @@ impl BootstrapProgress {
         }
     }
 
+    fn suspend(&self, action: impl FnOnce()) {
+        if let Some(bar) = &self.bar {
+            bar.suspend(action);
+        } else {
+            action();
+        }
+    }
+
     fn finish(&self) {
         if let Some(bar) = &self.bar {
             bar.finish_and_clear();
@@ -942,10 +970,70 @@ fn print_daemon_status(title: &str, status: &ipc::DaemonStatus, style: CliStyle)
     print_status_row("engine phase", status.engine_phase, style);
     print_status_row("stable cursor", status.stable_cursor_end, style);
     print_status_row("connectivity", connectivity_status_text(status), style);
+    for warning in &status.warnings {
+        print_status_row("warning", style.yellow(daemon_warning_text(warning)), style);
+    }
 }
 
 fn print_status_row(label: &str, value: impl std::fmt::Display, style: CliStyle) {
     println!("  {}  {}", style.dim(format!("{label:<13}")), value);
+}
+
+fn print_warning(warning: &ipc::DaemonWarning, style: CliStyle) {
+    eprintln!(
+        "{} {}",
+        style.yellow("warning:"),
+        daemon_warning_text(warning)
+    );
+}
+
+fn print_retention_check_warning(error: &eyre::Report, style: CliStyle) {
+    eprintln!(
+        "{} could not verify workspace ops stream retention: {error:#}. \
+         Future clones require the ops stream to retain records long enough; Infinite retention is recommended.",
+        style.yellow("warning:")
+    );
+}
+
+fn daemon_warning_text(warning: &ipc::DaemonWarning) -> String {
+    match warning {
+        ipc::DaemonWarning::OpsStreamRetentionNotInfinite { retention } => format!(
+            "ops stream retention is {}; future clones may fail after records expire. \
+             Reconfigure the ops stream to Infinite retention, or create workspaces in a basin \
+             whose default stream retention is Infinite.",
+            retention_summary_text(retention)
+        ),
+    }
+}
+
+fn retention_summary_text(retention: &ipc::StreamRetentionSummary) -> String {
+    match retention {
+        ipc::StreamRetentionSummary::Age { seconds } => duration_text(*seconds),
+        ipc::StreamRetentionSummary::Unspecified => "not confirmed as Infinite".to_string(),
+    }
+}
+
+fn duration_text(seconds: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+
+    if seconds != 0 && seconds % DAY == 0 {
+        let days = seconds / DAY;
+        format!("{days} day{}", plural(days))
+    } else if seconds != 0 && seconds % HOUR == 0 {
+        let hours = seconds / HOUR;
+        format!("{hours} hour{}", plural(hours))
+    } else if seconds != 0 && seconds % MINUTE == 0 {
+        let minutes = seconds / MINUTE;
+        format!("{minutes} minute{}", plural(minutes))
+    } else {
+        format!("{seconds} second{}", plural(seconds))
+    }
+}
+
+fn plural(value: u64) -> &'static str {
+    if value == 1 { "" } else { "s" }
 }
 
 fn connectivity_status_text(status: &ipc::DaemonStatus) -> String {

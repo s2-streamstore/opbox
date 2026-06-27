@@ -26,7 +26,9 @@ use tracing::{debug, warn};
 
 type IpcBody = UnsyncBoxBody<Bytes, Infallible>;
 
-pub use crate::app::control::{DaemonStatus, EnginePhaseStatus};
+pub use crate::app::control::{
+    DaemonStatus, DaemonWarning, EnginePhaseStatus, StreamRetentionSummary,
+};
 
 pub const IPC_PROTOCOL_VERSION: u32 = 1;
 
@@ -650,6 +652,9 @@ mod tests {
             started_at_ns: 0,
             engine_phase: EnginePhaseStatus::Scanning,
             connectivity: ConnectivitySnapshot::starting(),
+            warnings: vec![DaemonWarning::OpsStreamRetentionNotInfinite {
+                retention: StreamRetentionSummary::Age { seconds: 86_400 },
+            }],
         };
         let engine = tokio::spawn({
             let expected_status = expected_status.clone();
@@ -685,6 +690,7 @@ mod tests {
         assert_eq!(status.stable_cursor_end, expected_status.stable_cursor_end);
         assert_eq!(status.engine_phase, expected_status.engine_phase);
         assert_eq!(status.connectivity, expected_status.connectivity);
+        assert_eq!(status.warnings, expected_status.warnings);
 
         token.cancel();
         server.await??;
@@ -797,6 +803,7 @@ mod tests {
             started_at_ns: 0,
             engine_phase: EnginePhaseStatus::Scanning,
             connectivity: ConnectivitySnapshot::starting(),
+            warnings: Vec::new(),
         };
         let engine = tokio::spawn({
             let expected_status = expected_status.clone();
@@ -902,6 +909,7 @@ mod tests {
             started_at_ns: 0,
             engine_phase: EnginePhaseStatus::Scanning,
             connectivity: ConnectivitySnapshot::starting(),
+            warnings: Vec::new(),
         };
         let engine = tokio::spawn({
             let expected_status = expected_status.clone();

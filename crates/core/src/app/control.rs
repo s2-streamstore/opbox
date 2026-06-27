@@ -20,6 +20,19 @@ impl std::fmt::Display for EnginePhaseStatus {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StreamRetentionSummary {
+    Age { seconds: u64 },
+    Unspecified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DaemonWarning {
+    OpsStreamRetentionNotInfinite { retention: StreamRetentionSummary },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub workspace_id: String,
@@ -30,4 +43,5 @@ pub struct DaemonStatus {
     pub started_at_ns: i64,
     pub engine_phase: EnginePhaseStatus,
     pub connectivity: ConnectivitySnapshot,
+    pub warnings: Vec<DaemonWarning>,
 }

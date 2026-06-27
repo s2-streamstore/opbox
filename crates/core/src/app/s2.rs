@@ -1,8 +1,9 @@
+use crate::app::control::{DaemonWarning, StreamRetentionSummary};
 use crate::types::WorkspaceId;
 use eyre::eyre;
 use s2_sdk::types::{
-    AccountEndpoint, BasinEndpoint, BasinName, CreateStreamInput, RetryConfig, S2Config,
-    S2Endpoints, S2Error, StreamName,
+    AccountEndpoint, BasinEndpoint, BasinName, CreateStreamInput, RetentionPolicy, RetryConfig,
+    S2Config, S2Endpoints, S2Error, StreamConfig, StreamName,
 };
 use s2_sdk::{S2, S2Basin};
 use std::num::NonZeroU32;
@@ -179,6 +180,25 @@ pub async fn ensure_workspace_stream_exists(
     }
 }
 
+pub async fn workspace_stream_retention_warning(
+    s2_basin: &S2Basin,
+    workspace_id: &WorkspaceId,
+) -> eyre::Result<Option<DaemonWarning>> {
+    let stream_name = ops_stream_name(workspace_id)?;
+    let config = s2_basin.get_stream_config(stream_name).await?;
+    Ok(stream_config_retention_warning(&config))
+}
+
+pub fn stream_config_retention_warning(config: &StreamConfig) -> Option<DaemonWarning> {
+    let retention = match config.retention_policy {
+        Some(RetentionPolicy::Infinite) => return None,
+        Some(RetentionPolicy::Age(seconds)) => StreamRetentionSummary::Age { seconds },
+        None => StreamRetentionSummary::Unspecified,
+    };
+
+    Some(DaemonWarning::OpsStreamRetentionNotInfinite { retention })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +250,32 @@ mod tests {
         assert!(
             error.to_string().contains("no S2 access token configured"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn stream_config_retention_warning_flags_non_infinite_retention() {
+        assert_eq!(
+            stream_config_retention_warning(
+                &StreamConfig::new().with_retention_policy(RetentionPolicy::Infinite)
+            ),
+            None
+        );
+
+        assert_eq!(
+            stream_config_retention_warning(
+                &StreamConfig::new().with_retention_policy(RetentionPolicy::Age(86_400))
+            ),
+            Some(DaemonWarning::OpsStreamRetentionNotInfinite {
+                retention: StreamRetentionSummary::Age { seconds: 86_400 }
+            })
+        );
+
+        assert_eq!(
+            stream_config_retention_warning(&StreamConfig::new()),
+            Some(DaemonWarning::OpsStreamRetentionNotInfinite {
+                retention: StreamRetentionSummary::Unspecified
+            })
         );
     }
 }
