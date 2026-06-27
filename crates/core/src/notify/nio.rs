@@ -148,10 +148,11 @@ impl LocalNotifyIO {
         }
 
         let relative_path = relative_path_from_path(relative)?;
-        if self.ignore_rules.is_ignored(&relative_path) {
+        let is_dir = absolute.is_dir();
+        if self.ignore_rules.is_ignored(&relative_path, is_dir) {
             return Ok(None);
         }
-        if absolute.is_file() {
+        if !is_dir && absolute.is_file() {
             Ok(Some(ScanScope::SingleFile(relative_path)))
         } else {
             // Missing paths may be deletes, so scan the prior subtree rooted at the path.

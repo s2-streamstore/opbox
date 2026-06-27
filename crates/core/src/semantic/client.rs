@@ -20,7 +20,9 @@ use tracing::instrument;
 pub enum SemanticClientResponse {
     ApplyInitScan(eyre::Result<NextWork>),
     ApplyScan(eyre::Result<NextWork>),
+    CommitImportAction(eyre::Result<()>),
     CommitImportEpoch(eyre::Result<()>),
+    CommitProjectionAction(eyre::Result<()>),
     CommitProjectionEpoch(eyre::Result<()>),
     GetNextWork {
         /// Echo of the caller-supplied boundary sequence, so the engine can
@@ -115,9 +117,21 @@ impl SemanticClient {
     }
 
     pub fn commit_import_action(&mut self, result: ImportActionResult) -> eyre::Result<()> {
-        self.tx
-            .send(SemanticRequest::CommitImportAction { result })?;
+        self.tx.send(SemanticRequest::CommitImportAction {
+            result,
+            reply: None,
+        })?;
         Ok(())
+    }
+
+    pub fn commit_import_action_checked(&mut self, result: ImportActionResult) -> eyre::Result<()> {
+        self.enqueue(
+            |reply| SemanticRequest::CommitImportAction {
+                result,
+                reply: Some(reply),
+            },
+            SemanticClientResponse::CommitImportAction,
+        )
     }
 
     pub fn commit_import_epoch(&mut self, epoch: ImportEpoch) -> eyre::Result<()> {
@@ -128,9 +142,24 @@ impl SemanticClient {
     }
 
     pub fn commit_projection_action(&mut self, result: ProjectionActionResult) -> eyre::Result<()> {
-        self.tx
-            .send(SemanticRequest::CommitProjectionAction { result })?;
+        self.tx.send(SemanticRequest::CommitProjectionAction {
+            result,
+            reply: None,
+        })?;
         Ok(())
+    }
+
+    pub fn commit_projection_action_checked(
+        &mut self,
+        result: ProjectionActionResult,
+    ) -> eyre::Result<()> {
+        self.enqueue(
+            |reply| SemanticRequest::CommitProjectionAction {
+                result,
+                reply: Some(reply),
+            },
+            SemanticClientResponse::CommitProjectionAction,
+        )
     }
 
     pub fn commit_projection_epoch(

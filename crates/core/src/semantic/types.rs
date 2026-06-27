@@ -193,9 +193,13 @@ pub enum SemanticRequest {
         reply: oneshot::Sender<eyre::Result<NextWork>>,
     },
 
-    /// Deliver one completed import action result. This is fire-and-forget;
-    /// `CommitImportEpoch` is the durability/accounting barrier.
-    CommitImportAction { result: ImportActionResult },
+    /// Deliver one completed import action result. Normal sync may use this
+    /// fire-and-forget and rely on `CommitImportEpoch` as the barrier; bootstrap
+    /// can request an acknowledgement to bound memory during large imports.
+    CommitImportAction {
+        result: ImportActionResult,
+        reply: Option<oneshot::Sender<eyre::Result<()>>>,
+    },
 
     /// Close an import epoch. Engine fetches next work at its boundary via
     /// `GetNextWork` once the commit confirms.
@@ -204,9 +208,13 @@ pub enum SemanticRequest {
         reply: oneshot::Sender<eyre::Result<()>>,
     },
 
-    /// Deliver one completed projection action result. This is fire-and-forget;
-    /// `CommitProjectionEpoch` is the durability/accounting barrier.
-    CommitProjectionAction { result: ProjectionActionResult },
+    /// Deliver one completed projection action result. Normal sync may use this
+    /// fire-and-forget and rely on `CommitProjectionEpoch` as the barrier;
+    /// bootstrap clone can request an acknowledgement to bound memory.
+    CommitProjectionAction {
+        result: ProjectionActionResult,
+        reply: Option<oneshot::Sender<eyre::Result<()>>>,
+    },
 
     /// Close a projection epoch. Engine fetches next work at its boundary via
     /// `GetNextWork` once the commit confirms.

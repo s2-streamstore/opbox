@@ -20,7 +20,7 @@ use opbox_core::app::workspace::{
     remove_stale_socket_files, socket_link_path, storage_db_path, workspace_config_path,
 };
 use opbox_core::fs::fio::local::LocalFileIO;
-use opbox_core::fs::ignore::{IGNORE_FILE_NAME, default_ignore_file_contents};
+use opbox_core::fs::ignore::{IGNORE_FILE_NAME, METADATA_DIR_NAME, default_ignore_file_contents};
 use opbox_core::log::types::LogReadStop;
 use opbox_core::semantic::service::SemanticService;
 use opbox_core::semantic::table::daemon_state;
@@ -43,6 +43,7 @@ use tokio::process::Command as TokioCommand;
 use tracing::debug;
 
 const CLIENT_COMMAND: &str = "ob";
+const GITIGNORE_FILE_NAME: &str = ".gitignore";
 
 const STYLES: styling::Styles = styling::Styles::styled()
     .header(styling::AnsiColor::Green.on_default().bold())
@@ -286,7 +287,7 @@ fn create_default_ignore_file(sync_root: &Path) -> eyre::Result<()> {
     {
         Ok(mut file) => {
             use std::io::Write;
-            file.write_all(default_ignore_file_contents().as_bytes())?;
+            file.write_all(default_ignore_file_contents_for_root(sync_root)?.as_bytes())?;
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -294,10 +295,63 @@ fn create_default_ignore_file(sync_root: &Path) -> eyre::Result<()> {
     }
 }
 
-fn add_metadata_dir_to_gitignore_if_present(sync_root: &Path) -> eyre::Result<()> {
-    const GITIGNORE_FILE_NAME: &str = ".gitignore";
-    const METADATA_IGNORE_PATTERN: &str = ".opbox";
+fn default_ignore_file_contents_for_root(sync_root: &Path) -> eyre::Result<String> {
+    let mut contents = default_ignore_file_contents().to_string();
+    let gitignore_contents = gitignore_contents_for_opboxignore(sync_root)?;
+    if gitignore_contents.trim().is_empty() {
+        return Ok(contents);
+    }
 
+    if !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str("\n# Imported from .gitignore by ob init.\n");
+    contents.push_str("# Edit this file if opbox should track a different set of paths.\n");
+    contents.push_str(gitignore_contents.trim_end());
+    contents.push('\n');
+    Ok(contents)
+}
+
+fn gitignore_contents_for_opboxignore(sync_root: &Path) -> eyre::Result<String> {
+    let path = sync_root.join(GITIGNORE_FILE_NAME);
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            let mut normalized = contents.replace("\r\n", "\n");
+            if !normalized.ends_with('\n') {
+                normalized.push('\n');
+            }
+            Ok(normalized)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn gitignore_contains_metadata_dir(contents: &str) -> bool {
+    contents.lines().map(str::trim).any(|line| {
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        line == METADATA_DIR_NAME
+            || line == format!("{METADATA_DIR_NAME}/")
+            || line == format!("/{METADATA_DIR_NAME}")
+            || line == format!("/{METADATA_DIR_NAME}/")
+    })
+}
+
+fn ensure_gitignore_metadata_entry(contents: &mut String) {
+    if gitignore_contains_metadata_dir(contents) {
+        return;
+    }
+
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(METADATA_DIR_NAME);
+    contents.push('\n');
+}
+
+fn add_metadata_dir_to_gitignore_if_present(sync_root: &Path) -> eyre::Result<()> {
     let path = sync_root.join(GITIGNORE_FILE_NAME);
     let mut contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -305,17 +359,7 @@ fn add_metadata_dir_to_gitignore_if_present(sync_root: &Path) -> eyre::Result<()
         Err(error) => return Err(error.into()),
     };
 
-    if contents.lines().map(str::trim).any(|line| {
-        line == METADATA_IGNORE_PATTERN || line == format!("{METADATA_IGNORE_PATTERN}/")
-    }) {
-        return Ok(());
-    }
-
-    if !contents.is_empty() && !contents.ends_with('\n') {
-        contents.push('\n');
-    }
-    contents.push_str(METADATA_IGNORE_PATTERN);
-    contents.push('\n');
+    ensure_gitignore_metadata_entry(&mut contents);
     std::fs::write(&path, contents)?;
     Ok(())
 }
@@ -1562,6 +1606,51 @@ mod tests {
 
         assert!("1969-12-31T23:59:59Z".parse::<CloneAsOf>().is_err());
         assert!("2026-06-18:01:30:00Z".parse::<CloneAsOf>().is_err());
+    }
+
+    #[test]
+    fn init_opboxignore_imports_gitignore_contents() -> eyre::Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("opbox-ignore-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root)?;
+        std::fs::write(
+            root.join(GITIGNORE_FILE_NAME),
+            "\
+# already in default
+target
+
+.next
+dist/
+!dist/keep.txt
+**/*.dst.out
+foo/**/bar
+.opbox
+",
+        )?;
+
+        create_default_ignore_file(&root)?;
+        let contents = std::fs::read_to_string(root.join(IGNORE_FILE_NAME))?;
+        assert!(contents.contains("target\n"));
+        assert!(contents.contains("# Imported from .gitignore by ob init.\n"));
+        assert!(contents.contains(".next\n"));
+        assert!(contents.contains("dist/\n"));
+        assert!(contents.contains("!dist/keep.txt\n"));
+        assert!(contents.contains("**/*.dst.out\n"));
+        assert!(contents.contains("foo/**/bar\n"));
+        assert!(contents.contains("\n.opbox\n"));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn gitignore_metadata_detection_handles_anchored_forms() {
+        assert!(gitignore_contains_metadata_dir(".opbox\n"));
+        assert!(gitignore_contains_metadata_dir(".opbox/\n"));
+        assert!(gitignore_contains_metadata_dir("/.opbox\n"));
+        assert!(gitignore_contains_metadata_dir("/.opbox/\n"));
+        assert!(!gitignore_contains_metadata_dir("!.opbox\n"));
+        assert!(!gitignore_contains_metadata_dir(".opbox-other\n"));
     }
 
     #[test]
