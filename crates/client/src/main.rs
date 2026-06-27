@@ -135,6 +135,9 @@ enum ConfigCommand {
     /// List configured values.
     List,
 
+    /// List supported config keys.
+    Keys,
+
     /// Get one configured value.
     Get {
         #[arg(value_enum)]
@@ -1310,6 +1313,11 @@ fn run_config(workspace: bool, command: ConfigCommand) -> eyre::Result<()> {
                         config_display_value(key, value, false)
                     );
                 }
+            }
+        }
+        ConfigCommand::Keys => {
+            for key in scope.keys().iter().copied().map(ConfigKey::user_config_key) {
+                println!("{}", key.as_str());
             }
         }
         ConfigCommand::Get { key } => {
