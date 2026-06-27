@@ -550,10 +550,14 @@ async fn warn_if_retention_not_infinite(
     if skip_retention_checks(workspace_config, user_config)? {
         return Ok(());
     }
+    let context = RetentionWarningContext {
+        basin: basin.as_ref(),
+        workspace_id: &workspace_id.0,
+    };
 
     match workspace_stream_retention_warning(s2_basin, workspace_id).await {
         Ok(Some(warning)) => {
-            progress.suspend(|| print_warning(&warning, CliStyle::for_stderr()));
+            progress.suspend(|| print_warning(&warning, context, CliStyle::for_stderr()));
         }
         Ok(None) => {}
         Err(error) => {
@@ -569,7 +573,7 @@ async fn warn_if_retention_not_infinite(
 
     match basin_default_stream_retention_warning(s2, basin.clone()).await {
         Ok(Some(warning)) => {
-            progress.suspend(|| print_warning(&warning, CliStyle::for_stderr()));
+            progress.suspend(|| print_warning(&warning, context, CliStyle::for_stderr()));
         }
         Ok(None) => {}
         Err(error) => {
@@ -1028,13 +1032,18 @@ impl CliStyle {
 fn print_daemon_status(title: &str, status: &ipc::DaemonStatus, style: CliStyle) {
     println!("{}", style.bold(title));
     print_status_row("workspace", &status.workspace_id, style);
+    print_status_row("basin", &status.basin, style);
     print_status_row("root", &status.root, style);
     print_status_row("pid", status.pid, style);
     print_status_row("engine phase", status.engine_phase, style);
     print_status_row("stable cursor", status.stable_cursor_end, style);
     print_status_row("connectivity", connectivity_status_text(status), style);
+    let context = RetentionWarningContext {
+        basin: &status.basin,
+        workspace_id: &status.workspace_id,
+    };
     for warning in &status.warnings {
-        print_status_row("warning", style.yellow(daemon_warning_text(warning)), style);
+        print_status_warning(warning, context, style);
     }
 }
 
@@ -1042,12 +1051,40 @@ fn print_status_row(label: &str, value: impl std::fmt::Display, style: CliStyle)
     println!("  {}  {}", style.dim(format!("{label:<13}")), value);
 }
 
-fn print_warning(warning: &ipc::DaemonWarning, style: CliStyle) {
-    eprintln!(
-        "{} {}",
-        style.yellow("warning:"),
-        daemon_warning_text(warning)
-    );
+#[derive(Clone, Copy)]
+struct RetentionWarningContext<'a> {
+    basin: &'a str,
+    workspace_id: &'a str,
+}
+
+fn print_status_warning(
+    warning: &ipc::DaemonWarning,
+    context: RetentionWarningContext<'_>,
+    style: CliStyle,
+) {
+    let lines = daemon_warning_lines(warning, context);
+    let Some((first, rest)) = lines.split_first() else {
+        return;
+    };
+    print_status_row("warning", style.yellow(first), style);
+    for line in rest {
+        print_status_row("", style.yellow(line), style);
+    }
+}
+
+fn print_warning(
+    warning: &ipc::DaemonWarning,
+    context: RetentionWarningContext<'_>,
+    style: CliStyle,
+) {
+    let lines = daemon_warning_lines(warning, context);
+    let Some((first, rest)) = lines.split_first() else {
+        return;
+    };
+    eprintln!("{} {}", style.yellow("warning:"), first);
+    for line in rest {
+        eprintln!("         {line}");
+    }
 }
 
 fn print_retention_check_warning(target: &str, error: &eyre::Report, style: CliStyle) {
@@ -1058,19 +1095,38 @@ fn print_retention_check_warning(target: &str, error: &eyre::Report, style: CliS
     );
 }
 
-fn daemon_warning_text(warning: &ipc::DaemonWarning) -> String {
+fn daemon_warning_lines(
+    warning: &ipc::DaemonWarning,
+    context: RetentionWarningContext<'_>,
+) -> Vec<String> {
     match warning {
-        ipc::DaemonWarning::OpsStreamRetentionNotInfinite { retention } => format!(
-            "ops stream retention is {}; future clones may fail after records expire. \
-             Reconfigure the ops stream to Infinite retention, or create workspaces in a basin \
-             whose default stream retention is Infinite.",
-            retention_summary_text(retention)
-        ),
-        ipc::DaemonWarning::BasinDefaultStreamRetentionNotInfinite { retention } => format!(
-            "basin default stream retention is {}; future multipart object streams may expire. \
-             Reconfigure the basin default stream retention to Infinite before writing large objects.",
-            retention_summary_text(retention)
-        ),
+        ipc::DaemonWarning::OpsStreamRetentionNotInfinite { retention } => vec![
+            format!(
+                "ops stream retention is {}; future clones may fail after records expire.",
+                retention_summary_text(retention)
+            ),
+            "if this workspace is disposable, fix the basin default and recreate it.".to_string(),
+            "to keep this workspace, reconfigure the ops stream:".to_string(),
+            format!(
+                "$ s2 reconfigure-stream s2://{}/{}/ops --retention-policy infinite",
+                context.basin, context.workspace_id
+            ),
+            "this does not restore expired records; existing object streams may also need reconfiguration.".to_string(),
+        ],
+        ipc::DaemonWarning::BasinDefaultStreamRetentionNotInfinite { retention } => vec![
+            format!(
+                "basin default stream retention is {}; future multipart object streams may expire.",
+                retention_summary_text(retention)
+            ),
+            "for new/prototype workspaces, fix the basin default and recreate the opbox workspace:"
+                .to_string(),
+            format!(
+                "$ s2 reconfigure-basin {} --retention-policy infinite",
+                context.basin
+            ),
+            "this does not change existing streams or restore records that may already have expired."
+                .to_string(),
+        ],
     }
 }
 

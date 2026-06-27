@@ -37,6 +37,7 @@ pub enum DaemonWarning {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub workspace_id: String,
+    pub basin: String,
     pub root: String,
     pub pid: u32,
     pub stable_cursor_end: u64,

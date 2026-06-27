@@ -17,6 +17,7 @@ use crate::spy::{NamespaceSpyTracker, NamespaceUpdateSummary, SpyEvent, SpyOpen}
 use crate::types::{DaemonWriterId, SharedMessageBatch, WorkspaceId};
 use enum_ordinalize::Ordinalize;
 use eyre::eyre;
+use s2_sdk::types::BasinName;
 use std::collections::{BTreeSet, VecDeque};
 use std::ops::{RangeInclusive, RangeTo};
 use std::path::PathBuf;
@@ -272,6 +273,7 @@ pub enum EngineCommand {
 pub struct EngineStatusConfig {
     pub sync_root: PathBuf,
     pub workspace_id: WorkspaceId,
+    pub basin: BasinName,
     pub daemon_writer_id: DaemonWriterId,
     pub stable_cursor: RangeTo<SequenceNumber>,
     pub started_at: OffsetDateTime,
@@ -282,6 +284,7 @@ pub struct EngineStatusConfig {
 struct EngineStatusState {
     sync_root: PathBuf,
     workspace_id: WorkspaceId,
+    basin: BasinName,
     daemon_writer_id: DaemonWriterId,
     denormalized_stable_cursor: RangeTo<SequenceNumber>,
     started_at: OffsetDateTime,
@@ -293,6 +296,7 @@ impl EngineStatusState {
         Self {
             sync_root: config.sync_root,
             workspace_id: config.workspace_id,
+            basin: config.basin,
             daemon_writer_id: config.daemon_writer_id,
             denormalized_stable_cursor: config.stable_cursor,
             started_at: config.started_at,
@@ -429,6 +433,7 @@ impl Engine {
     fn daemon_status(&self) -> DaemonStatus {
         DaemonStatus {
             workspace_id: self.status.workspace_id.0.clone(),
+            basin: self.status.basin.as_ref().to_string(),
             root: self.status.sync_root.display().to_string(),
             pid: std::process::id(),
             stable_cursor_end: self.status.denormalized_stable_cursor.end,

@@ -645,6 +645,7 @@ mod tests {
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
         let expected_status = DaemonStatus {
             workspace_id: daemon_row.workspace_id.0.clone(),
+            basin: daemon_row.s2_basin.as_ref().to_string(),
             root: sync_root.display().to_string(),
             pid: 123,
             stable_cursor_end: 42,
@@ -685,6 +686,7 @@ mod tests {
 
         let status = request_status(&sync_root).await?;
         assert_eq!(status.workspace_id, expected_status.workspace_id);
+        assert_eq!(status.basin, expected_status.basin);
         assert_eq!(status.root, expected_status.root);
         assert_eq!(status.pid, expected_status.pid);
         assert_eq!(status.stable_cursor_end, expected_status.stable_cursor_end);
@@ -796,6 +798,7 @@ mod tests {
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
         let expected_status = DaemonStatus {
             workspace_id: daemon_row.workspace_id.0.clone(),
+            basin: daemon_row.s2_basin.as_ref().to_string(),
             root: sync_root.display().to_string(),
             pid: 123,
             stable_cursor_end: 42,
@@ -902,6 +905,7 @@ mod tests {
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
         let expected_status = DaemonStatus {
             workspace_id: daemon_row.workspace_id.0.clone(),
+            basin: daemon_row.s2_basin.as_ref().to_string(),
             root: sync_root.display().to_string(),
             pid: 123,
             stable_cursor_end: 42,

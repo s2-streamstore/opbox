@@ -184,6 +184,7 @@ async fn run(
         engine_status: Some(EngineStatusConfig {
             sync_root: sync_root.clone(),
             workspace_id: daemon_row.workspace_id.clone(),
+            basin: daemon_row.s2_basin.clone(),
             daemon_writer_id: daemon_row.daemon_writer_id.clone(),
             stable_cursor: daemon_row.stable_cursor.clone(),
             started_at,
