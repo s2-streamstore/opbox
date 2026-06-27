@@ -2,8 +2,8 @@ use crate::app::control::{DaemonWarning, StreamRetentionSummary};
 use crate::types::WorkspaceId;
 use eyre::eyre;
 use s2_sdk::types::{
-    AccountEndpoint, BasinEndpoint, BasinName, CreateStreamInput, RetentionPolicy, RetryConfig,
-    S2Config, S2Endpoints, S2Error, StreamConfig, StreamName,
+    AccountEndpoint, BasinConfig, BasinEndpoint, BasinName, CreateStreamInput, RetentionPolicy,
+    RetryConfig, S2Config, S2Endpoints, S2Error, StreamConfig, StreamName,
 };
 use s2_sdk::{S2, S2Basin};
 use std::num::NonZeroU32;
@@ -190,13 +190,36 @@ pub async fn workspace_stream_retention_warning(
 }
 
 pub fn stream_config_retention_warning(config: &StreamConfig) -> Option<DaemonWarning> {
-    let retention = match config.retention_policy {
-        Some(RetentionPolicy::Infinite) => return None,
-        Some(RetentionPolicy::Age(seconds)) => StreamRetentionSummary::Age { seconds },
-        None => StreamRetentionSummary::Unspecified,
-    };
+    retention_warning_summary(config.retention_policy)
+        .map(|retention| DaemonWarning::OpsStreamRetentionNotInfinite { retention })
+}
 
-    Some(DaemonWarning::OpsStreamRetentionNotInfinite { retention })
+pub async fn basin_default_stream_retention_warning(
+    s2: &S2,
+    basin: BasinName,
+) -> eyre::Result<Option<DaemonWarning>> {
+    let config = s2.get_basin_config(basin).await?;
+    Ok(basin_config_retention_warning(&config))
+}
+
+pub fn basin_config_retention_warning(config: &BasinConfig) -> Option<DaemonWarning> {
+    let retention_policy = config
+        .default_stream_config
+        .as_ref()
+        .and_then(|config| config.retention_policy);
+
+    retention_warning_summary(retention_policy)
+        .map(|retention| DaemonWarning::BasinDefaultStreamRetentionNotInfinite { retention })
+}
+
+fn retention_warning_summary(
+    retention_policy: Option<RetentionPolicy>,
+) -> Option<StreamRetentionSummary> {
+    match retention_policy {
+        Some(RetentionPolicy::Infinite) => None,
+        Some(RetentionPolicy::Age(seconds)) => Some(StreamRetentionSummary::Age { seconds }),
+        None => Some(StreamRetentionSummary::Unspecified),
+    }
 }
 
 #[cfg(test)]
@@ -274,6 +297,32 @@ mod tests {
         assert_eq!(
             stream_config_retention_warning(&StreamConfig::new()),
             Some(DaemonWarning::OpsStreamRetentionNotInfinite {
+                retention: StreamRetentionSummary::Unspecified
+            })
+        );
+    }
+
+    #[test]
+    fn basin_config_retention_warning_flags_non_infinite_default_stream_retention() {
+        assert_eq!(
+            basin_config_retention_warning(&BasinConfig::new().with_default_stream_config(
+                StreamConfig::new().with_retention_policy(RetentionPolicy::Infinite)
+            )),
+            None
+        );
+
+        assert_eq!(
+            basin_config_retention_warning(&BasinConfig::new().with_default_stream_config(
+                StreamConfig::new().with_retention_policy(RetentionPolicy::Age(3_600))
+            )),
+            Some(DaemonWarning::BasinDefaultStreamRetentionNotInfinite {
+                retention: StreamRetentionSummary::Age { seconds: 3_600 }
+            })
+        );
+
+        assert_eq!(
+            basin_config_retention_warning(&BasinConfig::new()),
+            Some(DaemonWarning::BasinDefaultStreamRetentionNotInfinite {
                 retention: StreamRetentionSummary::Unspecified
             })
         );

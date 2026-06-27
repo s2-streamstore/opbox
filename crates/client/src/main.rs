@@ -6,12 +6,13 @@ use opbox_core::app::db::{open_database, semantic_pool};
 use opbox_core::app::ipc;
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::app::s2::{
-    S2ConnectionConfig, create_workspace_stream, ensure_workspace_stream_exists,
-    s2_basin_from_config, workspace_stream_retention_warning,
+    S2ConnectionConfig, basin_default_stream_retention_warning, create_workspace_stream,
+    ensure_workspace_stream_exists, s2_client_from_config, workspace_stream_retention_warning,
 };
 use opbox_core::app::user_config::{
-    UserConfig, UserConfigKey, load_user_config, load_user_config_from_path, save_user_config,
-    save_user_config_to_path, user_config_path,
+    UserConfig, UserConfigKey, load_user_config, load_user_config_from_path,
+    parse_bool_config_value, save_user_config, save_user_config_to_path, skip_retention_checks,
+    user_config_path,
 };
 use opbox_core::app::workspace::{
     NotInWorkspace, canonicalize_existing_dir, create_metadata_dir, current_dir, daemon_log_path,
@@ -29,7 +30,7 @@ use opbox_core::types::{
     DaemonWriterId, OutboxId, WorkspaceId, short_crockford_base32_lower_from_b64,
 };
 use s2_sdk::{
-    S2Basin,
+    S2, S2Basin,
     types::{AccountEndpoint, BasinEndpoint, BasinName},
 };
 use std::io::IsTerminal;
@@ -170,6 +171,8 @@ enum ConfigKey {
     DaemonLogLevel,
     #[value(alias = "client_log_level")]
     ClientLogLevel,
+    #[value(alias = "skip_retention_checks")]
+    SkipRetentionChecks,
 }
 
 impl ConfigKey {
@@ -182,6 +185,7 @@ impl ConfigKey {
             Self::BasinEndpoint => UserConfigKey::BasinEndpoint,
             Self::DaemonLogLevel => UserConfigKey::DaemonLogLevel,
             Self::ClientLogLevel => UserConfigKey::ClientLogLevel,
+            Self::SkipRetentionChecks => UserConfigKey::SkipRetentionChecks,
         }
     }
 }
@@ -444,13 +448,23 @@ async fn bootstrap_init(
     let sync_root = canonicalize_existing_dir(&root_or_current(sync_root)?)?;
     ensure_sync_root_unconfigured(&sync_root).await?;
     progress.set(format!("connecting to basin {}", basin.as_ref()));
-    let s2_basin = s2_basin_from_config(basin.clone(), &s2_connection).await?;
+    let s2 = s2_client_from_config(&s2_connection)?;
+    let s2_basin = s2.basin(basin.clone());
     let workspace_id = WorkspaceId::generate();
     debug!(?workspace_id, "generated workspace id");
     progress.set("creating shared log stream");
     create_workspace_stream(&s2_basin, &workspace_id).await?;
     progress.set("checking shared log retention");
-    warn_if_workspace_stream_retention_not_infinite(&s2_basin, &workspace_id, progress).await;
+    warn_if_retention_not_infinite(
+        &s2,
+        &s2_basin,
+        &basin,
+        &workspace_id,
+        &workspace_config,
+        user_config,
+        progress,
+    )
+    .await?;
     let daemon_row = fresh_daemon_state_row(workspace_id, basin, &s2_connection);
     progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
@@ -487,11 +501,21 @@ async fn bootstrap_clone(
     let sync_root = ensure_clean_clone_root(&requested_root)?;
     ensure_sync_root_unconfigured(&sync_root).await?;
     progress.set(format!("connecting to basin {}", basin.as_ref()));
-    let s2_basin = s2_basin_from_config(basin.clone(), &s2_connection).await?;
+    let s2 = s2_client_from_config(&s2_connection)?;
+    let s2_basin = s2.basin(basin.clone());
     progress.set("checking shared log stream");
     ensure_workspace_stream_exists(&s2_basin, &workspace).await?;
     progress.set("checking shared log retention");
-    warn_if_workspace_stream_retention_not_infinite(&s2_basin, &workspace, progress).await;
+    warn_if_retention_not_infinite(
+        &s2,
+        &s2_basin,
+        &basin,
+        &workspace,
+        &workspace_config,
+        user_config,
+        progress,
+    )
+    .await?;
     let daemon_row = fresh_daemon_state_row(workspace, basin, &s2_connection);
     progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
@@ -507,20 +531,52 @@ async fn bootstrap_clone(
     })
 }
 
-async fn warn_if_workspace_stream_retention_not_infinite(
+async fn warn_if_retention_not_infinite(
+    s2: &S2,
     s2_basin: &S2Basin,
+    basin: &BasinName,
     workspace_id: &WorkspaceId,
+    workspace_config: &UserConfig,
+    user_config: &UserConfig,
     progress: &BootstrapProgress,
-) {
+) -> eyre::Result<()> {
+    if skip_retention_checks(workspace_config, user_config)? {
+        return Ok(());
+    }
+
     match workspace_stream_retention_warning(s2_basin, workspace_id).await {
         Ok(Some(warning)) => {
             progress.suspend(|| print_warning(&warning, CliStyle::for_stderr()));
         }
         Ok(None) => {}
         Err(error) => {
-            progress.suspend(|| print_retention_check_warning(&error, CliStyle::for_stderr()));
+            progress.suspend(|| {
+                print_retention_check_warning(
+                    "workspace ops stream",
+                    &error,
+                    CliStyle::for_stderr(),
+                )
+            });
         }
     }
+
+    match basin_default_stream_retention_warning(s2, basin.clone()).await {
+        Ok(Some(warning)) => {
+            progress.suspend(|| print_warning(&warning, CliStyle::for_stderr()));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            progress.suspend(|| {
+                print_retention_check_warning(
+                    "basin default stream",
+                    &error,
+                    CliStyle::for_stderr(),
+                )
+            });
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> eyre::Result<()> {
@@ -987,10 +1043,10 @@ fn print_warning(warning: &ipc::DaemonWarning, style: CliStyle) {
     );
 }
 
-fn print_retention_check_warning(error: &eyre::Report, style: CliStyle) {
+fn print_retention_check_warning(target: &str, error: &eyre::Report, style: CliStyle) {
     eprintln!(
-        "{} could not verify workspace ops stream retention: {error:#}. \
-         Future clones require the ops stream to retain records long enough; Infinite retention is recommended.",
+        "{} could not verify {target} retention: {error:#}. \
+         Opbox workspaces should use Infinite retention for the ops stream and basin default stream config.",
         style.yellow("warning:")
     );
 }
@@ -1001,6 +1057,11 @@ fn daemon_warning_text(warning: &ipc::DaemonWarning) -> String {
             "ops stream retention is {}; future clones may fail after records expire. \
              Reconfigure the ops stream to Infinite retention, or create workspaces in a basin \
              whose default stream retention is Infinite.",
+            retention_summary_text(retention)
+        ),
+        ipc::DaemonWarning::BasinDefaultStreamRetentionNotInfinite { retention } => format!(
+            "basin default stream retention is {}; future multipart object streams may expire. \
+             Reconfigure the basin default stream retention to Infinite before writing large objects.",
             retention_summary_text(retention)
         ),
     }
@@ -1119,6 +1180,7 @@ impl ConfigScope {
                 ConfigKey::BasinEndpoint,
                 ConfigKey::DaemonLogLevel,
                 ConfigKey::ClientLogLevel,
+                ConfigKey::SkipRetentionChecks,
             ],
             Self::Workspace => &[
                 ConfigKey::Basin,
@@ -1126,6 +1188,7 @@ impl ConfigScope {
                 ConfigKey::AccountEndpoint,
                 ConfigKey::BasinEndpoint,
                 ConfigKey::DaemonLogLevel,
+                ConfigKey::SkipRetentionChecks,
             ],
         }
     }
@@ -1214,6 +1277,9 @@ fn validate_config_value(key: ConfigKey, value: &str) -> eyre::Result<()> {
                     key.user_config_key().as_str()
                 )
             })?;
+        }
+        ConfigKey::SkipRetentionChecks => {
+            parse_bool_config_value(key.user_config_key().as_str(), value)?;
         }
     }
 

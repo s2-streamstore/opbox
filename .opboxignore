@@ -1,0 +1,27 @@
+# opbox always ignores .opbox/ internally.
+# .opboxignore uses gitignore syntax.
+# A bare name matches that file or directory at any depth.
+
+# version control
+.git
+
+# build artifacts and dependency trees
+target
+node_modules
+__pycache__
+*.pyc
+
+# editors and IDEs
+.idea
+*.swp
+*.swo
+*~
+.#*
+
+# operating system noise
+.DS_Store
+Thumbs.db
+
+# Imported from .gitignore by ob init.
+# Edit this file if opbox should track a different set of paths.
+/target

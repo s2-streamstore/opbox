@@ -31,6 +31,7 @@ pub enum StreamRetentionSummary {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DaemonWarning {
     OpsStreamRetentionNotInfinite { retention: StreamRetentionSummary },
+    BasinDefaultStreamRetentionNotInfinite { retention: StreamRetentionSummary },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
