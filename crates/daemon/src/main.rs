@@ -3,10 +3,12 @@ use opbox_core::app::db::{open_database, semantic_pool};
 use opbox_core::app::ipc::{self, ControlServerConfig};
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::app::s2::{
-    S2ConnectionConfig, ensure_workspace_stream_exists, report_is_s2_connectivity,
-    s2_basin_from_config,
+    S2ConnectionConfig, basin_default_stream_retention_warning, ensure_workspace_stream_exists,
+    report_is_s2_connectivity, s2_client_from_config, workspace_stream_retention_warning,
 };
-use opbox_core::app::user_config::{UserConfig, load_user_config, load_user_config_from_path};
+use opbox_core::app::user_config::{
+    UserConfig, load_user_config, load_user_config_from_path, skip_retention_checks,
+};
 use opbox_core::app::workspace::{
     DaemonLock, canonicalize_existing_dir, load_configured_daemon_state, remove_pid,
     workspace_config_path, write_pid,
@@ -21,7 +23,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -104,9 +106,56 @@ async fn run(
         daemon_row.s2_basin_endpoint.as_deref(),
         &user_config,
     )?;
-    let s2_basin = s2_basin_from_config(daemon_row.s2_basin.clone(), &s2_connection).await?;
+    let s2 = s2_client_from_config(&s2_connection)?;
+    let s2_basin = s2.basin(daemon_row.s2_basin.clone());
+    let skip_retention_checks = skip_retention_checks(&workspace_config, &user_config)?;
+    let mut status_warnings = Vec::new();
     match ensure_workspace_stream_exists(&s2_basin, &daemon_row.workspace_id).await {
-        Ok(()) => {}
+        Ok(()) => {
+            if !skip_retention_checks {
+                match workspace_stream_retention_warning(&s2_basin, &daemon_row.workspace_id).await
+                {
+                    Ok(Some(warning)) => {
+                        warn!(
+                            ?warning,
+                            "workspace ops stream retention is not infinite; future clones may fail after records expire"
+                        );
+                        status_warnings.push(warning);
+                    }
+                    Ok(None) => {}
+                    Err(error) if report_is_s2_connectivity(&error) => {
+                        warn!(
+                            ?error,
+                            "could not verify workspace ops stream retention because S2 is unavailable"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(?error, "could not verify workspace ops stream retention");
+                    }
+                }
+
+                match basin_default_stream_retention_warning(&s2, daemon_row.s2_basin.clone()).await
+                {
+                    Ok(Some(warning)) => {
+                        warn!(
+                            ?warning,
+                            "basin default stream retention is not infinite; future multipart object streams may expire"
+                        );
+                        status_warnings.push(warning);
+                    }
+                    Ok(None) => {}
+                    Err(error) if report_is_s2_connectivity(&error) => {
+                        warn!(
+                            ?error,
+                            "could not verify basin default stream retention because S2 is unavailable"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(?error, "could not verify basin default stream retention");
+                    }
+                }
+            }
+        }
         Err(err) if report_is_s2_connectivity(&err) => {
             tracing::warn!(
                 ?err,
@@ -135,9 +184,11 @@ async fn run(
         engine_status: Some(EngineStatusConfig {
             sync_root: sync_root.clone(),
             workspace_id: daemon_row.workspace_id.clone(),
+            basin: daemon_row.s2_basin.clone(),
             daemon_writer_id: daemon_row.daemon_writer_id.clone(),
             stable_cursor: daemon_row.stable_cursor.clone(),
             started_at,
+            warnings: status_warnings,
         }),
         spy_tx: Some(spy_tx.clone()),
     })

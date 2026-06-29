@@ -15,6 +15,7 @@ pub enum UserConfigKey {
     BasinEndpoint,
     DaemonLogLevel,
     ClientLogLevel,
+    SkipRetentionChecks,
 }
 
 impl UserConfigKey {
@@ -33,6 +34,7 @@ pub struct UserConfig {
     pub basin_endpoint: Option<String>,
     pub daemon_log_level: Option<String>,
     pub client_log_level: Option<String>,
+    pub skip_retention_checks: Option<String>,
 }
 
 impl UserConfig {
@@ -45,6 +47,7 @@ impl UserConfig {
             UserConfigKey::BasinEndpoint => self.basin_endpoint.as_deref(),
             UserConfigKey::DaemonLogLevel => self.daemon_log_level.as_deref(),
             UserConfigKey::ClientLogLevel => self.client_log_level.as_deref(),
+            UserConfigKey::SkipRetentionChecks => self.skip_retention_checks.as_deref(),
         }
     }
 
@@ -57,6 +60,7 @@ impl UserConfig {
             UserConfigKey::BasinEndpoint => self.basin_endpoint = Some(value),
             UserConfigKey::DaemonLogLevel => self.daemon_log_level = Some(value),
             UserConfigKey::ClientLogLevel => self.client_log_level = Some(value),
+            UserConfigKey::SkipRetentionChecks => self.skip_retention_checks = Some(value),
         }
     }
 
@@ -69,6 +73,7 @@ impl UserConfig {
             UserConfigKey::BasinEndpoint => self.basin_endpoint = None,
             UserConfigKey::DaemonLogLevel => self.daemon_log_level = None,
             UserConfigKey::ClientLogLevel => self.client_log_level = None,
+            UserConfigKey::SkipRetentionChecks => self.skip_retention_checks = None,
         }
     }
 
@@ -81,10 +86,32 @@ impl UserConfig {
             UserConfigKey::BasinEndpoint,
             UserConfigKey::DaemonLogLevel,
             UserConfigKey::ClientLogLevel,
+            UserConfigKey::SkipRetentionChecks,
         ]
         .into_iter()
         .filter_map(|key| self.get(key).map(|value| (key, value)))
     }
+}
+
+pub fn parse_bool_config_value(key: &str, value: &str) -> eyre::Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => eyre::bail!("invalid {key} {value:?}: expected true or false"),
+    }
+}
+
+pub fn skip_retention_checks(
+    workspace_config: &UserConfig,
+    user_config: &UserConfig,
+) -> eyre::Result<bool> {
+    if let Some(value) = workspace_config.skip_retention_checks.as_deref() {
+        return parse_bool_config_value(UserConfigKey::SkipRetentionChecks.as_str(), value);
+    }
+    if let Some(value) = user_config.skip_retention_checks.as_deref() {
+        return parse_bool_config_value(UserConfigKey::SkipRetentionChecks.as_str(), value);
+    }
+    Ok(false)
 }
 
 pub fn user_config_dir() -> eyre::Result<PathBuf> {
@@ -184,6 +211,7 @@ mod tests {
             basin_endpoint: Some("{basin}.s2.test".to_string()),
             daemon_log_level: Some("opbox_core=debug".to_string()),
             client_log_level: Some("warn".to_string()),
+            skip_retention_checks: Some("true".to_string()),
         };
 
         save_user_config_to_path(&config, &path)?;
@@ -195,6 +223,7 @@ mod tests {
         assert_eq!(loaded.basin_endpoint.as_deref(), Some("{basin}.s2.test"));
         assert_eq!(loaded.daemon_log_level.as_deref(), Some("opbox_core=debug"));
         assert_eq!(loaded.client_log_level.as_deref(), Some("warn"));
+        assert_eq!(loaded.skip_retention_checks.as_deref(), Some("true"));
 
         #[cfg(unix)]
         {
@@ -207,6 +236,23 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_skip_retention_checks_overrides_user_default() -> eyre::Result<()> {
+        let user_config = UserConfig {
+            skip_retention_checks: Some("true".to_string()),
+            ..UserConfig::default()
+        };
+        let workspace_config = UserConfig {
+            skip_retention_checks: Some("false".to_string()),
+            ..UserConfig::default()
+        };
+
+        assert!(!skip_retention_checks(&workspace_config, &user_config)?);
+        assert!(skip_retention_checks(&UserConfig::default(), &user_config)?);
+
         Ok(())
     }
 }

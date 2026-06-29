@@ -6,12 +6,13 @@ use opbox_core::app::db::{open_database, semantic_pool};
 use opbox_core::app::ipc;
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::app::s2::{
-    S2ConnectionConfig, create_workspace_stream, ensure_workspace_stream_exists,
-    s2_basin_from_config,
+    S2ConnectionConfig, basin_default_stream_retention_warning, create_workspace_stream,
+    ensure_workspace_stream_exists, s2_client_from_config, workspace_stream_retention_warning,
 };
 use opbox_core::app::user_config::{
-    UserConfig, UserConfigKey, load_user_config, load_user_config_from_path, save_user_config,
-    save_user_config_to_path, user_config_path,
+    UserConfig, UserConfigKey, load_user_config, load_user_config_from_path,
+    parse_bool_config_value, save_user_config, save_user_config_to_path, skip_retention_checks,
+    user_config_path,
 };
 use opbox_core::app::workspace::{
     NotInWorkspace, canonicalize_existing_dir, create_metadata_dir, current_dir, daemon_log_path,
@@ -29,7 +30,7 @@ use opbox_core::types::{
     DaemonWriterId, OutboxId, WorkspaceId, short_crockford_base32_lower_from_b64,
 };
 use s2_sdk::{
-    S2Basin,
+    S2, S2Basin,
     types::{AccountEndpoint, BasinEndpoint, BasinName},
 };
 use std::io::IsTerminal;
@@ -52,7 +53,11 @@ const STYLES: styling::Styles = styling::Styles::styled()
     .placeholder(styling::AnsiColor::Cyan.on_default());
 
 #[derive(Parser, Debug)]
-#[command(name = "ob", version, styles = STYLES)]
+#[command(
+    name = "ob",
+    version = concat!(env!("CARGO_PKG_VERSION"), " ", env!("OPBOX_BUILD_HASH")),
+    styles = STYLES
+)]
 struct Args {
     #[clap(subcommand)]
     command: Command,
@@ -134,6 +139,9 @@ enum ConfigCommand {
     /// List configured values.
     List,
 
+    /// List supported config keys.
+    Keys,
+
     /// Get one configured value.
     Get {
         #[arg(value_enum)]
@@ -170,6 +178,8 @@ enum ConfigKey {
     DaemonLogLevel,
     #[value(alias = "client_log_level")]
     ClientLogLevel,
+    #[value(alias = "skip_retention_checks")]
+    SkipRetentionChecks,
 }
 
 impl ConfigKey {
@@ -182,6 +192,7 @@ impl ConfigKey {
             Self::BasinEndpoint => UserConfigKey::BasinEndpoint,
             Self::DaemonLogLevel => UserConfigKey::DaemonLogLevel,
             Self::ClientLogLevel => UserConfigKey::ClientLogLevel,
+            Self::SkipRetentionChecks => UserConfigKey::SkipRetentionChecks,
         }
     }
 }
@@ -444,11 +455,23 @@ async fn bootstrap_init(
     let sync_root = canonicalize_existing_dir(&root_or_current(sync_root)?)?;
     ensure_sync_root_unconfigured(&sync_root).await?;
     progress.set(format!("connecting to basin {}", basin.as_ref()));
-    let s2_basin = s2_basin_from_config(basin.clone(), &s2_connection).await?;
+    let s2 = s2_client_from_config(&s2_connection)?;
+    let s2_basin = s2.basin(basin.clone());
     let workspace_id = WorkspaceId::generate();
     debug!(?workspace_id, "generated workspace id");
     progress.set("creating shared log stream");
     create_workspace_stream(&s2_basin, &workspace_id).await?;
+    progress.set("checking shared log retention");
+    warn_if_retention_not_infinite(
+        &s2,
+        &s2_basin,
+        &basin,
+        &workspace_id,
+        &workspace_config,
+        user_config,
+        progress,
+    )
+    .await?;
     let daemon_row = fresh_daemon_state_row(workspace_id, basin, &s2_connection);
     progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
@@ -485,9 +508,21 @@ async fn bootstrap_clone(
     let sync_root = ensure_clean_clone_root(&requested_root)?;
     ensure_sync_root_unconfigured(&sync_root).await?;
     progress.set(format!("connecting to basin {}", basin.as_ref()));
-    let s2_basin = s2_basin_from_config(basin.clone(), &s2_connection).await?;
+    let s2 = s2_client_from_config(&s2_connection)?;
+    let s2_basin = s2.basin(basin.clone());
     progress.set("checking shared log stream");
     ensure_workspace_stream_exists(&s2_basin, &workspace).await?;
+    progress.set("checking shared log retention");
+    warn_if_retention_not_infinite(
+        &s2,
+        &s2_basin,
+        &basin,
+        &workspace,
+        &workspace_config,
+        user_config,
+        progress,
+    )
+    .await?;
     let daemon_row = fresh_daemon_state_row(workspace, basin, &s2_connection);
     progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
@@ -501,6 +536,58 @@ async fn bootstrap_clone(
         s2_basin,
         clone_log_read_stop,
     })
+}
+
+async fn warn_if_retention_not_infinite(
+    s2: &S2,
+    s2_basin: &S2Basin,
+    basin: &BasinName,
+    workspace_id: &WorkspaceId,
+    workspace_config: &UserConfig,
+    user_config: &UserConfig,
+    progress: &BootstrapProgress,
+) -> eyre::Result<()> {
+    if skip_retention_checks(workspace_config, user_config)? {
+        return Ok(());
+    }
+    let context = RetentionWarningContext {
+        basin: basin.as_ref(),
+        workspace_id: &workspace_id.0,
+    };
+
+    match workspace_stream_retention_warning(s2_basin, workspace_id).await {
+        Ok(Some(warning)) => {
+            progress.suspend(|| print_warning(&warning, context, CliStyle::for_stderr()));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            progress.suspend(|| {
+                print_retention_check_warning(
+                    "workspace ops stream",
+                    &error,
+                    CliStyle::for_stderr(),
+                )
+            });
+        }
+    }
+
+    match basin_default_stream_retention_warning(s2, basin.clone()).await {
+        Ok(Some(warning)) => {
+            progress.suspend(|| print_warning(&warning, context, CliStyle::for_stderr()));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            progress.suspend(|| {
+                print_retention_check_warning(
+                    "basin default stream",
+                    &error,
+                    CliStyle::for_stderr(),
+                )
+            });
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> eyre::Result<()> {
@@ -856,6 +943,14 @@ impl BootstrapProgress {
         }
     }
 
+    fn suspend(&self, action: impl FnOnce()) {
+        if let Some(bar) = &self.bar {
+            bar.suspend(action);
+        } else {
+            action();
+        }
+    }
+
     fn finish(&self) {
         if let Some(bar) = &self.bar {
             bar.finish_and_clear();
@@ -937,15 +1032,132 @@ impl CliStyle {
 fn print_daemon_status(title: &str, status: &ipc::DaemonStatus, style: CliStyle) {
     println!("{}", style.bold(title));
     print_status_row("workspace", &status.workspace_id, style);
+    print_status_row("basin", &status.basin, style);
     print_status_row("root", &status.root, style);
     print_status_row("pid", status.pid, style);
     print_status_row("engine phase", status.engine_phase, style);
     print_status_row("stable cursor", status.stable_cursor_end, style);
     print_status_row("connectivity", connectivity_status_text(status), style);
+    let context = RetentionWarningContext {
+        basin: &status.basin,
+        workspace_id: &status.workspace_id,
+    };
+    for warning in &status.warnings {
+        print_status_warning(warning, context, style);
+    }
 }
 
 fn print_status_row(label: &str, value: impl std::fmt::Display, style: CliStyle) {
     println!("  {}  {}", style.dim(format!("{label:<13}")), value);
+}
+
+#[derive(Clone, Copy)]
+struct RetentionWarningContext<'a> {
+    basin: &'a str,
+    workspace_id: &'a str,
+}
+
+fn print_status_warning(
+    warning: &ipc::DaemonWarning,
+    context: RetentionWarningContext<'_>,
+    style: CliStyle,
+) {
+    let lines = daemon_warning_lines(warning, context);
+    let Some((first, rest)) = lines.split_first() else {
+        return;
+    };
+    print_status_row("warning", style.yellow(first), style);
+    for line in rest {
+        print_status_row("", style.yellow(line), style);
+    }
+}
+
+fn print_warning(
+    warning: &ipc::DaemonWarning,
+    context: RetentionWarningContext<'_>,
+    style: CliStyle,
+) {
+    let lines = daemon_warning_lines(warning, context);
+    let Some((first, rest)) = lines.split_first() else {
+        return;
+    };
+    eprintln!("{} {}", style.yellow("warning:"), first);
+    for line in rest {
+        eprintln!("         {line}");
+    }
+}
+
+fn print_retention_check_warning(target: &str, error: &eyre::Report, style: CliStyle) {
+    eprintln!(
+        "{} could not verify {target} retention: {error:#}. \
+         Opbox workspaces should use Infinite retention for the ops stream and basin default stream config.",
+        style.yellow("warning:")
+    );
+}
+
+fn daemon_warning_lines(
+    warning: &ipc::DaemonWarning,
+    context: RetentionWarningContext<'_>,
+) -> Vec<String> {
+    match warning {
+        ipc::DaemonWarning::OpsStreamRetentionNotInfinite { retention } => vec![
+            format!(
+                "ops stream retention is {}; future clones may fail after records expire.",
+                retention_summary_text(retention)
+            ),
+            "if this workspace is disposable, fix the basin default and recreate it.".to_string(),
+            "to keep this workspace, reconfigure the ops stream:".to_string(),
+            format!(
+                "$ s2 reconfigure-stream s2://{}/{}/ops --retention-policy infinite",
+                context.basin, context.workspace_id
+            ),
+            "this does not restore expired records; existing object streams may also need reconfiguration.".to_string(),
+        ],
+        ipc::DaemonWarning::BasinDefaultStreamRetentionNotInfinite { retention } => vec![
+            format!(
+                "basin default stream retention is {}; future multipart object streams may expire.",
+                retention_summary_text(retention)
+            ),
+            "for new/prototype workspaces, fix the basin default and recreate the opbox workspace:"
+                .to_string(),
+            format!(
+                "$ s2 reconfigure-basin {} --retention-policy infinite",
+                context.basin
+            ),
+            "this does not change existing streams or restore records that may already have expired."
+                .to_string(),
+        ],
+    }
+}
+
+fn retention_summary_text(retention: &ipc::StreamRetentionSummary) -> String {
+    match retention {
+        ipc::StreamRetentionSummary::Age { seconds } => duration_text(*seconds),
+        ipc::StreamRetentionSummary::Unspecified => "not confirmed as Infinite".to_string(),
+    }
+}
+
+fn duration_text(seconds: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+
+    if seconds != 0 && seconds % DAY == 0 {
+        let days = seconds / DAY;
+        format!("{days} day{}", plural(days))
+    } else if seconds != 0 && seconds % HOUR == 0 {
+        let hours = seconds / HOUR;
+        format!("{hours} hour{}", plural(hours))
+    } else if seconds != 0 && seconds % MINUTE == 0 {
+        let minutes = seconds / MINUTE;
+        format!("{minutes} minute{}", plural(minutes))
+    } else {
+        format!("{seconds} second{}", plural(seconds))
+    }
+}
+
+fn plural(value: u64) -> &'static str {
+    if value == 1 { "" } else { "s" }
 }
 
 fn connectivity_status_text(status: &ipc::DaemonStatus) -> String {
@@ -1031,6 +1243,7 @@ impl ConfigScope {
                 ConfigKey::BasinEndpoint,
                 ConfigKey::DaemonLogLevel,
                 ConfigKey::ClientLogLevel,
+                ConfigKey::SkipRetentionChecks,
             ],
             Self::Workspace => &[
                 ConfigKey::Basin,
@@ -1038,6 +1251,7 @@ impl ConfigScope {
                 ConfigKey::AccountEndpoint,
                 ConfigKey::BasinEndpoint,
                 ConfigKey::DaemonLogLevel,
+                ConfigKey::SkipRetentionChecks,
             ],
         }
     }
@@ -1127,6 +1341,9 @@ fn validate_config_value(key: ConfigKey, value: &str) -> eyre::Result<()> {
                 )
             })?;
         }
+        ConfigKey::SkipRetentionChecks => {
+            parse_bool_config_value(key.user_config_key().as_str(), value)?;
+        }
     }
 
     Ok(())
@@ -1156,6 +1373,11 @@ fn run_config(workspace: bool, command: ConfigCommand) -> eyre::Result<()> {
                         config_display_value(key, value, false)
                     );
                 }
+            }
+        }
+        ConfigCommand::Keys => {
+            for key in scope.keys().iter().copied().map(ConfigKey::user_config_key) {
+                println!("{}", key.as_str());
             }
         }
         ConfigCommand::Get { key } => {

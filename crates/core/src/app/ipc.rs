@@ -26,7 +26,9 @@ use tracing::{debug, warn};
 
 type IpcBody = UnsyncBoxBody<Bytes, Infallible>;
 
-pub use crate::app::control::{DaemonStatus, EnginePhaseStatus};
+pub use crate::app::control::{
+    DaemonStatus, DaemonWarning, EnginePhaseStatus, StreamRetentionSummary,
+};
 
 pub const IPC_PROTOCOL_VERSION: u32 = 1;
 
@@ -643,6 +645,7 @@ mod tests {
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
         let expected_status = DaemonStatus {
             workspace_id: daemon_row.workspace_id.0.clone(),
+            basin: daemon_row.s2_basin.as_ref().to_string(),
             root: sync_root.display().to_string(),
             pid: 123,
             stable_cursor_end: 42,
@@ -650,6 +653,9 @@ mod tests {
             started_at_ns: 0,
             engine_phase: EnginePhaseStatus::Scanning,
             connectivity: ConnectivitySnapshot::starting(),
+            warnings: vec![DaemonWarning::OpsStreamRetentionNotInfinite {
+                retention: StreamRetentionSummary::Age { seconds: 86_400 },
+            }],
         };
         let engine = tokio::spawn({
             let expected_status = expected_status.clone();
@@ -680,11 +686,13 @@ mod tests {
 
         let status = request_status(&sync_root).await?;
         assert_eq!(status.workspace_id, expected_status.workspace_id);
+        assert_eq!(status.basin, expected_status.basin);
         assert_eq!(status.root, expected_status.root);
         assert_eq!(status.pid, expected_status.pid);
         assert_eq!(status.stable_cursor_end, expected_status.stable_cursor_end);
         assert_eq!(status.engine_phase, expected_status.engine_phase);
         assert_eq!(status.connectivity, expected_status.connectivity);
+        assert_eq!(status.warnings, expected_status.warnings);
 
         token.cancel();
         server.await??;
@@ -790,6 +798,7 @@ mod tests {
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
         let expected_status = DaemonStatus {
             workspace_id: daemon_row.workspace_id.0.clone(),
+            basin: daemon_row.s2_basin.as_ref().to_string(),
             root: sync_root.display().to_string(),
             pid: 123,
             stable_cursor_end: 42,
@@ -797,6 +806,7 @@ mod tests {
             started_at_ns: 0,
             engine_phase: EnginePhaseStatus::Scanning,
             connectivity: ConnectivitySnapshot::starting(),
+            warnings: Vec::new(),
         };
         let engine = tokio::spawn({
             let expected_status = expected_status.clone();
@@ -895,6 +905,7 @@ mod tests {
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
         let expected_status = DaemonStatus {
             workspace_id: daemon_row.workspace_id.0.clone(),
+            basin: daemon_row.s2_basin.as_ref().to_string(),
             root: sync_root.display().to_string(),
             pid: 123,
             stable_cursor_end: 42,
@@ -902,6 +913,7 @@ mod tests {
             started_at_ns: 0,
             engine_phase: EnginePhaseStatus::Scanning,
             connectivity: ConnectivitySnapshot::starting(),
+            warnings: Vec::new(),
         };
         let engine = tokio::spawn({
             let expected_status = expected_status.clone();
