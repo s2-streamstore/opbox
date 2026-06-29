@@ -1524,7 +1524,9 @@ async fn stop_mismatched_daemon_by_signal(
     terminate_daemon_process(pid)?;
     eprintln!(
         "{}",
-        style.yellow(format!("sent SIGTERM to mismatched opbox daemon pid {pid}"))
+        style.yellow(format!(
+            "sent termination signal to mismatched opbox daemon pid {pid}"
+        ))
     );
     Ok(ipc::StopResponse { workspace_id, pid })
 }
@@ -1568,6 +1570,7 @@ fn read_daemon_pid(root: &Path) -> eyre::Result<u32> {
         .map_err(|error| eyre::eyre!("invalid daemon pid in {}: {error}", path.display()))
 }
 
+#[cfg(unix)]
 fn terminate_daemon_process(pid: u32) -> eyre::Result<()> {
     let status = std::process::Command::new("kill")
         .arg("-TERM")
@@ -1580,6 +1583,19 @@ fn terminate_daemon_process(pid: u32) -> eyre::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn terminate_daemon_process(pid: u32) -> eyre::Result<()> {
+    let status = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status()
+        .map_err(|error| eyre::eyre!("failed to terminate daemon pid {pid}: {error}"))?;
+    if !status.success() {
+        eyre::bail!("failed to terminate daemon pid {pid}: taskkill exited with {status}");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn daemon_process_is_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .arg("-0")
@@ -1590,6 +1606,19 @@ fn daemon_process_is_alive(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+#[cfg(windows)]
+fn daemon_process_is_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .map(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.contains(&pid.to_string())
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
 fn run_daemon_logs(follow: bool, sync_root: Option<PathBuf>) -> eyre::Result<()> {
     let root = find_workspace_root(&root_or_current(sync_root)?)?;
     let log_path = daemon_log_path(&root);
@@ -1613,6 +1642,40 @@ fn run_daemon_logs(follow: bool, sync_root: Option<PathBuf>) -> eyre::Result<()>
         .arg(&log_path)
         .exec();
     Err(eyre::eyre!("failed to exec tail -f: {error}"))
+}
+
+#[cfg(windows)]
+fn run_daemon_logs(follow: bool, sync_root: Option<PathBuf>) -> eyre::Result<()> {
+    let root = find_workspace_root(&root_or_current(sync_root)?)?;
+    let log_path = daemon_log_path(&root);
+
+    if !follow {
+        println!("{}", log_path.display());
+        return Ok(());
+    }
+
+    if !log_path.try_exists()? {
+        eyre::bail!(
+            "no daemon log at {} yet; run {} to start the daemon",
+            log_path.display(),
+            CliStyle::for_stderr().bold(format!("{CLIENT_COMMAND} start")),
+        );
+    }
+
+    let status = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("Get-Content -Path '{}' -Wait -Tail 50", log_path.display()),
+        ])
+        .status()
+        .map_err(|error| eyre::eyre!("failed to tail log: {error}"))?;
+
+    if !status.success() {
+        eyre::bail!("log follower exited with {status}");
+    }
+
+    Ok(())
 }
 
 fn with_failure_banner(command: &'static str, result: eyre::Result<()>) -> eyre::Result<()> {
