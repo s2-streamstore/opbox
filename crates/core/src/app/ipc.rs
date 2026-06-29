@@ -368,7 +368,8 @@ pub async fn serve_control(
             &config.daemon_state.daemon_writer_id,
         );
         remove_stale_socket(&socket_path)?;
-        let listener = UnixListener::bind(&socket_path)?;
+        let listener = UnixListener::bind(&socket_path)
+            .wrap_err_with(|| format!("bind daemon control socket {}", socket_path.display()))?;
         replace_socket_symlink(&socket_path, &socket_link_path(&config.sync_root))?;
         let _guard = SocketGuard {
             socket_path,
