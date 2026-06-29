@@ -202,6 +202,7 @@ struct Bootstrap {
     db_path: PathBuf,
     sync_root: PathBuf,
     daemon_row: daemon_state::Row,
+    s2_connection: S2ConnectionConfig,
     s2_basin: S2Basin,
     clone_log_read_stop: Option<LogReadStop>,
 }
@@ -484,6 +485,7 @@ async fn bootstrap_init(
         db_path: storage_db_path(&sync_root),
         sync_root,
         daemon_row,
+        s2_connection,
         s2_basin,
         clone_log_read_stop: None,
     })
@@ -533,6 +535,7 @@ async fn bootstrap_clone(
         db_path: storage_db_path(&sync_root),
         sync_root,
         daemon_row,
+        s2_connection,
         s2_basin,
         clone_log_read_stop,
     })
@@ -595,6 +598,7 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
     let sync_root = bootstrap.sync_root.clone();
     let workspace_id = bootstrap.daemon_row.workspace_id.clone();
     let basin = bootstrap.daemon_row.s2_basin.clone();
+    let s2_connection = bootstrap.s2_connection.clone();
 
     progress.set(match mode {
         RunMode::Init => "uploading initial workspace snapshot",
@@ -643,6 +647,8 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
             "your workspace is: {}",
             style.bold(style.green(&workspace_id.0))
         );
+        println!();
+        print_share_clone_command(&workspace_id, &basin, &s2_connection, style);
         println!();
     }
     println!(
@@ -1049,6 +1055,63 @@ fn print_daemon_status(title: &str, status: &ipc::DaemonStatus, style: CliStyle)
 
 fn print_status_row(label: &str, value: impl std::fmt::Display, style: CliStyle) {
     println!("  {}  {}", style.dim(format!("{label:<13}")), value);
+}
+
+fn print_share_clone_command(
+    workspace_id: &WorkspaceId,
+    basin: &BasinName,
+    connection: &S2ConnectionConfig,
+    style: CliStyle,
+) {
+    println!(
+        "{}",
+        style.bold("share this clone command (contains access token):")
+    );
+    println!();
+    for line in share_clone_command_lines(workspace_id, basin, connection) {
+        println!("  {line}");
+    }
+}
+
+fn share_clone_command_lines(
+    workspace_id: &WorkspaceId,
+    basin: &BasinName,
+    connection: &S2ConnectionConfig,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("{CLIENT_COMMAND} clone \\"),
+        format!("  --workspace {} \\", shell_quote(&workspace_id.0)),
+        format!(
+            "  --access-token {} \\",
+            shell_quote(&connection.access_token)
+        ),
+    ];
+    let (account_endpoint, basin_endpoint) = connection.endpoint_pair_for_metadata();
+    if let Some(account_endpoint) = account_endpoint {
+        lines.push(format!(
+            "  --account-endpoint {} \\",
+            shell_quote(&account_endpoint)
+        ));
+    }
+    if let Some(basin_endpoint) = basin_endpoint {
+        lines.push(format!(
+            "  --basin-endpoint {} \\",
+            shell_quote(&basin_endpoint)
+        ));
+    }
+    lines.push(format!("  --basin {}", shell_quote(basin.as_ref())));
+    lines
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/' | b':' | b'=' | b'@'))
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[derive(Clone, Copy)]
@@ -1879,6 +1942,55 @@ mod tests {
         assert_eq!(row.s2_basin_endpoint.as_deref(), Some("{basin}.s2.test"));
 
         Ok(())
+    }
+
+    #[test]
+    fn share_clone_command_includes_effective_connection_config() -> eyre::Result<()> {
+        let workspace_id = WorkspaceId("dwwbav5ypjgxra25s7hjzt81gvdbsbmm".to_string());
+        let basin: BasinName = "opbox-dev-2".parse()?;
+        let connection = S2ConnectionConfig {
+            access_token: "R3QAAAAAAABq+secret/token".to_string(),
+            account_endpoint: Some("account.example.test".to_string()),
+            basin_endpoint: Some("{basin}.example.test".to_string()),
+        };
+
+        assert_eq!(
+            share_clone_command_lines(&workspace_id, &basin, &connection),
+            vec![
+                "ob clone \\".to_string(),
+                "  --workspace dwwbav5ypjgxra25s7hjzt81gvdbsbmm \\".to_string(),
+                "  --access-token 'R3QAAAAAAABq+secret/token' \\".to_string(),
+                "  --account-endpoint account.example.test \\".to_string(),
+                "  --basin-endpoint '{basin}.example.test' \\".to_string(),
+                "  --basin opbox-dev-2".to_string(),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn share_clone_command_omits_partial_endpoint_config() -> eyre::Result<()> {
+        let workspace_id = WorkspaceId("dwwbav5ypjgxra25s7hjzt81gvdbsbmm".to_string());
+        let basin: BasinName = "opbox-dev-2".parse()?;
+        let connection = S2ConnectionConfig {
+            access_token: "tok-123".to_string(),
+            account_endpoint: Some("account.example.test".to_string()),
+            basin_endpoint: None,
+        };
+
+        let command = share_clone_command_lines(&workspace_id, &basin, &connection).join("\n");
+        assert!(!command.contains("--account-endpoint"));
+        assert!(!command.contains("--basin-endpoint"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("simple-token_123"), "simple-token_123");
+        assert_eq!(shell_quote("needs space"), "'needs space'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]
