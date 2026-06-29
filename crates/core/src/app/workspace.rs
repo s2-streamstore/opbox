@@ -5,6 +5,7 @@ use crate::types::{DaemonWriterId, WorkspaceId};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use xxhash_rust::xxh3::xxh3_128;
 
 pub const STORAGE_DB_FILE_NAME: &str = "storage.db";
 pub const SOCKET_LINK_FILE_NAME: &str = "socket";
@@ -42,21 +43,28 @@ pub fn workspace_config_path(sync_root: &Path) -> PathBuf {
 }
 
 pub fn real_socket_path(workspace_id: &WorkspaceId, daemon_writer_id: &DaemonWriterId) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "opbox-{}-{}.sock",
-        workspace_id.0,
-        hex_component(daemon_writer_id.0.as_ref())
+    socket_dir().join(format!(
+        "ob-{:032x}.sock",
+        socket_id_hash(workspace_id, daemon_writer_id)
     ))
 }
 
-fn hex_component(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
+#[cfg(unix)]
+fn socket_dir() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+#[cfg(not(unix))]
+fn socket_dir() -> PathBuf {
+    std::env::temp_dir()
+}
+
+fn socket_id_hash(workspace_id: &WorkspaceId, daemon_writer_id: &DaemonWriterId) -> u128 {
+    let mut bytes = Vec::with_capacity(workspace_id.0.len() + 1 + daemon_writer_id.0.len());
+    bytes.extend_from_slice(workspace_id.0.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(daemon_writer_id.0.as_ref());
+    xxh3_128(&bytes)
 }
 
 pub fn remove_socket_pointer(sync_root: &Path) -> eyre::Result<()> {
@@ -403,5 +411,22 @@ mod tests {
             path.len() < 100,
             "socket path should stay below common Unix SUN_LEN limits: {path}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_path_uses_short_unix_tmp_name() {
+        let workspace_id = WorkspaceId("0123456789abcdefghijklmnopqrstuv".to_string());
+        let writer_id = DaemonWriterId(Bytes::from_static(b"0123456789abcdef"));
+        let path = real_socket_path(&workspace_id, &writer_id);
+
+        assert_eq!(path.parent(), Some(Path::new("/tmp")));
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("socket filename is valid utf-8");
+        assert!(file_name.starts_with("ob-"), "{file_name}");
+        assert!(file_name.ends_with(".sock"), "{file_name}");
+        assert_eq!(file_name.len(), "ob-".len() + 32 + ".sock".len());
     }
 }
