@@ -7,7 +7,8 @@ use opbox_core::app::ipc;
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::app::s2::{
     S2ConnectionConfig, basin_default_stream_retention_warning, create_workspace_stream,
-    ensure_workspace_stream_exists, s2_client_from_config, workspace_stream_retention_warning,
+    ensure_basin_stream_cipher, ensure_workspace_stream_exists, s2_client_from_config,
+    workspace_stream_retention_warning,
 };
 use opbox_core::app::user_config::{
     UserConfig, UserConfigKey, load_user_config, load_user_config_from_path,
@@ -33,8 +34,9 @@ use s2_sdk::{
     S2, S2Basin,
     types::{
         AccessTokenId, AccessTokenIdPrefix, AccessTokenMatcher, AccessTokenScopeInput,
-        AccountEndpoint, BasinEndpoint, BasinMatcher, BasinName, IssueAccessTokenInput,
-        ListAccessTokensInput, Operation, S2DateTime, S2Error, StreamMatcher, StreamNamePrefix,
+        AccountEndpoint, BasinEndpoint, BasinMatcher, BasinName, EncryptionKey,
+        IssueAccessTokenInput, ListAccessTokensInput, Operation, S2DateTime, S2Error,
+        StreamMatcher, StreamNamePrefix,
     },
 };
 use std::io::IsTerminal;
@@ -99,6 +101,9 @@ enum Command {
     Clone {
         #[arg(long)]
         workspace: WorkspaceId,
+        /// Encryption key for the workspace (base64-encoded).
+        #[arg(long)]
+        cipher: String,
         /// Clone only shared log records at or before this RFC3339 timestamp.
         #[arg(long, value_name = "RFC3339")]
         as_of: Option<CloneAsOf>,
@@ -339,6 +344,7 @@ fn fresh_daemon_state_row(
     workspace_id: WorkspaceId,
     basin: BasinName,
     connection: &S2ConnectionConfig,
+    encryption_key: Option<EncryptionKey>,
 ) -> daemon_state::Row {
     let writer_id = rand::random::<[u8; 16]>();
     let (s2_account_endpoint, s2_basin_endpoint) = connection.endpoint_pair_for_metadata();
@@ -351,7 +357,16 @@ fn fresh_daemon_state_row(
         daemon_writer_id: DaemonWriterId(bytes::Bytes::copy_from_slice(&writer_id)),
         stable_cursor: ..0,
         next_outbox_id: OutboxId::new(0),
+        encryption_key,
     }
+}
+
+fn generate_encryption_key() -> EncryptionKey {
+    EncryptionKey::new(rand::random::<[u8; 32]>())
+}
+
+fn encryption_key_string(key: &EncryptionKey) -> String {
+    key.to_header_value().to_str().unwrap().to_owned()
 }
 
 fn create_default_ignore_file(sync_root: &Path) -> eyre::Result<()> {
@@ -549,6 +564,9 @@ async fn bootstrap_init(
     let s2_basin = s2.basin(basin.clone());
     let workspace_id = WorkspaceId::generate();
     debug!(?workspace_id, "generated workspace id");
+    progress.set("configuring basin encryption");
+    ensure_basin_stream_cipher(&s2, basin.clone()).await?;
+    let encryption_key = generate_encryption_key();
     progress.set("creating shared log stream");
     create_workspace_stream(&s2_basin, &workspace_id).await?;
     progress.set("checking shared log retention");
@@ -562,7 +580,8 @@ async fn bootstrap_init(
         progress,
     )
     .await?;
-    let daemon_row = fresh_daemon_state_row(workspace_id, basin, &s2_connection);
+    let daemon_row =
+        fresh_daemon_state_row(workspace_id, basin, &s2_connection, Some(encryption_key));
     progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
     save_workspace_config(&sync_root, &workspace_config)?;
@@ -582,6 +601,7 @@ async fn bootstrap_init(
 
 async fn bootstrap_clone(
     workspace: WorkspaceId,
+    cipher: String,
     sync_root: Option<PathBuf>,
     clone_log_read_stop: Option<LogReadStop>,
     user_config: &UserConfig,
@@ -603,6 +623,9 @@ async fn bootstrap_clone(
     let s2_basin = s2.basin(basin.clone());
     progress.set("checking shared log stream");
     ensure_workspace_stream_exists(&s2_basin, &workspace).await?;
+    let encryption_key: EncryptionKey = cipher
+        .parse()
+        .map_err(|err| eyre::eyre!("invalid --cipher value: {err}"))?;
     progress.set("checking shared log retention");
     warn_if_retention_not_infinite(
         &s2,
@@ -614,7 +637,7 @@ async fn bootstrap_clone(
         progress,
     )
     .await?;
-    let daemon_row = fresh_daemon_state_row(workspace, basin, &s2_connection);
+    let daemon_row = fresh_daemon_state_row(workspace, basin, &s2_connection, Some(encryption_key));
     progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
     save_workspace_config(&sync_root, &workspace_config)?;
@@ -687,6 +710,7 @@ struct ShareContext {
     workspace_id: WorkspaceId,
     basin: BasinName,
     connection: S2ConnectionConfig,
+    encryption_key: Option<EncryptionKey>,
 }
 
 struct IssuedShareToken {
@@ -710,12 +734,14 @@ async fn load_share_context(sync_root: Option<PathBuf>) -> eyre::Result<ShareCon
         None,
         &user_config,
     )?;
+    let (_, daemon_row) = load_configured_daemon_state(&root).await?;
 
     Ok(ShareContext {
         root,
         workspace_id,
         basin,
         connection,
+        encryption_key: daemon_row.encryption_key,
     })
 }
 
@@ -872,6 +898,7 @@ async fn run_share(command: ShareCommand) -> eyre::Result<()> {
                 &ctx.workspace_id,
                 &ctx.basin,
                 &token.access_token,
+                ctx.encryption_key.as_ref(),
                 &ctx.connection,
                 style,
             );
@@ -939,6 +966,7 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
     let workspace_id = bootstrap.daemon_row.workspace_id.clone();
     let basin = bootstrap.daemon_row.s2_basin.clone();
     let s2_connection = bootstrap.s2_connection.clone();
+    let encryption_key = bootstrap.daemon_row.encryption_key.clone();
 
     progress.set(match mode {
         RunMode::Init => "uploading initial workspace snapshot",
@@ -972,6 +1000,7 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
             workspace_id: workspace_id.clone(),
             basin: basin.clone(),
             connection: s2_connection.clone(),
+            encryption_key: encryption_key.clone(),
         };
         match issue_share_token(&ctx, BOOTSTRAP_SHARE_ID, None).await {
             Ok(token) => Some(token),
@@ -1016,12 +1045,19 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
                 &workspace_id,
                 &basin,
                 &token.access_token,
+                encryption_key.as_ref(),
                 &s2_connection,
                 style,
             );
             println!();
         } else if should_print_configured_clone_command(&s2_connection) {
-            print_configured_clone_command(&workspace_id, &basin, &s2_connection, style);
+            print_configured_clone_command(
+                &workspace_id,
+                &basin,
+                encryption_key.as_ref(),
+                &s2_connection,
+                style,
+            );
             println!();
         } else {
             print_bootstrap_share_next_step(style);
@@ -1470,6 +1506,7 @@ fn print_share_clone_command(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
     access_token: &str,
+    encryption_key: Option<&EncryptionKey>,
     connection: &S2ConnectionConfig,
     style: CliStyle,
 ) {
@@ -1478,6 +1515,7 @@ fn print_share_clone_command(
         workspace_id,
         basin,
         access_token,
+        encryption_key,
         connection,
         style,
     );
@@ -1486,6 +1524,7 @@ fn print_share_clone_command(
 fn print_configured_clone_command(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
+    encryption_key: Option<&EncryptionKey>,
     connection: &S2ConnectionConfig,
     style: CliStyle,
 ) {
@@ -1494,6 +1533,7 @@ fn print_configured_clone_command(
         workspace_id,
         basin,
         &connection.access_token,
+        encryption_key,
         connection,
         style,
     );
@@ -1504,12 +1544,19 @@ fn print_clone_command(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
     access_token: &str,
+    encryption_key: Option<&EncryptionKey>,
     connection: &S2ConnectionConfig,
     style: CliStyle,
 ) {
     println!("{}", style.bold(title));
     println!();
-    for line in share_clone_command_lines(workspace_id, basin, access_token, connection) {
+    for line in share_clone_command_lines(
+        workspace_id,
+        basin,
+        access_token,
+        encryption_key,
+        connection,
+    ) {
         println!("  {line}");
     }
 }
@@ -1518,6 +1565,7 @@ fn share_clone_command_lines(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
     access_token: &str,
+    encryption_key: Option<&EncryptionKey>,
     connection: &S2ConnectionConfig,
 ) -> Vec<String> {
     let mut lines = vec![
@@ -1525,6 +1573,12 @@ fn share_clone_command_lines(
         format!("  --workspace {} \\", shell_quote(&workspace_id.0)),
         format!("  --access-token {} \\", shell_quote(access_token)),
     ];
+    if let Some(key) = encryption_key {
+        lines.push(format!(
+            "  --cipher {} \\",
+            shell_quote(&encryption_key_string(key))
+        ));
+    }
     let (account_endpoint, basin_endpoint) = connection.endpoint_pair_for_metadata();
     if let Some(account_endpoint) = account_endpoint {
         lines.push(format!(
@@ -2319,6 +2373,7 @@ async fn main() {
         ),
         Command::Clone {
             workspace,
+            cipher,
             as_of,
             config,
             sync_root,
@@ -2330,6 +2385,7 @@ async fn main() {
                 let user_config = load_user_config()?;
                 let bootstrap = bootstrap_clone(
                     workspace,
+                    cipher,
                     sync_root,
                     as_of.map(CloneAsOf::log_read_stop),
                     &user_config,
@@ -2386,7 +2442,7 @@ mod tests {
             basin_endpoint: Some("{basin}.s2.test".to_string()),
         };
 
-        let row = fresh_daemon_state_row(workspace_id, basin, &connection);
+        let row = fresh_daemon_state_row(workspace_id, basin, &connection, None);
         assert_eq!(row.s2_account_endpoint.as_deref(), Some("account.s2.test"));
         assert_eq!(row.s2_basin_endpoint.as_deref(), Some("{basin}.s2.test"));
 
@@ -2503,7 +2559,13 @@ mod tests {
         };
 
         assert_eq!(
-            share_clone_command_lines(&workspace_id, &basin, "limited+share/token", &connection),
+            share_clone_command_lines(
+                &workspace_id,
+                &basin,
+                "limited+share/token",
+                None,
+                &connection
+            ),
             vec![
                 "ob clone \\".to_string(),
                 "  --workspace dwwbav5ypjgxra25s7hjzt81gvdbsbmm \\".to_string(),
@@ -2528,7 +2590,7 @@ mod tests {
         };
 
         let command =
-            share_clone_command_lines(&workspace_id, &basin, "limited-token", &connection)
+            share_clone_command_lines(&workspace_id, &basin, "limited-token", None, &connection)
                 .join("\n");
         assert!(!command.contains("--account-endpoint"));
         assert!(!command.contains("--basin-endpoint"));

@@ -1,4 +1,4 @@
-use crate::app::s2::s2_error_is_connectivity;
+use crate::app::s2::{s2_error_is_connectivity, s2_error_is_encryption, wrap_s2_encryption_error};
 use crate::crdt::types::SharedMessage;
 use crate::log::codec::{self, ObjectPointer};
 use crate::log::types::{
@@ -8,6 +8,7 @@ use crate::types::WorkspaceId;
 use bytes::BytesMut;
 use futures::StreamExt;
 use s2_sdk::S2Basin;
+use s2_sdk::types::EncryptionKey;
 use s2_sdk::types::ReadFrom::SeqNum;
 use s2_sdk::types::{
     CreateStreamInput, Header, ReadBatch, ReadFrom, ReadInput, ReadLimits, ReadStart, ReadStop,
@@ -28,7 +29,9 @@ enum ReaderRunError {
 
 impl ReaderRunError {
     fn from_s2(error: S2Error) -> Self {
-        if s2_error_is_connectivity(&error) {
+        if s2_error_is_encryption(&error) {
+            Self::Fatal(wrap_s2_encryption_error(error))
+        } else if s2_error_is_connectivity(&error) {
             Self::Disconnected(error.to_string())
         } else {
             Self::Fatal(error.into())
@@ -47,6 +50,7 @@ enum ReaderRunOutcome {
 pub struct LogReaderActor {
     basin: S2Basin,
     workspace: WorkspaceId,
+    encryption_key: Option<EncryptionKey>,
     start_at: SequenceNumber,
     stop: Option<LogReadStop>,
     req_rx: mpsc::UnboundedReceiver<LogReaderRequest>,
@@ -57,6 +61,7 @@ impl LogReaderActor {
     pub fn new(
         basin: S2Basin,
         workspace: WorkspaceId,
+        encryption_key: Option<EncryptionKey>,
         start_at: SequenceNumber,
         stop: Option<LogReadStop>,
         req_rx: mpsc::UnboundedReceiver<LogReaderRequest>,
@@ -65,6 +70,7 @@ impl LogReaderActor {
         Self {
             basin,
             workspace,
+            encryption_key,
             start_at,
             stop,
             req_rx,
@@ -88,6 +94,7 @@ impl LogReaderActor {
     async fn read_full_multipart(
         basin: S2Basin,
         workspace_id: WorkspaceId,
+        encryption_key: Option<EncryptionKey>,
         message_headers: Vec<Header>,
         object_pointer: ObjectPointer,
     ) -> Result<SharedMessage, ReaderRunError> {
@@ -105,7 +112,10 @@ impl LogReaderActor {
         let stream_name = object_pointer
             .stream_name(workspace_id)
             .map_err(ReaderRunError::fatal)?;
-        let stream = basin.stream(stream_name);
+        let mut stream = basin.stream(stream_name);
+        if let Some(key) = encryption_key {
+            stream = stream.with_encryption_key(key);
+        }
         let mut read_session = stream
             .read_session(
                 ReadInput::new()
@@ -218,7 +228,10 @@ impl LogReaderActor {
         Self::ensure_stream_exists(&self.basin, main_stream_name.clone())
             .await
             .map_err(ReaderRunError::from_s2)?;
-        let stream = self.basin.stream(main_stream_name);
+        let mut stream = self.basin.stream(main_stream_name);
+        if let Some(key) = &self.encryption_key {
+            stream = stream.with_encryption_key(key.clone());
+        }
 
         let mut read_input =
             ReadInput::new().with_start(ReadStart::new().with_from(ReadFrom::SeqNum(start_at)));
@@ -297,6 +310,7 @@ impl LogReaderActor {
                                 Self::read_full_multipart(
                                     self.basin.clone(),
                                     self.workspace.clone(),
+                                    self.encryption_key.clone(),
                                     record.headers,
                                     object_pointer,
                                 )

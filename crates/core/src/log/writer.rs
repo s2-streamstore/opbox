@@ -1,4 +1,4 @@
-use crate::app::s2::s2_error_is_connectivity;
+use crate::app::s2::{s2_error_is_connectivity, s2_error_is_encryption, wrap_s2_encryption_error};
 use crate::log::codec;
 use crate::log::codec::{ObjectPointer, S2Package};
 use crate::log::types::{LogWriterRequest, LogWriterResponse, SharedMessageOrigin};
@@ -9,7 +9,9 @@ use futures::stream::FuturesOrdered;
 use s2_sdk::append_session::AppendSessionConfig;
 use s2_sdk::batching::BatchingConfig;
 use s2_sdk::producer::{IndexedAppendAck, ProducerConfig};
-use s2_sdk::types::{AppendInput, AppendRecord, AppendRecordBatch, CreateStreamInput};
+use s2_sdk::types::{
+    AppendInput, AppendRecord, AppendRecordBatch, CreateStreamInput, EncryptionKey,
+};
 use s2_sdk::{
     S2Basin,
     types::{AppendAck, S2Error, StreamName},
@@ -28,7 +30,9 @@ enum WriterRunError {
 
 impl WriterRunError {
     fn from_s2(error: S2Error) -> Self {
-        if s2_error_is_connectivity(&error) {
+        if s2_error_is_encryption(&error) {
+            Self::Fatal(wrap_s2_encryption_error(error))
+        } else if s2_error_is_connectivity(&error) {
             Self::Disconnected(error.to_string())
         } else {
             Self::Fatal(error.into())
@@ -48,6 +52,7 @@ pub struct LogWriterActor {
     basin: S2Basin,
     workspace: WorkspaceId,
     daemon_writer_id: DaemonWriterId,
+    encryption_key: Option<EncryptionKey>,
     req_rx: mpsc::UnboundedReceiver<LogWriterRequest>,
     resp_tx: mpsc::UnboundedSender<LogWriterResponse>,
 }
@@ -68,6 +73,7 @@ impl LogWriterActor {
         basin: S2Basin,
         workspace: WorkspaceId,
         daemon_writer_id: DaemonWriterId,
+        encryption_key: Option<EncryptionKey>,
         req_rx: mpsc::UnboundedReceiver<LogWriterRequest>,
         resp_tx: mpsc::UnboundedSender<LogWriterResponse>,
     ) -> Self {
@@ -75,6 +81,7 @@ impl LogWriterActor {
             basin,
             workspace,
             daemon_writer_id,
+            encryption_key,
             req_rx,
             resp_tx,
         }
@@ -84,6 +91,7 @@ impl LogWriterActor {
     async fn upload_parts(
         s2: S2Basin,
         workspace_id: WorkspaceId,
+        encryption_key: Option<EncryptionKey>,
         outbox_id: OutboxId,
         pointer_record: AppendRecord,
         pointer: ObjectPointer,
@@ -95,7 +103,10 @@ impl LogWriterActor {
         Self::ensure_stream_exists(&s2, stream_name.clone())
             .await
             .map_err(WriterRunError::from_s2)?;
-        let stream = s2.stream(stream_name);
+        let mut stream = s2.stream(stream_name);
+        if let Some(key) = encryption_key {
+            stream = stream.with_encryption_key(key);
+        }
 
         let session = stream.append_session(AppendSessionConfig::new());
         let mut set = JoinSet::new();
@@ -167,7 +178,10 @@ impl LogWriterActor {
             .await
             .map_err(WriterRunError::from_s2)?;
 
-        let stream = self.basin.stream(main_stream_name);
+        let mut stream = self.basin.stream(main_stream_name);
+        if let Some(key) = &self.encryption_key {
+            stream = stream.with_encryption_key(key.clone());
+        }
         let producer = stream.producer(
             ProducerConfig::new()
                 .with_max_unacked_bytes(1024 * 1024 * 100)
@@ -277,7 +291,7 @@ impl LogWriterActor {
                                         checksum = pointer.checksum,
                                         "log writer using pointer package"
                                     );
-                                    let upload = tokio::spawn(Self::upload_parts(self.basin.clone(), self.workspace.clone(), outbox_id, pointer_record, pointer, parts));
+                                    let upload = tokio::spawn(Self::upload_parts(self.basin.clone(), self.workspace.clone(), self.encryption_key.clone(), outbox_id, pointer_record, pointer, parts));
                                     big_upload = Some(upload);
                                 }
                             }

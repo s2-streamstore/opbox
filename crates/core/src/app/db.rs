@@ -49,7 +49,7 @@ pub async fn load_daemon_state(db_path: &Path) -> eyre::Result<daemon_state::Row
     let mut rows = conn
         .query(
             "SELECT workspace_id, s2_basin, writer_id, stable_cursor, next_outbox_id,
-                    s2_account_endpoint, s2_basin_endpoint
+                    s2_account_endpoint, s2_basin_endpoint, encryption_key
              FROM daemon_state
              WHERE id = 1",
             (),
@@ -140,6 +140,11 @@ pub async fn insert_daemon_state(conn: &Connection, row: &daemon_state::Row) -> 
     let next_outbox_id = i64::try_from(row.next_outbox_id.get())
         .map_err(|_| eyre!("next_outbox_id out of range: {}", row.next_outbox_id.get()))?;
 
+    let encryption_key_str = row
+        .encryption_key
+        .as_ref()
+        .map(|k| k.to_header_value().to_str().unwrap().to_owned());
+
     conn.execute(
         "INSERT INTO daemon_state (
             id,
@@ -149,8 +154,9 @@ pub async fn insert_daemon_state(conn: &Connection, row: &daemon_state::Row) -> 
             s2_basin_endpoint,
             writer_id,
             stable_cursor,
-            next_outbox_id
-        ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            next_outbox_id,
+            encryption_key
+        ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         (
             row.workspace_id.0.as_str(),
             row.s2_basin.as_ref(),
@@ -159,6 +165,7 @@ pub async fn insert_daemon_state(conn: &Connection, row: &daemon_state::Row) -> 
             row.daemon_writer_id.0.as_ref(),
             stable_cursor,
             next_outbox_id,
+            encryption_key_str.as_deref(),
         ),
     )
     .await?;

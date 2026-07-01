@@ -2,8 +2,9 @@ use crate::app::control::{DaemonWarning, StreamRetentionSummary};
 use crate::types::WorkspaceId;
 use eyre::eyre;
 use s2_sdk::types::{
-    AccountEndpoint, BasinConfig, BasinEndpoint, BasinName, CreateStreamInput, RetentionPolicy,
-    RetryConfig, S2Config, S2Endpoints, S2Error, StreamConfig, StreamName,
+    AccountEndpoint, BasinConfig, BasinEndpoint, BasinName, BasinReconfiguration,
+    CreateStreamInput, EncryptionAlgorithm, ReconfigureBasinInput, RetentionPolicy, RetryConfig,
+    S2Config, S2Endpoints, S2Error, StreamConfig, StreamName,
 };
 use s2_sdk::{S2, S2Basin};
 use std::num::NonZeroU32;
@@ -117,6 +118,27 @@ pub fn s2_error_is_connectivity(error: &S2Error) -> bool {
     }
 }
 
+pub fn s2_error_is_encryption(error: &S2Error) -> bool {
+    matches!(
+        error,
+        S2Error::Server(err)
+            if matches!(err.code.as_str(), "decryption_failed" | "bad_header")
+                && (err.message.contains("encryption key")
+                    || err.message.contains("decryption"))
+    )
+}
+
+pub fn wrap_s2_encryption_error(error: S2Error) -> eyre::Report {
+    if s2_error_is_encryption(&error) {
+        eyre::eyre!(
+            "encryption error: the configured cipher does not match this workspace's encryption key\n\
+             detail: {error}"
+        )
+    } else {
+        error.into()
+    }
+}
+
 pub fn s2_error_is_not_found(error: &S2Error) -> bool {
     matches!(
         error,
@@ -200,6 +222,19 @@ pub async fn basin_default_stream_retention_warning(
 ) -> eyre::Result<Option<DaemonWarning>> {
     let config = s2.get_basin_config(basin).await?;
     Ok(basin_config_retention_warning(&config))
+}
+
+pub async fn ensure_basin_stream_cipher(s2: &S2, basin: BasinName) -> eyre::Result<()> {
+    let config = s2.get_basin_config(basin.clone()).await?;
+    if config.stream_cipher.is_some() {
+        return Ok(());
+    }
+    s2.reconfigure_basin(ReconfigureBasinInput::new(
+        basin,
+        BasinReconfiguration::new().with_stream_cipher(EncryptionAlgorithm::Aes256Gcm),
+    ))
+    .await?;
+    Ok(())
 }
 
 pub fn basin_config_retention_warning(config: &BasinConfig) -> Option<DaemonWarning> {

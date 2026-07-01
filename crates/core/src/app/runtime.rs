@@ -102,6 +102,7 @@ where
                     s2_basin.clone(),
                     daemon_row.workspace_id.clone(),
                     daemon_row.daemon_writer_id.clone(),
+                    daemon_row.encryption_key.clone(),
                     log_writer_req_rx,
                     log_writer_resp_tx,
                 );
@@ -137,6 +138,7 @@ where
                 let log_reader = LogReaderActor::new(
                     s2_basin.clone(),
                     daemon_row.workspace_id.clone(),
+                    daemon_row.encryption_key.clone(),
                     daemon_row.stable_cursor.end,
                     clone_log_read_stop,
                     log_reader_req_rx,
@@ -175,6 +177,7 @@ where
                     s2_basin.clone(),
                     daemon_row.workspace_id.clone(),
                     daemon_row.daemon_writer_id.clone(),
+                    daemon_row.encryption_key.clone(),
                     log_writer_req_rx,
                     log_writer_resp_tx,
                 );
@@ -188,6 +191,7 @@ where
                 let log_reader = LogReaderActor::new(
                     s2_basin.clone(),
                     daemon_row.workspace_id.clone(),
+                    daemon_row.encryption_key.clone(),
                     daemon_row.stable_cursor.end,
                     None,
                     log_reader_req_rx,

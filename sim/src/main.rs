@@ -24,7 +24,8 @@ use opbox_core::types::{DaemonWriterId, OutboxId, WorkspaceId};
 use rand::SeedableRng;
 use s2_sdk::S2;
 use s2_sdk::types::{
-    AccountEndpoint, BasinEndpoint, BasinName, CreateBasinInput, ListStreamsInput, S2Config,
+    AccountEndpoint, BasinConfig, BasinEndpoint, BasinName, BasinReconfiguration, CreateBasinInput,
+    EncryptionAlgorithm, EncryptionKey, ListStreamsInput, ReconfigureBasinInput, S2Config,
     S2Endpoints, S2Error,
 };
 use std::collections::BTreeMap;
@@ -180,6 +181,7 @@ enum Workload {
     BinaryFileIgnore,
     PermissionDeniedIgnore,
     TooLargeIgnore,
+    WrongCipherClone,
 }
 
 impl Workload {
@@ -319,6 +321,9 @@ fn run_single(args: SingleArgs) -> eyre::Result<()> {
         }
         Workload::TooLargeIgnore => {
             run_too_large_ignore_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::WrongCipherClone => {
+            run_wrong_cipher_clone_workload(&mut sim, seed, args.common.max_steps)?
         }
     }
 
@@ -3121,6 +3126,28 @@ fn spawn_daemon_with_initial_files(
     workspace_id: WorkspaceId,
     initial_files: BTreeMap<String, Bytes>,
 ) -> eyre::Result<SimDaemonHandle> {
+    spawn_daemon_with_config(
+        sim,
+        name,
+        daemon_index,
+        workspace_id,
+        initial_files,
+        sim_encryption_key(),
+    )
+}
+
+fn sim_encryption_key() -> Option<EncryptionKey> {
+    Some(EncryptionKey::new([0x42u8; 32]))
+}
+
+fn spawn_daemon_with_config(
+    sim: &mut turmoil::Sim<'static>,
+    name: &'static str,
+    daemon_index: u8,
+    workspace_id: WorkspaceId,
+    initial_files: BTreeMap<String, Bytes>,
+    encryption_key: Option<EncryptionKey>,
+) -> eyre::Result<SimDaemonHandle> {
     let daemon_row = daemon_state::Row {
         workspace_id,
         s2_basin: SIM_BASIN.parse()?,
@@ -3129,6 +3156,7 @@ fn spawn_daemon_with_initial_files(
         daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&[daemon_index; 16])),
         stable_cursor: ..0,
         next_outbox_id: OutboxId::new(0),
+        encryption_key,
     };
 
     let file_io = FaultInjectingFileIO::new(InMemoryFileIO::new());
@@ -3681,6 +3709,109 @@ enum SimDaemonCommand {
     },
 }
 
+fn run_wrong_cipher_clone_workload(
+    sim: &mut turmoil::Sim<'static>,
+    _seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000099".to_string());
+    let correct_key = sim_encryption_key();
+    let wrong_key = Some(EncryptionKey::new([0x24u8; 32]));
+
+    let daemon_a = spawn_daemon_with_config(
+        sim,
+        "daemon-a",
+        0,
+        workspace_id.clone(),
+        BTreeMap::new(),
+        correct_key,
+    )?;
+    configure_daemon_s2_link_latencies(sim);
+
+    // daemon-b uses the wrong encryption key.
+    let wrong_key_clone = wrong_key.clone();
+    let workspace_id_b = workspace_id.clone();
+    sim.client("daemon-b-wrong-cipher", async move {
+        ensure_basin_exists().await?;
+        let daemon_row = daemon_state::Row {
+            workspace_id: workspace_id_b,
+            s2_basin: SIM_BASIN.parse().map_err(io_err)?,
+            s2_account_endpoint: None,
+            s2_basin_endpoint: None,
+            daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&[1u8; 16])),
+            stable_cursor: ..0,
+            next_outbox_id: OutboxId::new(0),
+            encryption_key: wrong_key_clone,
+        };
+        let db = open_memory_database().await.map_err(io_err)?;
+        initialize_database(&db, &daemon_row)
+            .await
+            .map_err(io_err)?;
+        let pool = semantic_pool(db).await.map_err(io_err)?;
+        let semantic_service = SemanticService::new(pool);
+        let s2_basin = sim_s2_client()
+            .map_err(io_err)?
+            .basin(daemon_row.s2_basin.clone());
+        let engine_status = EngineStatusConfig {
+            sync_root: PathBuf::from("/sim/daemon-b-wrong-cipher"),
+            workspace_id: daemon_row.workspace_id.clone(),
+            basin: daemon_row.s2_basin.clone(),
+            daemon_writer_id: daemon_row.daemon_writer_id.clone(),
+            stable_cursor: daemon_row.stable_cursor.clone(),
+            started_at: time::OffsetDateTime::now_utc(),
+            warnings: Vec::new(),
+        };
+        let cancellation_token = CancellationToken::new();
+        let (notify_io, _notify_handle) = channel_notify_io();
+        let file_io = FaultInjectingFileIO::new(InMemoryFileIO::new());
+        let runtime = AppRuntime::new(AppRuntimeConfig {
+            mode: RunMode::Sync,
+            file_io,
+            notify_io: Some(notify_io),
+            semantic_service,
+            daemon_row,
+            s2_basin,
+            clone_log_read_stop: None,
+            engine_status: Some(engine_status),
+            spy_tx: None,
+        });
+        let mut actors = runtime.spawn(cancellation_token.clone());
+
+        // Wait for the runtime to fail due to wrong encryption key.
+        let error = actors.wait_for_actor_stop().await;
+        let _ = actors.shutdown(cancellation_token).await;
+        match error {
+            Some(err)
+                if err.to_string().contains("encryption")
+                    || err.to_string().contains("decryption") =>
+            {
+                info!("daemon-b correctly failed with encryption error: {err}");
+                Ok(())
+            }
+            Some(err) => Err(io_err(format!(
+                "daemon-b failed with unexpected error (expected encryption error): {err}"
+            ))),
+            None => Err(io_err("daemon-b did not fail (expected encryption error)")),
+        }
+    });
+
+    sim.client("controller", async move {
+        let path = "test.txt";
+        let content = Bytes::from("encrypted content\n");
+        daemon_a.write_file(path, content).await?;
+        daemon_a.request_single_file_scan(path).await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        // Give daemon-b time to attempt reading and fail.
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        daemon_a.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
+}
+
 fn sim_s2_client() -> eyre::Result<S2> {
     let endpoints = S2Endpoints::new(
         AccountEndpoint::new("http://s2-lite:80")?,
@@ -3697,9 +3828,21 @@ fn sim_s2_client() -> eyre::Result<S2> {
 async fn ensure_basin_exists() -> Result<(), Box<dyn std::error::Error>> {
     let basin_name: BasinName = SIM_BASIN.parse().map_err(io_err)?;
     let s2 = sim_s2_client().map_err(io_err)?;
-    match s2.create_basin(CreateBasinInput::new(basin_name)).await {
+    let config = BasinConfig::default().with_stream_cipher(EncryptionAlgorithm::Aes256Gcm);
+    match s2
+        .create_basin(CreateBasinInput::new(basin_name.clone()).with_config(config))
+        .await
+    {
         Ok(_) => Ok(()),
-        Err(S2Error::Server(err)) if err.code == "resource_already_exists" => Ok(()),
+        Err(S2Error::Server(err)) if err.code == "resource_already_exists" => {
+            s2.reconfigure_basin(ReconfigureBasinInput::new(
+                basin_name,
+                BasinReconfiguration::new().with_stream_cipher(EncryptionAlgorithm::Aes256Gcm),
+            ))
+            .await
+            .map_err(io_err)?;
+            Ok(())
+        }
         Err(err) => Err(io_err(err)),
     }
 }

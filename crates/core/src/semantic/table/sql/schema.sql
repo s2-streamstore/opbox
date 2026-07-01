@@ -207,5 +207,6 @@ CREATE TABLE IF NOT EXISTS daemon_state (
     s2_basin_endpoint   TEXT,
     writer_id      BLOB NOT NULL,
     stable_cursor  INTEGER NOT NULL CHECK (stable_cursor >= 0),
-    next_outbox_id INTEGER NOT NULL CHECK (next_outbox_id >= 0)
+    next_outbox_id INTEGER NOT NULL CHECK (next_outbox_id >= 0),
+    encryption_key TEXT
 );
