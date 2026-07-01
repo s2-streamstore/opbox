@@ -31,7 +31,11 @@ use opbox_core::types::{
 };
 use s2_sdk::{
     S2, S2Basin,
-    types::{AccountEndpoint, BasinEndpoint, BasinName},
+    types::{
+        AccessTokenId, AccessTokenIdPrefix, AccessTokenMatcher, AccessTokenScopeInput,
+        AccountEndpoint, BasinEndpoint, BasinMatcher, BasinName, IssueAccessTokenInput,
+        ListAccessTokensInput, Operation, S2DateTime, S2Error, StreamMatcher, StreamNamePrefix,
+    },
 };
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -45,6 +49,8 @@ use tracing::debug;
 
 const CLIENT_COMMAND: &str = "ob";
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
+const SHARE_TOKEN_NAMESPACE: &str = "opbox";
+const BOOTSTRAP_SHARE_ID: &str = "bootstrap";
 
 const STYLES: styling::Styles = styling::Styles::styled()
     .header(styling::AnsiColor::Green.on_default().bold())
@@ -106,11 +112,40 @@ enum Command {
     /// Attach to daemon in order to see CRDT ops as they are received.
     Spy { sync_root: Option<PathBuf> },
 
+    /// Manage share tokens for the current workspace.
+    Share {
+        #[command(subcommand)]
+        command: ShareCommand,
+    },
+
     /// Inspect the daemon process logs.
     Logs {
         /// Tail the log (via `tail -f`).
         #[arg(short, long)]
         follow: bool,
+        sync_root: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Clone, Debug)]
+enum ShareCommand {
+    /// Create a limited S2 access token and print a clone command.
+    New {
+        /// Human-readable share id. The S2 token id will be opbox-$workspace-$id.
+        #[arg(long)]
+        id: Option<String>,
+        /// Token expiration timestamp. Defaults to the issuer token's expiration.
+        #[arg(long, value_name = "RFC3339")]
+        expires_at: Option<S2DateTime>,
+        sync_root: Option<PathBuf>,
+    },
+
+    /// List share tokens for the current workspace.
+    List { sync_root: Option<PathBuf> },
+
+    /// Revoke a share token by share id.
+    Revoke {
+        id: String,
         sync_root: Option<PathBuf>,
     },
 }
@@ -593,6 +628,229 @@ async fn warn_if_retention_not_infinite(
     Ok(())
 }
 
+struct ShareContext {
+    root: PathBuf,
+    workspace_id: WorkspaceId,
+    basin: BasinName,
+    connection: S2ConnectionConfig,
+}
+
+struct IssuedShareToken {
+    id: AccessTokenId,
+    access_token: String,
+}
+
+async fn load_share_context(sync_root: Option<PathBuf>) -> eyre::Result<ShareContext> {
+    let root = find_workspace_root(&root_or_current(sync_root)?)?;
+    let (_db_path, daemon_row) = load_configured_daemon_state(&root).await?;
+    let workspace_config = load_user_config_from_path(&workspace_config_path(&root))?;
+    let user_config = load_user_config()?;
+    let basin = match workspace_config.basin.as_deref() {
+        Some(value) => parse_basin_config_value("basin", value)?,
+        None => daemon_row.s2_basin.clone(),
+    };
+    let connection = S2ConnectionConfig::from_workspace_or_user_config(
+        &workspace_config,
+        daemon_row.s2_account_endpoint.as_deref(),
+        daemon_row.s2_basin_endpoint.as_deref(),
+        &user_config,
+    )?;
+
+    Ok(ShareContext {
+        root,
+        workspace_id: daemon_row.workspace_id,
+        basin,
+        connection,
+    })
+}
+
+fn share_token_prefix(workspace_id: &WorkspaceId) -> String {
+    format!("{SHARE_TOKEN_NAMESPACE}-{}-", workspace_id.0)
+}
+
+fn generated_share_id() -> String {
+    format!("share-{:016x}", rand::random::<u64>())
+}
+
+fn share_token_id(workspace_id: &WorkspaceId, share_id: &str) -> eyre::Result<AccessTokenId> {
+    if share_id.is_empty() {
+        eyre::bail!("share id cannot be empty");
+    }
+
+    let token_id = format!("{}{share_id}", share_token_prefix(workspace_id));
+    token_id
+        .parse()
+        .map_err(|err| eyre::eyre!("invalid share token id {token_id:?}: {err}"))
+}
+
+fn share_token_id_prefix(workspace_id: &WorkspaceId) -> eyre::Result<AccessTokenIdPrefix> {
+    let prefix = share_token_prefix(workspace_id);
+    prefix
+        .parse()
+        .map_err(|err| eyre::eyre!("invalid share token prefix {prefix:?}: {err}"))
+}
+
+fn share_token_stream_prefix(workspace_id: &WorkspaceId) -> eyre::Result<StreamNamePrefix> {
+    let prefix = format!("{}/", workspace_id.0);
+    prefix
+        .parse()
+        .map_err(|err| eyre::eyre!("invalid workspace stream prefix {prefix:?}: {err}"))
+}
+
+fn share_id_from_token_id<'a>(workspace_id: &WorkspaceId, token_id: &'a str) -> &'a str {
+    token_id
+        .strip_prefix(&share_token_prefix(workspace_id))
+        .unwrap_or(token_id)
+}
+
+fn share_token_scope(
+    workspace_id: &WorkspaceId,
+    basin: &BasinName,
+) -> eyre::Result<AccessTokenScopeInput> {
+    Ok(AccessTokenScopeInput::from_ops([
+        Operation::GetBasinConfig,
+        Operation::CreateStream,
+        Operation::ListStreams,
+        Operation::GetStreamConfig,
+        Operation::CheckTail,
+        Operation::Append,
+        Operation::Read,
+    ])
+    .with_basins(BasinMatcher::Exact(basin.clone()))
+    .with_streams(StreamMatcher::Prefix(share_token_stream_prefix(
+        workspace_id,
+    )?))
+    .with_access_tokens(AccessTokenMatcher::None))
+}
+
+fn share_token_management_error(
+    action: &'static str,
+    required_permission: &'static str,
+    error: impl std::fmt::Display,
+) -> eyre::Report {
+    eyre::eyre!(
+        "failed to {action} share token: {error}\n\
+         share token management requires S2 Cloud and an access token allowed to {required_permission} access tokens; \
+         use the workspace owner/admin token"
+    )
+}
+
+fn share_token_management_report(
+    action: &'static str,
+    required_permission: &'static str,
+    error: eyre::Report,
+) -> eyre::Report {
+    if error.downcast_ref::<S2Error>().is_some() {
+        share_token_management_error(action, required_permission, format!("{error:#}"))
+    } else {
+        error
+    }
+}
+
+async fn issue_share_token(
+    ctx: &ShareContext,
+    share_id: &str,
+    expires_at: Option<S2DateTime>,
+) -> eyre::Result<IssuedShareToken> {
+    let token_id = share_token_id(&ctx.workspace_id, share_id)?;
+    let scope = share_token_scope(&ctx.workspace_id, &ctx.basin)?;
+    let mut input = IssueAccessTokenInput::new(token_id.clone(), scope);
+    if let Some(expires_at) = expires_at {
+        input = input.with_expires_at(expires_at);
+    }
+
+    let s2 = s2_client_from_config(&ctx.connection)?;
+    let access_token = s2.issue_access_token(input).await?;
+    Ok(IssuedShareToken {
+        id: token_id,
+        access_token,
+    })
+}
+
+async fn run_share(command: ShareCommand) -> eyre::Result<()> {
+    match command {
+        ShareCommand::New {
+            id,
+            expires_at,
+            sync_root,
+        } => {
+            let ctx = load_share_context(sync_root).await?;
+            let share_id = id.unwrap_or_else(generated_share_id);
+            let token = issue_share_token(&ctx, &share_id, expires_at)
+                .await
+                .map_err(|error| share_token_management_report("create", "issue", error))?;
+            let style = CliStyle::for_stdout();
+            println!("{}", style.bold("created opbox share token"));
+            print_status_row("workspace", &ctx.workspace_id.0, style);
+            print_status_row("basin", ctx.basin.as_ref(), style);
+            print_status_row("share id", &share_id, style);
+            print_status_row("token id", &token.id, style);
+            println!();
+            print_share_clone_command(
+                &ctx.workspace_id,
+                &ctx.basin,
+                &token.access_token,
+                &ctx.connection,
+                style,
+            );
+            Ok(())
+        }
+        ShareCommand::List { sync_root } => {
+            let ctx = load_share_context(sync_root).await?;
+            let s2 = s2_client_from_config(&ctx.connection)?;
+            let prefix = share_token_id_prefix(&ctx.workspace_id)?;
+            let page = s2
+                .list_access_tokens(
+                    ListAccessTokensInput::new()
+                        .with_prefix(prefix)
+                        .with_limit(1000),
+                )
+                .await
+                .map_err(|error| share_token_management_error("list", "list", error))?;
+            let style = CliStyle::for_stdout();
+            println!("{}", style.bold("opbox share tokens"));
+            print_status_row("workspace", &ctx.workspace_id.0, style);
+            print_status_row("basin", ctx.basin.as_ref(), style);
+            print_status_row("root", ctx.root.display(), style);
+            if page.values.is_empty() {
+                print_status_row("tokens", "none", style);
+                return Ok(());
+            }
+            println!();
+            for token in page.values {
+                let token_id = token.id.to_string();
+                println!(
+                    "  {}  {}  {}",
+                    style.bold(format!(
+                        "{:<20}",
+                        share_id_from_token_id(&ctx.workspace_id, &token_id)
+                    )),
+                    style.dim("expires"),
+                    token.expires_at
+                );
+                println!("  {}  {}", style.dim(format!("{:<20}", "")), token_id);
+            }
+            if page.has_more {
+                eprintln!(
+                    "{} more share tokens exist; prefix listing is currently limited to 1000 results",
+                    CliStyle::for_stderr().yellow("warning:")
+                );
+            }
+            Ok(())
+        }
+        ShareCommand::Revoke { id, sync_root } => {
+            let ctx = load_share_context(sync_root).await?;
+            let token_id = share_token_id(&ctx.workspace_id, &id)?;
+            let s2 = s2_client_from_config(&ctx.connection)?;
+            s2.revoke_access_token(token_id.clone())
+                .await
+                .map_err(|error| share_token_management_error("revoke", "revoke", error))?;
+            println!("revoked share token {token_id}");
+            Ok(())
+        }
+    }
+}
+
 async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> eyre::Result<()> {
     let mode = bootstrap.mode;
     let sync_root = bootstrap.sync_root.clone();
@@ -623,6 +881,25 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
     .run_until_shutdown()
     .await?;
 
+    let bootstrap_share_token = if mode == RunMode::Init {
+        progress.set("creating bootstrap share token");
+        let ctx = ShareContext {
+            root: sync_root.clone(),
+            workspace_id: workspace_id.clone(),
+            basin: basin.clone(),
+            connection: s2_connection.clone(),
+        };
+        match issue_share_token(&ctx, BOOTSTRAP_SHARE_ID, None).await {
+            Ok(token) => Some(token),
+            Err(error) => {
+                progress.suspend(|| print_bootstrap_share_warning(&error, CliStyle::for_stderr()));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if mode == RunMode::Clone {
         progress.set("writing local ignore rules");
         create_default_ignore_file(&sync_root)?;
@@ -648,8 +925,21 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
             style.bold(style.green(&workspace_id.0))
         );
         println!();
-        print_share_clone_command(&workspace_id, &basin, &s2_connection, style);
-        println!();
+        if let Some(token) = bootstrap_share_token {
+            print_status_row("share token", token.id, style);
+            println!();
+            print_share_clone_command(
+                &workspace_id,
+                &basin,
+                &token.access_token,
+                &s2_connection,
+                style,
+            );
+            println!();
+        } else {
+            print_bootstrap_share_next_step(style);
+            println!();
+        }
     }
     println!(
         "run {} to begin syncing",
@@ -1057,18 +1347,39 @@ fn print_status_row(label: &str, value: impl std::fmt::Display, style: CliStyle)
     println!("  {}  {}", style.dim(format!("{label:<13}")), value);
 }
 
+fn print_bootstrap_share_warning(error: &eyre::Report, style: CliStyle) {
+    eprintln!(
+        "{} could not create bootstrap share token: {error:#}",
+        style.yellow("warning:")
+    );
+    eprintln!(
+        "         share token creation requires S2 Cloud and an access token that can issue access tokens"
+    );
+}
+
+fn print_bootstrap_share_next_step(style: CliStyle) {
+    println!("{}", style.yellow("bootstrap share token was not created"));
+    println!(
+        "run {} after configuring a workspace owner/admin token",
+        style.bold(format!(
+            "{CLIENT_COMMAND} share new --id {BOOTSTRAP_SHARE_ID}"
+        ))
+    );
+}
+
 fn print_share_clone_command(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
+    access_token: &str,
     connection: &S2ConnectionConfig,
     style: CliStyle,
 ) {
     println!(
         "{}",
-        style.bold("share this clone command (contains access token):")
+        style.bold("share this clone command (contains limited access token):")
     );
     println!();
-    for line in share_clone_command_lines(workspace_id, basin, connection) {
+    for line in share_clone_command_lines(workspace_id, basin, access_token, connection) {
         println!("  {line}");
     }
 }
@@ -1076,15 +1387,13 @@ fn print_share_clone_command(
 fn share_clone_command_lines(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
+    access_token: &str,
     connection: &S2ConnectionConfig,
 ) -> Vec<String> {
     let mut lines = vec![
         format!("{CLIENT_COMMAND} clone \\"),
         format!("  --workspace {} \\", shell_quote(&workspace_id.0)),
-        format!(
-            "  --access-token {} \\",
-            shell_quote(&connection.access_token)
-        ),
+        format!("  --access-token {} \\", shell_quote(access_token)),
     ];
     let (account_endpoint, basin_endpoint) = connection.endpoint_pair_for_metadata();
     if let Some(account_endpoint) = account_endpoint {
@@ -1897,6 +2206,7 @@ async fn main() {
         Command::Stop { sync_root } => run_stop(sync_root).await,
         Command::Status { sync_root } => run_status(sync_root).await,
         Command::Spy { sync_root } => run_spy(sync_root).await,
+        Command::Share { command } => with_failure_banner("share", run_share(command).await),
         Command::Logs { follow, sync_root } => run_daemon_logs(follow, sync_root),
     };
 
@@ -1955,11 +2265,11 @@ mod tests {
         };
 
         assert_eq!(
-            share_clone_command_lines(&workspace_id, &basin, &connection),
+            share_clone_command_lines(&workspace_id, &basin, "limited+share/token", &connection),
             vec![
                 "ob clone \\".to_string(),
                 "  --workspace dwwbav5ypjgxra25s7hjzt81gvdbsbmm \\".to_string(),
-                "  --access-token 'R3QAAAAAAABq+secret/token' \\".to_string(),
+                "  --access-token 'limited+share/token' \\".to_string(),
                 "  --account-endpoint account.example.test \\".to_string(),
                 "  --basin-endpoint '{basin}.example.test' \\".to_string(),
                 "  --basin opbox-dev-2".to_string(),
@@ -1979,9 +2289,31 @@ mod tests {
             basin_endpoint: None,
         };
 
-        let command = share_clone_command_lines(&workspace_id, &basin, &connection).join("\n");
+        let command =
+            share_clone_command_lines(&workspace_id, &basin, "limited-token", &connection)
+                .join("\n");
         assert!(!command.contains("--account-endpoint"));
         assert!(!command.contains("--basin-endpoint"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn share_token_id_is_scoped_to_workspace() -> eyre::Result<()> {
+        let workspace_id = WorkspaceId("dwwbav5ypjgxra25s7hjzt81gvdbsbmm".to_string());
+
+        assert_eq!(
+            share_token_id(&workspace_id, "bootstrap")?.to_string(),
+            "opbox-dwwbav5ypjgxra25s7hjzt81gvdbsbmm-bootstrap"
+        );
+        assert_eq!(
+            share_id_from_token_id(
+                &workspace_id,
+                "opbox-dwwbav5ypjgxra25s7hjzt81gvdbsbmm-alice"
+            ),
+            "alice"
+        );
+        assert!(share_token_id(&workspace_id, "").is_err());
 
         Ok(())
     }
