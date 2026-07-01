@@ -37,15 +37,16 @@ Monitor the shared log (CRDT operations being read from S2) in real time within 
 
 ```console
 my-opbox-project % ob spy
-spying on opbox workspace e4wtker801s559vp97drk6xbnfkq6ez7 (pid 41152)
-#92      text        obj=IUO8u30p  from=n2c4dr0x  outbox=89  35B  ts=1781201298256000000  +4ch -0  insert=" ok\n"
-#93      text        obj=tVFw/DK6  from=n2c4dr0x  outbox=90  1422B  ts=1781201298297000000  +1180ch -74  insert="&amp;amp;amp;quot;\n&amp;amp;amp;quot;\n&amp;amp;amp;quot;\n&amp;amp;amp;quot;\n&amp;amp;amp;quot;\n&amp;amp;amp;quot;\n..."
-#94      text        obj=IUO8u30p  from=n2c4dr0x  outbox=91  46B  ts=1781201303180000000  +15ch -0  insert="I dont know why"
-#95      text        obj=IUO8u30p  from=n2c4dr0x  outbox=92  37B  ts=1781201307152000000  +6ch -0  insert="otest\n"
-#96      text        obj=IUO8u30p  from=n2c4dr0x  outbox=93  27B  ts=1781201309542000000  +0ch -30
-#97      text        obj=WUmyY6V/  from=n2c4dr0x  outbox=94  29B  ts=1781201316564000000  +1ch -0  insert="\n"
-#98      text        obj=WUmyY6V/  from=n2c4dr0x  outbox=95  33B  ts=1781201317024000000  +5ch -0  insert="yo yo"
-#99      text        obj=WUmyY6V/  from=n2c4dr0x  outbox=96  24B  ts=1781201322218000000  +0ch -6
+spying on opbox workspace d5nev0w5bmzxrh44vsc6jd38rqhb03pb (pid 97662)
+session  daemon=jc99r2
+#4@1782939393173              169B  namespace   from=n20f2d(remote)  obj=ae1fxx  +claim="hello.txt" (text)
+#5@1782939393173               13B  text        from=n20f2d(remote)  obj=ae1fxx  +0ch -0
+#6@1782939397685               41B  text        from=n20f2d(remote)  obj=ae1fxx  +13ch -0  insert="hello world!\n"
+#7@1782939411995               65B  namespace   from=n20f2d(remote)  obj=ae1fxx  -claim="hello.txt" (text)
+#8@1782939448876              169B  namespace   from=jc99r2(you)  obj=fej65k  +claim="world.txt" (text)
+#9@1782939448876               13B  text        from=jc99r2(you)  obj=fej65k  +0ch -0
+#10@1782939458443              31B  text        from=n20f2d(remote)  obj=fej65k  +3ch -0  insert="yo\n"
+#11@1782939468828              37B  text        from=jc99r2(you)  obj=fej65k  +9ch -0  insert="hi there "
 ```
 
 ### configuration
