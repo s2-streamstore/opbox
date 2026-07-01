@@ -642,23 +642,24 @@ struct IssuedShareToken {
 
 async fn load_share_context(sync_root: Option<PathBuf>) -> eyre::Result<ShareContext> {
     let root = find_workspace_root(&root_or_current(sync_root)?)?;
-    let (_db_path, daemon_row) = load_configured_daemon_state(&root).await?;
+    let status = match request_valid_status(&root).await {
+        Ok(status) => status,
+        Err(error) => exit_daemon_not_running_or_report(&root, error),
+    };
     let workspace_config = load_user_config_from_path(&workspace_config_path(&root))?;
     let user_config = load_user_config()?;
-    let basin = match workspace_config.basin.as_deref() {
-        Some(value) => parse_basin_config_value("basin", value)?,
-        None => daemon_row.s2_basin.clone(),
-    };
+    let workspace_id = status.workspace_id.parse::<WorkspaceId>()?;
+    let basin = parse_basin_config_value("basin", &status.basin)?;
     let connection = S2ConnectionConfig::from_workspace_or_user_config(
         &workspace_config,
-        daemon_row.s2_account_endpoint.as_deref(),
-        daemon_row.s2_basin_endpoint.as_deref(),
+        None,
+        None,
         &user_config,
     )?;
 
     Ok(ShareContext {
         root,
-        workspace_id: daemon_row.workspace_id,
+        workspace_id,
         basin,
         connection,
     })
