@@ -51,6 +51,10 @@ const CLIENT_COMMAND: &str = "ob";
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
 const SHARE_TOKEN_NAMESPACE: &str = "opbox";
 const BOOTSTRAP_SHARE_ID: &str = "bootstrap";
+const S2_BASIN_ENV: &str = "S2_BASIN";
+const S2_ACCESS_TOKEN_ENV: &str = "S2_ACCESS_TOKEN";
+const S2_ACCOUNT_ENDPOINT_ENV: &str = "S2_ACCOUNT_ENDPOINT";
+const S2_BASIN_ENDPOINT_ENV: &str = "S2_BASIN_ENDPOINT";
 
 const STYLES: styling::Styles = styling::Styles::styled()
     .header(styling::AnsiColor::Green.on_default().bold())
@@ -82,6 +86,7 @@ enum Command {
 
     /// Initialize a new opbox workspace.
     /// Uses the $PWD unless a sync root is specified.
+    /// Reads S2_* environment values when matching flags are omitted.
     Init {
         #[command(flatten)]
         config: WorkspaceConfigOverrides,
@@ -89,6 +94,7 @@ enum Command {
     },
 
     /// Clone an existing workspace.
+    /// Reads S2_* environment values when matching flags are omitted.
     Clone {
         #[arg(long)]
         workspace: WorkspaceId,
@@ -164,6 +170,28 @@ struct WorkspaceConfigOverrides {
     /// Persist a workspace-local S2 basin endpoint override.
     #[arg(long)]
     basin_endpoint: Option<String>,
+}
+
+impl WorkspaceConfigOverrides {
+    fn with_s2_env_fallbacks(mut self) -> eyre::Result<Self> {
+        self.apply_missing(s2_env_workspace_config_overrides()?);
+        Ok(self)
+    }
+
+    fn apply_missing(&mut self, fallback: Self) {
+        if self.basin.is_none() {
+            self.basin = fallback.basin;
+        }
+        if self.access_token.is_none() {
+            self.access_token = fallback.access_token;
+        }
+        if self.account_endpoint.is_none() {
+            self.account_endpoint = fallback.account_endpoint;
+        }
+        if self.basin_endpoint.is_none() {
+            self.basin_endpoint = fallback.basin_endpoint;
+        }
+    }
 }
 
 #[derive(Subcommand, Clone, Debug)]
@@ -427,6 +455,31 @@ fn parse_basin_config_value(key: &str, value: &str) -> eyre::Result<BasinName> {
     value
         .parse()
         .map_err(|err| eyre::eyre!("invalid {key} {value:?}: {err}"))
+}
+
+fn env_config_value(name: &str) -> eyre::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eyre::bail!("{name} is not valid UTF-8")
+        }
+    }
+}
+
+fn s2_env_workspace_config_overrides() -> eyre::Result<WorkspaceConfigOverrides> {
+    s2_env_workspace_config_overrides_from(env_config_value)
+}
+
+fn s2_env_workspace_config_overrides_from(
+    mut get_env: impl FnMut(&str) -> eyre::Result<Option<String>>,
+) -> eyre::Result<WorkspaceConfigOverrides> {
+    Ok(WorkspaceConfigOverrides {
+        basin: get_env(S2_BASIN_ENV)?,
+        access_token: get_env(S2_ACCESS_TOKEN_ENV)?,
+        account_endpoint: get_env(S2_ACCOUNT_ENDPOINT_ENV)?,
+        basin_endpoint: get_env(S2_BASIN_ENDPOINT_ENV)?,
+    })
 }
 
 fn basin_from_config_stack(
@@ -2211,6 +2264,7 @@ async fn main() {
         Command::Init { config, sync_root } => with_failure_banner(
             "init",
             async {
+                let config = config.with_s2_env_fallbacks()?;
                 let progress = BootstrapProgress::new(RunMode::Init)?;
                 let user_config = load_user_config()?;
                 let bootstrap = bootstrap_init(sync_root, &user_config, &config, &progress).await?;
@@ -2226,6 +2280,7 @@ async fn main() {
         } => with_failure_banner(
             "clone",
             async {
+                let config = config.with_s2_env_fallbacks()?;
                 let progress = BootstrapProgress::new(RunMode::Clone)?;
                 let user_config = load_user_config()?;
                 let bootstrap = bootstrap_clone(
@@ -2289,6 +2344,86 @@ mod tests {
         let row = fresh_daemon_state_row(workspace_id, basin, &connection);
         assert_eq!(row.s2_account_endpoint.as_deref(), Some("account.s2.test"));
         assert_eq!(row.s2_basin_endpoint.as_deref(), Some("{basin}.s2.test"));
+
+        Ok(())
+    }
+
+    fn fake_s2_env_overrides() -> eyre::Result<WorkspaceConfigOverrides> {
+        s2_env_workspace_config_overrides_from(|name| {
+            Ok(match name {
+                S2_BASIN_ENV => Some("env-basin".to_string()),
+                S2_ACCESS_TOKEN_ENV => Some("ignored".to_string()),
+                S2_ACCOUNT_ENDPOINT_ENV => Some("http://localhost:80".to_string()),
+                S2_BASIN_ENDPOINT_ENV => Some("http://localhost:80".to_string()),
+                _ => None,
+            })
+        })
+    }
+
+    #[test]
+    fn init_s2_env_fallbacks_override_user_config() -> eyre::Result<()> {
+        let mut overrides = WorkspaceConfigOverrides::default();
+        overrides.apply_missing(fake_s2_env_overrides()?);
+        let user_config = UserConfig {
+            default_basin: Some("global-basin".to_string()),
+            access_token: Some("global-token".to_string()),
+            account_endpoint: Some("global-account.s2.test".to_string()),
+            basin_endpoint: Some("{basin}.global.s2.test".to_string()),
+            ..UserConfig::default()
+        };
+
+        let (workspace_config, basin, connection) =
+            workspace_config_from_overrides(&overrides, &user_config)?;
+
+        assert_eq!(basin.as_ref(), "env-basin");
+        assert_eq!(workspace_config.basin.as_deref(), Some("env-basin"));
+        assert_eq!(workspace_config.access_token.as_deref(), Some("ignored"));
+        assert_eq!(
+            workspace_config.account_endpoint.as_deref(),
+            Some("http://localhost:80")
+        );
+        assert_eq!(
+            workspace_config.basin_endpoint.as_deref(),
+            Some("http://localhost:80")
+        );
+        assert_eq!(connection.access_token, "ignored");
+        assert_eq!(
+            connection.account_endpoint.as_deref(),
+            Some("http://localhost:80")
+        );
+        assert_eq!(
+            connection.basin_endpoint.as_deref(),
+            Some("http://localhost:80")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn init_cli_overrides_win_over_s2_env_fallbacks() -> eyre::Result<()> {
+        let mut overrides = WorkspaceConfigOverrides {
+            basin: Some("cli-basin".to_string()),
+            access_token: Some("cli-token".to_string()),
+            account_endpoint: Some("cli-account.s2.test".to_string()),
+            basin_endpoint: Some("{basin}.cli.s2.test".to_string()),
+        };
+        overrides.apply_missing(fake_s2_env_overrides()?);
+        let user_config = UserConfig::default();
+
+        let (workspace_config, basin, connection) =
+            workspace_config_from_overrides(&overrides, &user_config)?;
+
+        assert_eq!(basin.as_ref(), "cli-basin");
+        assert_eq!(workspace_config.basin.as_deref(), Some("cli-basin"));
+        assert_eq!(connection.access_token, "cli-token");
+        assert_eq!(
+            connection.account_endpoint.as_deref(),
+            Some("cli-account.s2.test")
+        );
+        assert_eq!(
+            connection.basin_endpoint.as_deref(),
+            Some("{basin}.cli.s2.test")
+        );
 
         Ok(())
     }
