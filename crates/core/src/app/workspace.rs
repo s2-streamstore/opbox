@@ -351,6 +351,7 @@ mod tests {
             daemon_writer_id: DaemonWriterId(Bytes::from_static(b"0123456789abcdef")),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),
+            encryption_key: None,
         };
         let db_path = storage_db_path(&sync_root);
         create_initialized_database(&db_path, &daemon_row).await?;

@@ -750,6 +750,7 @@ mod tests {
             daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),
+            encryption_key: None,
         };
 
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
@@ -827,6 +828,7 @@ mod tests {
             daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),
+            encryption_key: None,
         };
 
         let (spy_tx, _) = broadcast::channel(8);
@@ -903,6 +905,7 @@ mod tests {
             daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),
+            encryption_key: None,
         };
 
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
@@ -1011,6 +1014,7 @@ mod tests {
             daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),
+            encryption_key: None,
         };
 
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
@@ -1132,6 +1136,7 @@ mod tests {
             daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),
+            encryption_key: None,
         };
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
         let engine = tokio::spawn(async move {
