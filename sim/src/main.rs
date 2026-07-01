@@ -3726,7 +3726,11 @@ fn run_wrong_cipher_clone_workload(
         BTreeMap::new(),
         correct_key,
     )?;
-    configure_daemon_s2_link_latencies(sim);
+    sim.set_link_latency(
+        "daemon-a",
+        "s2-lite",
+        Duration::from_millis(DAEMON_A_S2_LINK_LATENCY_MS),
+    );
 
     // daemon-b uses the wrong encryption key.
     let wrong_key_clone = wrong_key.clone();
@@ -3794,6 +3798,12 @@ fn run_wrong_cipher_clone_workload(
             None => Err(io_err("daemon-b did not fail (expected encryption error)")),
         }
     });
+
+    sim.set_link_latency(
+        "daemon-b-wrong-cipher",
+        "s2-lite",
+        Duration::from_millis(DAEMON_B_S2_LINK_LATENCY_MS),
+    );
 
     sim.client("controller", async move {
         let path = "test.txt";
