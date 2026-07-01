@@ -821,7 +821,7 @@ async fn run_share(command: ShareCommand) -> eyre::Result<()> {
             for token in page.values {
                 let token_id = token.id.to_string();
                 println!(
-                    "  {}  {}  {}",
+                    "  {}  {}  {:?}",
                     style.bold(format!(
                         "{:<20}",
                         share_id_from_token_id(&ctx.workspace_id, &token_id)
@@ -1305,6 +1305,10 @@ impl CliStyle {
         self.paint("33", value)
     }
 
+    fn yellow_bold(self, value: impl std::fmt::Display) -> String {
+        self.paint("1;33", value)
+    }
+
     fn magenta(self, value: impl std::fmt::Display) -> String {
         self.paint("35", value)
     }
@@ -1435,13 +1439,10 @@ fn print_status_warning(
     context: RetentionWarningContext<'_>,
     style: CliStyle,
 ) {
-    let lines = daemon_warning_lines(warning, context);
-    let Some((first, rest)) = lines.split_first() else {
-        return;
-    };
-    print_status_row("warning", style.yellow(first), style);
-    for line in rest {
-        print_status_row("", style.yellow(line), style);
+    let text = daemon_warning_text(warning, context);
+    print_status_row("warning", style.yellow_bold(&text.headline), style);
+    for line in text.details {
+        print_status_row("", style.dim(format!("  {line}")), style);
     }
 }
 
@@ -1450,13 +1451,10 @@ fn print_warning(
     context: RetentionWarningContext<'_>,
     style: CliStyle,
 ) {
-    let lines = daemon_warning_lines(warning, context);
-    let Some((first, rest)) = lines.split_first() else {
-        return;
-    };
-    eprintln!("{} {}", style.yellow("warning:"), first);
-    for line in rest {
-        eprintln!("         {line}");
+    let text = daemon_warning_text(warning, context);
+    eprintln!("{} {}", style.yellow("warning:"), text.headline);
+    for line in text.details {
+        eprintln!("           {line}");
     }
 }
 
@@ -1468,38 +1466,51 @@ fn print_retention_check_warning(target: &str, error: &eyre::Report, style: CliS
     );
 }
 
-fn daemon_warning_lines(
+struct DaemonWarningText {
+    headline: String,
+    details: Vec<String>,
+}
+
+fn daemon_warning_text(
     warning: &ipc::DaemonWarning,
     context: RetentionWarningContext<'_>,
-) -> Vec<String> {
+) -> DaemonWarningText {
     match warning {
-        ipc::DaemonWarning::OpsStreamRetentionNotInfinite { retention } => vec![
-            format!(
-                "ops stream retention is {}; future clones may fail after records expire.",
+        ipc::DaemonWarning::OpsStreamRetentionNotInfinite { retention } => DaemonWarningText {
+            headline: format!(
+                "ops stream retention is {}",
                 retention_summary_text(retention)
             ),
-            "if this workspace is disposable, fix the basin default and recreate it.".to_string(),
-            "to keep this workspace, reconfigure the ops stream:".to_string(),
-            format!(
-                "$ s2 reconfigure-stream s2://{}/{}/ops --retention-policy infinite",
-                context.basin, context.workspace_id
-            ),
-            "this does not restore expired records; existing object streams may also need reconfiguration.".to_string(),
-        ],
-        ipc::DaemonWarning::BasinDefaultStreamRetentionNotInfinite { retention } => vec![
-            format!(
-                "basin default stream retention is {}; future multipart object streams may expire.",
-                retention_summary_text(retention)
-            ),
-            "for new/prototype workspaces, fix the basin default and recreate the opbox workspace:"
-                .to_string(),
-            format!(
-                "$ s2 reconfigure-basin {} --retention-policy infinite",
-                context.basin
-            ),
-            "this does not change existing streams or restore records that may already have expired."
-                .to_string(),
-        ],
+            details: vec![
+                "future clones may fail after records expire.".to_string(),
+                "if this workspace is disposable, fix the basin default and recreate it.".to_string(),
+                "to keep this workspace, reconfigure the ops stream:".to_string(),
+                format!(
+                    "$ s2 reconfigure-stream s2://{}/{}/ops --retention-policy infinite",
+                    context.basin, context.workspace_id
+                ),
+                "this does not restore expired records; existing object streams may also need reconfiguration.".to_string(),
+            ],
+        },
+        ipc::DaemonWarning::BasinDefaultStreamRetentionNotInfinite { retention } => {
+            DaemonWarningText {
+                headline: format!(
+                    "basin default stream retention is {}",
+                    retention_summary_text(retention)
+                ),
+                details: vec![
+                    "future multipart object streams may expire.".to_string(),
+                    "for new/prototype workspaces, fix the basin default and recreate the opbox workspace:"
+                        .to_string(),
+                    format!(
+                        "$ s2 reconfigure-basin {} --retention-policy infinite",
+                        context.basin
+                    ),
+                    "this does not change existing streams or restore records that may already have expired."
+                        .to_string(),
+                ],
+            }
+        }
     }
 }
 
@@ -2317,6 +2328,25 @@ mod tests {
         assert!(share_token_id(&workspace_id, "").is_err());
 
         Ok(())
+    }
+
+    #[test]
+    fn daemon_warning_text_splits_headline_from_details() {
+        let text = daemon_warning_text(
+            &ipc::DaemonWarning::OpsStreamRetentionNotInfinite {
+                retention: ipc::StreamRetentionSummary::Age { seconds: 86_400 },
+            },
+            RetentionWarningContext {
+                basin: "opbox-dev",
+                workspace_id: "dwwbav5ypjgxra25s7hjzt81gvdbsbmm",
+            },
+        );
+
+        assert_eq!(text.headline, "ops stream retention is 1 day");
+        assert_eq!(
+            text.details.first().map(String::as_str),
+            Some("future clones may fail after records expire.")
+        );
     }
 
     #[test]
