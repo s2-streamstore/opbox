@@ -55,6 +55,7 @@ const S2_BASIN_ENV: &str = "S2_BASIN";
 const S2_ACCESS_TOKEN_ENV: &str = "S2_ACCESS_TOKEN";
 const S2_ACCOUNT_ENDPOINT_ENV: &str = "S2_ACCOUNT_ENDPOINT";
 const S2_BASIN_ENDPOINT_ENV: &str = "S2_BASIN_ENDPOINT";
+const S2_LITE_ACCESS_TOKEN: &str = "ignored";
 
 const STYLES: styling::Styles = styling::Styles::styled()
     .header(styling::AnsiColor::Green.on_default().bold())
@@ -962,7 +963,9 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
     .run_until_shutdown()
     .await?;
 
-    let bootstrap_share_token = if mode == RunMode::Init {
+    let bootstrap_share_token = if mode == RunMode::Init
+        && should_issue_bootstrap_share_token(&s2_connection)
+    {
         progress.set("creating bootstrap share token");
         let ctx = ShareContext {
             root: sync_root.clone(),
@@ -1016,6 +1019,9 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
                 &s2_connection,
                 style,
             );
+            println!();
+        } else if should_print_configured_clone_command(&s2_connection) {
+            print_configured_clone_command(&workspace_id, &basin, &s2_connection, style);
             println!();
         } else {
             print_bootstrap_share_next_step(style);
@@ -1452,6 +1458,14 @@ fn print_bootstrap_share_next_step(style: CliStyle) {
     );
 }
 
+fn should_issue_bootstrap_share_token(connection: &S2ConnectionConfig) -> bool {
+    connection.access_token != S2_LITE_ACCESS_TOKEN
+}
+
+fn should_print_configured_clone_command(connection: &S2ConnectionConfig) -> bool {
+    connection.access_token == S2_LITE_ACCESS_TOKEN
+}
+
 fn print_share_clone_command(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
@@ -1459,10 +1473,41 @@ fn print_share_clone_command(
     connection: &S2ConnectionConfig,
     style: CliStyle,
 ) {
-    println!(
-        "{}",
-        style.bold("share this clone command (contains limited access token):")
+    print_clone_command(
+        "share this clone command (contains limited access token):",
+        workspace_id,
+        basin,
+        access_token,
+        connection,
+        style,
     );
+}
+
+fn print_configured_clone_command(
+    workspace_id: &WorkspaceId,
+    basin: &BasinName,
+    connection: &S2ConnectionConfig,
+    style: CliStyle,
+) {
+    print_clone_command(
+        "clone this workspace with the same S2 connection:",
+        workspace_id,
+        basin,
+        &connection.access_token,
+        connection,
+        style,
+    );
+}
+
+fn print_clone_command(
+    title: &str,
+    workspace_id: &WorkspaceId,
+    basin: &BasinName,
+    access_token: &str,
+    connection: &S2ConnectionConfig,
+    style: CliStyle,
+) {
+    println!("{}", style.bold(title));
     println!();
     for line in share_clone_command_lines(workspace_id, basin, access_token, connection) {
         println!("  {line}");
@@ -2426,6 +2471,25 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn bootstrap_share_token_is_skipped_for_s2_lite_ignored_token() {
+        let s2_lite_connection = S2ConnectionConfig {
+            access_token: "ignored".to_string(),
+            account_endpoint: Some("https://s2-lite.example.test".to_string()),
+            basin_endpoint: Some("https://s2-lite.example.test".to_string()),
+        };
+        assert!(!should_issue_bootstrap_share_token(&s2_lite_connection));
+        assert!(should_print_configured_clone_command(&s2_lite_connection));
+
+        let cloud_connection = S2ConnectionConfig {
+            access_token: "not-ignored".to_string(),
+            account_endpoint: None,
+            basin_endpoint: None,
+        };
+        assert!(should_issue_bootstrap_share_token(&cloud_connection));
+        assert!(!should_print_configured_clone_command(&cloud_connection));
     }
 
     #[test]
