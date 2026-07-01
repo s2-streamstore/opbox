@@ -27,10 +27,17 @@ Go to [s2.dev](http://s2.dev) and make an account. You can sign on with SSO and 
 Create an access token on the UI, and hold on to it.
 
 Next, create a basin, making sure that:
-- You enable automatic stream creation `on append`
-- The retention policy is set to `Infinite` (age-based will work for short-lived workspaces)
+- The retention policy is set to `Infinite` (age-based TTLs will work for short-lived workspaces)
 
 ![create_basin.png](images/create_basin.png)
+
+If you have the `s2` CLI installed, you could also use it to create a basin:
+
+```bash
+s2 create-basin \
+  my-opbox-basin \
+  --retention-policy infinite
+```
 
 Configure your local opbox using your access token and basin name:
 
@@ -99,3 +106,8 @@ cd ~/my-opbox-workspace-clone-1
 # then, use the workspace id from earlier
 ob clone --workspace tgyz0q5a5051djmmpsm6vy7fv3m3egy4
 ```
+
+## Next steps
+
+When sharing a workspace with others, it's better to give out custom access tokens.
+
