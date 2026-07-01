@@ -143,7 +143,7 @@ enum ShareCommand {
     /// List share tokens for the current workspace.
     List { sync_root: Option<PathBuf> },
 
-    /// Revoke a share token by share id.
+    /// Revoke a share token by share id or full token id.
     Revoke {
         id: String,
         sync_root: Option<PathBuf>,
@@ -684,6 +684,27 @@ fn share_token_id(workspace_id: &WorkspaceId, share_id: &str) -> eyre::Result<Ac
         .map_err(|err| eyre::eyre!("invalid share token id {token_id:?}: {err}"))
 }
 
+fn share_token_id_from_arg(workspace_id: &WorkspaceId, value: &str) -> eyre::Result<AccessTokenId> {
+    if value.is_empty() {
+        eyre::bail!("share id cannot be empty");
+    }
+
+    let workspace_prefix = share_token_prefix(workspace_id);
+    let token_id = if value.starts_with(&workspace_prefix) {
+        value.to_string()
+    } else if value.starts_with(&format!("{SHARE_TOKEN_NAMESPACE}-")) {
+        eyre::bail!(
+            "share token id {value:?} does not belong to workspace {}",
+            workspace_id.0
+        );
+    } else {
+        format!("{workspace_prefix}{value}")
+    };
+    token_id
+        .parse()
+        .map_err(|err| eyre::eyre!("invalid share token id {token_id:?}: {err}"))
+}
+
 fn share_token_id_prefix(workspace_id: &WorkspaceId) -> eyre::Result<AccessTokenIdPrefix> {
     let prefix = share_token_prefix(workspace_id);
     prefix
@@ -702,6 +723,12 @@ fn share_id_from_token_id<'a>(workspace_id: &WorkspaceId, token_id: &'a str) -> 
     token_id
         .strip_prefix(&share_token_prefix(workspace_id))
         .unwrap_or(token_id)
+}
+
+fn share_token_expiration_text(expires_at: Option<S2DateTime>) -> String {
+    expires_at
+        .map(|expires_at| expires_at.to_string())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 fn share_token_scope(
@@ -821,13 +848,13 @@ async fn run_share(command: ShareCommand) -> eyre::Result<()> {
             for token in page.values {
                 let token_id = token.id.to_string();
                 println!(
-                    "  {}  {}  {:?}",
+                    "  {}  {}  {}",
                     style.bold(format!(
                         "{:<20}",
                         share_id_from_token_id(&ctx.workspace_id, &token_id)
                     )),
                     style.dim("expires"),
-                    token.expires_at
+                    share_token_expiration_text(token.expires_at)
                 );
                 println!("  {}  {}", style.dim(format!("{:<20}", "")), token_id);
             }
@@ -841,7 +868,7 @@ async fn run_share(command: ShareCommand) -> eyre::Result<()> {
         }
         ShareCommand::Revoke { id, sync_root } => {
             let ctx = load_share_context(sync_root).await?;
-            let token_id = share_token_id(&ctx.workspace_id, &id)?;
+            let token_id = share_token_id_from_arg(&ctx.workspace_id, &id)?;
             let s2 = s2_client_from_config(&ctx.connection)?;
             s2.revoke_access_token(token_id.clone())
                 .await
@@ -2319,6 +2346,14 @@ mod tests {
             "opbox-dwwbav5ypjgxra25s7hjzt81gvdbsbmm-bootstrap"
         );
         assert_eq!(
+            share_token_id_from_arg(
+                &workspace_id,
+                "opbox-dwwbav5ypjgxra25s7hjzt81gvdbsbmm-bootstrap"
+            )?
+            .to_string(),
+            "opbox-dwwbav5ypjgxra25s7hjzt81gvdbsbmm-bootstrap"
+        );
+        assert_eq!(
             share_id_from_token_id(
                 &workspace_id,
                 "opbox-dwwbav5ypjgxra25s7hjzt81gvdbsbmm-alice"
@@ -2326,8 +2361,20 @@ mod tests {
             "alice"
         );
         assert!(share_token_id(&workspace_id, "").is_err());
+        assert!(
+            share_token_id_from_arg(
+                &workspace_id,
+                "opbox-otherworkspace000000000000000000000000-alice"
+            )
+            .is_err()
+        );
 
         Ok(())
+    }
+
+    #[test]
+    fn share_token_expiration_formats_absent_expiration() {
+        assert_eq!(share_token_expiration_text(None), "none");
     }
 
     #[test]
