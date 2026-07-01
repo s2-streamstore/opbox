@@ -31,7 +31,11 @@ use opbox_core::types::{
 };
 use s2_sdk::{
     S2, S2Basin,
-    types::{AccountEndpoint, BasinEndpoint, BasinName},
+    types::{
+        AccessTokenId, AccessTokenIdPrefix, AccessTokenMatcher, AccessTokenScopeInput,
+        AccountEndpoint, BasinEndpoint, BasinMatcher, BasinName, IssueAccessTokenInput,
+        ListAccessTokensInput, Operation, S2DateTime, S2Error, StreamMatcher, StreamNamePrefix,
+    },
 };
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -45,6 +49,13 @@ use tracing::debug;
 
 const CLIENT_COMMAND: &str = "ob";
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
+const SHARE_TOKEN_NAMESPACE: &str = "opbox";
+const BOOTSTRAP_SHARE_ID: &str = "bootstrap";
+const S2_BASIN_ENV: &str = "S2_BASIN";
+const S2_ACCESS_TOKEN_ENV: &str = "S2_ACCESS_TOKEN";
+const S2_ACCOUNT_ENDPOINT_ENV: &str = "S2_ACCOUNT_ENDPOINT";
+const S2_BASIN_ENDPOINT_ENV: &str = "S2_BASIN_ENDPOINT";
+const S2_LITE_ACCESS_TOKEN: &str = "ignored";
 
 const STYLES: styling::Styles = styling::Styles::styled()
     .header(styling::AnsiColor::Green.on_default().bold())
@@ -76,6 +87,7 @@ enum Command {
 
     /// Initialize a new opbox workspace.
     /// Uses the $PWD unless a sync root is specified.
+    /// Reads S2_* environment values when matching flags are omitted.
     Init {
         #[command(flatten)]
         config: WorkspaceConfigOverrides,
@@ -83,6 +95,7 @@ enum Command {
     },
 
     /// Clone an existing workspace.
+    /// Reads S2_* environment values when matching flags are omitted.
     Clone {
         #[arg(long)]
         workspace: WorkspaceId,
@@ -106,11 +119,40 @@ enum Command {
     /// Attach to daemon in order to see CRDT ops as they are received.
     Spy { sync_root: Option<PathBuf> },
 
+    /// Manage share tokens for the current workspace.
+    Share {
+        #[command(subcommand)]
+        command: ShareCommand,
+    },
+
     /// Inspect the daemon process logs.
     Logs {
         /// Tail the log (via `tail -f`).
         #[arg(short, long)]
         follow: bool,
+        sync_root: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Clone, Debug)]
+enum ShareCommand {
+    /// Create a limited S2 access token and print a clone command.
+    New {
+        /// Human-readable share id. The S2 token id will be opbox-$workspace-$id.
+        #[arg(long)]
+        id: Option<String>,
+        /// Token expiration timestamp. Defaults to the issuer token's expiration.
+        #[arg(long, value_name = "RFC3339")]
+        expires_at: Option<S2DateTime>,
+        sync_root: Option<PathBuf>,
+    },
+
+    /// List share tokens for the current workspace.
+    List { sync_root: Option<PathBuf> },
+
+    /// Revoke a share token by share id or full token id.
+    Revoke {
+        id: String,
         sync_root: Option<PathBuf>,
     },
 }
@@ -129,6 +171,28 @@ struct WorkspaceConfigOverrides {
     /// Persist a workspace-local S2 basin endpoint override.
     #[arg(long)]
     basin_endpoint: Option<String>,
+}
+
+impl WorkspaceConfigOverrides {
+    fn with_s2_env_fallbacks(mut self) -> eyre::Result<Self> {
+        self.apply_missing(s2_env_workspace_config_overrides()?);
+        Ok(self)
+    }
+
+    fn apply_missing(&mut self, fallback: Self) {
+        if self.basin.is_none() {
+            self.basin = fallback.basin;
+        }
+        if self.access_token.is_none() {
+            self.access_token = fallback.access_token;
+        }
+        if self.account_endpoint.is_none() {
+            self.account_endpoint = fallback.account_endpoint;
+        }
+        if self.basin_endpoint.is_none() {
+            self.basin_endpoint = fallback.basin_endpoint;
+        }
+    }
 }
 
 #[derive(Subcommand, Clone, Debug)]
@@ -394,6 +458,31 @@ fn parse_basin_config_value(key: &str, value: &str) -> eyre::Result<BasinName> {
         .map_err(|err| eyre::eyre!("invalid {key} {value:?}: {err}"))
 }
 
+fn env_config_value(name: &str) -> eyre::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eyre::bail!("{name} is not valid UTF-8")
+        }
+    }
+}
+
+fn s2_env_workspace_config_overrides() -> eyre::Result<WorkspaceConfigOverrides> {
+    s2_env_workspace_config_overrides_from(env_config_value)
+}
+
+fn s2_env_workspace_config_overrides_from(
+    mut get_env: impl FnMut(&str) -> eyre::Result<Option<String>>,
+) -> eyre::Result<WorkspaceConfigOverrides> {
+    Ok(WorkspaceConfigOverrides {
+        basin: get_env(S2_BASIN_ENV)?,
+        access_token: get_env(S2_ACCESS_TOKEN_ENV)?,
+        account_endpoint: get_env(S2_ACCOUNT_ENDPOINT_ENV)?,
+        basin_endpoint: get_env(S2_BASIN_ENDPOINT_ENV)?,
+    })
+}
+
 fn basin_from_config_stack(
     workspace_config: &UserConfig,
     user_config: &UserConfig,
@@ -593,6 +682,257 @@ async fn warn_if_retention_not_infinite(
     Ok(())
 }
 
+struct ShareContext {
+    root: PathBuf,
+    workspace_id: WorkspaceId,
+    basin: BasinName,
+    connection: S2ConnectionConfig,
+}
+
+struct IssuedShareToken {
+    id: AccessTokenId,
+    access_token: String,
+}
+
+async fn load_share_context(sync_root: Option<PathBuf>) -> eyre::Result<ShareContext> {
+    let root = find_workspace_root(&root_or_current(sync_root)?)?;
+    let status = match request_valid_status(&root).await {
+        Ok(status) => status,
+        Err(error) => exit_daemon_not_running_or_report(&root, error),
+    };
+    let workspace_config = load_user_config_from_path(&workspace_config_path(&root))?;
+    let user_config = load_user_config()?;
+    let workspace_id = status.workspace_id.parse::<WorkspaceId>()?;
+    let basin = parse_basin_config_value("basin", &status.basin)?;
+    let connection = S2ConnectionConfig::from_workspace_or_user_config(
+        &workspace_config,
+        None,
+        None,
+        &user_config,
+    )?;
+
+    Ok(ShareContext {
+        root,
+        workspace_id,
+        basin,
+        connection,
+    })
+}
+
+fn share_token_prefix(workspace_id: &WorkspaceId) -> String {
+    format!("{SHARE_TOKEN_NAMESPACE}-{}-", workspace_id.0)
+}
+
+fn generated_share_id() -> String {
+    format!("share-{:016x}", rand::random::<u64>())
+}
+
+fn share_token_id(workspace_id: &WorkspaceId, share_id: &str) -> eyre::Result<AccessTokenId> {
+    if share_id.is_empty() {
+        eyre::bail!("share id cannot be empty");
+    }
+
+    let token_id = format!("{}{share_id}", share_token_prefix(workspace_id));
+    token_id
+        .parse()
+        .map_err(|err| eyre::eyre!("invalid share token id {token_id:?}: {err}"))
+}
+
+fn share_token_id_from_arg(workspace_id: &WorkspaceId, value: &str) -> eyre::Result<AccessTokenId> {
+    if value.is_empty() {
+        eyre::bail!("share id cannot be empty");
+    }
+
+    let workspace_prefix = share_token_prefix(workspace_id);
+    let token_id = if value.starts_with(&workspace_prefix) {
+        value.to_string()
+    } else if value.starts_with(&format!("{SHARE_TOKEN_NAMESPACE}-")) {
+        eyre::bail!(
+            "share token id {value:?} does not belong to workspace {}",
+            workspace_id.0
+        );
+    } else {
+        format!("{workspace_prefix}{value}")
+    };
+    token_id
+        .parse()
+        .map_err(|err| eyre::eyre!("invalid share token id {token_id:?}: {err}"))
+}
+
+fn share_token_id_prefix(workspace_id: &WorkspaceId) -> eyre::Result<AccessTokenIdPrefix> {
+    let prefix = share_token_prefix(workspace_id);
+    prefix
+        .parse()
+        .map_err(|err| eyre::eyre!("invalid share token prefix {prefix:?}: {err}"))
+}
+
+fn share_token_stream_prefix(workspace_id: &WorkspaceId) -> eyre::Result<StreamNamePrefix> {
+    let prefix = format!("{}/", workspace_id.0);
+    prefix
+        .parse()
+        .map_err(|err| eyre::eyre!("invalid workspace stream prefix {prefix:?}: {err}"))
+}
+
+fn share_id_from_token_id<'a>(workspace_id: &WorkspaceId, token_id: &'a str) -> &'a str {
+    token_id
+        .strip_prefix(&share_token_prefix(workspace_id))
+        .unwrap_or(token_id)
+}
+
+fn share_token_expiration_text(expires_at: Option<S2DateTime>) -> String {
+    expires_at
+        .map(|expires_at| expires_at.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn share_token_scope(
+    workspace_id: &WorkspaceId,
+    basin: &BasinName,
+) -> eyre::Result<AccessTokenScopeInput> {
+    Ok(AccessTokenScopeInput::from_ops([
+        Operation::GetBasinConfig,
+        Operation::CreateStream,
+        Operation::ListStreams,
+        Operation::GetStreamConfig,
+        Operation::CheckTail,
+        Operation::Append,
+        Operation::Read,
+    ])
+    .with_basins(BasinMatcher::Exact(basin.clone()))
+    .with_streams(StreamMatcher::Prefix(share_token_stream_prefix(
+        workspace_id,
+    )?))
+    .with_access_tokens(AccessTokenMatcher::None))
+}
+
+fn share_token_management_error(
+    action: &'static str,
+    required_permission: &'static str,
+    error: impl std::fmt::Display,
+) -> eyre::Report {
+    eyre::eyre!(
+        "failed to {action} share token: {error}\n\
+         share token management requires S2 Cloud and an access token allowed to {required_permission} access tokens; \
+         use the workspace owner/admin token"
+    )
+}
+
+fn share_token_management_report(
+    action: &'static str,
+    required_permission: &'static str,
+    error: eyre::Report,
+) -> eyre::Report {
+    if error.downcast_ref::<S2Error>().is_some() {
+        share_token_management_error(action, required_permission, format!("{error:#}"))
+    } else {
+        error
+    }
+}
+
+async fn issue_share_token(
+    ctx: &ShareContext,
+    share_id: &str,
+    expires_at: Option<S2DateTime>,
+) -> eyre::Result<IssuedShareToken> {
+    let token_id = share_token_id(&ctx.workspace_id, share_id)?;
+    let scope = share_token_scope(&ctx.workspace_id, &ctx.basin)?;
+    let mut input = IssueAccessTokenInput::new(token_id.clone(), scope);
+    if let Some(expires_at) = expires_at {
+        input = input.with_expires_at(expires_at);
+    }
+
+    let s2 = s2_client_from_config(&ctx.connection)?;
+    let access_token = s2.issue_access_token(input).await?;
+    Ok(IssuedShareToken {
+        id: token_id,
+        access_token,
+    })
+}
+
+async fn run_share(command: ShareCommand) -> eyre::Result<()> {
+    match command {
+        ShareCommand::New {
+            id,
+            expires_at,
+            sync_root,
+        } => {
+            let ctx = load_share_context(sync_root).await?;
+            let share_id = id.unwrap_or_else(generated_share_id);
+            let token = issue_share_token(&ctx, &share_id, expires_at)
+                .await
+                .map_err(|error| share_token_management_report("create", "issue", error))?;
+            let style = CliStyle::for_stdout();
+            println!("{}", style.bold("created opbox share token"));
+            print_status_row("workspace", &ctx.workspace_id.0, style);
+            print_status_row("basin", ctx.basin.as_ref(), style);
+            print_status_row("share id", &share_id, style);
+            print_status_row("token id", &token.id, style);
+            println!();
+            print_share_clone_command(
+                &ctx.workspace_id,
+                &ctx.basin,
+                &token.access_token,
+                &ctx.connection,
+                style,
+            );
+            Ok(())
+        }
+        ShareCommand::List { sync_root } => {
+            let ctx = load_share_context(sync_root).await?;
+            let s2 = s2_client_from_config(&ctx.connection)?;
+            let prefix = share_token_id_prefix(&ctx.workspace_id)?;
+            let page = s2
+                .list_access_tokens(
+                    ListAccessTokensInput::new()
+                        .with_prefix(prefix)
+                        .with_limit(1000),
+                )
+                .await
+                .map_err(|error| share_token_management_error("list", "list", error))?;
+            let style = CliStyle::for_stdout();
+            println!("{}", style.bold("opbox share tokens"));
+            print_status_row("workspace", &ctx.workspace_id.0, style);
+            print_status_row("basin", ctx.basin.as_ref(), style);
+            print_status_row("root", ctx.root.display(), style);
+            if page.values.is_empty() {
+                print_status_row("tokens", "none", style);
+                return Ok(());
+            }
+            println!();
+            for token in page.values {
+                let token_id = token.id.to_string();
+                println!(
+                    "  {}  {}  {}",
+                    style.bold(format!(
+                        "{:<20}",
+                        share_id_from_token_id(&ctx.workspace_id, &token_id)
+                    )),
+                    style.dim("expires"),
+                    share_token_expiration_text(token.expires_at)
+                );
+                println!("  {}  {}", style.dim(format!("{:<20}", "")), token_id);
+            }
+            if page.has_more {
+                eprintln!(
+                    "{} more share tokens exist; prefix listing is currently limited to 1000 results",
+                    CliStyle::for_stderr().yellow("warning:")
+                );
+            }
+            Ok(())
+        }
+        ShareCommand::Revoke { id, sync_root } => {
+            let ctx = load_share_context(sync_root).await?;
+            let token_id = share_token_id_from_arg(&ctx.workspace_id, &id)?;
+            let s2 = s2_client_from_config(&ctx.connection)?;
+            s2.revoke_access_token(token_id.clone())
+                .await
+                .map_err(|error| share_token_management_error("revoke", "revoke", error))?;
+            println!("revoked share token {token_id}");
+            Ok(())
+        }
+    }
+}
+
 async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> eyre::Result<()> {
     let mode = bootstrap.mode;
     let sync_root = bootstrap.sync_root.clone();
@@ -623,6 +963,27 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
     .run_until_shutdown()
     .await?;
 
+    let bootstrap_share_token = if mode == RunMode::Init
+        && should_issue_bootstrap_share_token(&s2_connection)
+    {
+        progress.set("creating bootstrap share token");
+        let ctx = ShareContext {
+            root: sync_root.clone(),
+            workspace_id: workspace_id.clone(),
+            basin: basin.clone(),
+            connection: s2_connection.clone(),
+        };
+        match issue_share_token(&ctx, BOOTSTRAP_SHARE_ID, None).await {
+            Ok(token) => Some(token),
+            Err(error) => {
+                progress.suspend(|| print_bootstrap_share_warning(&error, CliStyle::for_stderr()));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if mode == RunMode::Clone {
         progress.set("writing local ignore rules");
         create_default_ignore_file(&sync_root)?;
@@ -648,8 +1009,24 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
             style.bold(style.green(&workspace_id.0))
         );
         println!();
-        print_share_clone_command(&workspace_id, &basin, &s2_connection, style);
-        println!();
+        if let Some(token) = bootstrap_share_token {
+            print_status_row("share token", token.id, style);
+            println!();
+            print_share_clone_command(
+                &workspace_id,
+                &basin,
+                &token.access_token,
+                &s2_connection,
+                style,
+            );
+            println!();
+        } else if should_print_configured_clone_command(&s2_connection) {
+            print_configured_clone_command(&workspace_id, &basin, &s2_connection, style);
+            println!();
+        } else {
+            print_bootstrap_share_next_step(style);
+            println!();
+        }
     }
     println!(
         "run {} to begin syncing",
@@ -1014,6 +1391,10 @@ impl CliStyle {
         self.paint("33", value)
     }
 
+    fn yellow_bold(self, value: impl std::fmt::Display) -> String {
+        self.paint("1;33", value)
+    }
+
     fn magenta(self, value: impl std::fmt::Display) -> String {
         self.paint("35", value)
     }
@@ -1057,18 +1438,78 @@ fn print_status_row(label: &str, value: impl std::fmt::Display, style: CliStyle)
     println!("  {}  {}", style.dim(format!("{label:<13}")), value);
 }
 
+fn print_bootstrap_share_warning(error: &eyre::Report, style: CliStyle) {
+    eprintln!(
+        "{} could not create bootstrap share token: {error:#}",
+        style.yellow("warning:")
+    );
+    eprintln!(
+        "         share token creation requires S2 Cloud and an access token that can issue access tokens"
+    );
+}
+
+fn print_bootstrap_share_next_step(style: CliStyle) {
+    println!("{}", style.yellow("bootstrap share token was not created"));
+    println!(
+        "run {} after configuring a workspace owner/admin token",
+        style.bold(format!(
+            "{CLIENT_COMMAND} share new --id {BOOTSTRAP_SHARE_ID}"
+        ))
+    );
+}
+
+fn should_issue_bootstrap_share_token(connection: &S2ConnectionConfig) -> bool {
+    connection.access_token != S2_LITE_ACCESS_TOKEN
+}
+
+fn should_print_configured_clone_command(connection: &S2ConnectionConfig) -> bool {
+    connection.access_token == S2_LITE_ACCESS_TOKEN
+}
+
 fn print_share_clone_command(
+    workspace_id: &WorkspaceId,
+    basin: &BasinName,
+    access_token: &str,
+    connection: &S2ConnectionConfig,
+    style: CliStyle,
+) {
+    print_clone_command(
+        "share this clone command (contains limited access token):",
+        workspace_id,
+        basin,
+        access_token,
+        connection,
+        style,
+    );
+}
+
+fn print_configured_clone_command(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
     connection: &S2ConnectionConfig,
     style: CliStyle,
 ) {
-    println!(
-        "{}",
-        style.bold("share this clone command (contains access token):")
+    print_clone_command(
+        "clone this workspace with the same S2 connection:",
+        workspace_id,
+        basin,
+        &connection.access_token,
+        connection,
+        style,
     );
+}
+
+fn print_clone_command(
+    title: &str,
+    workspace_id: &WorkspaceId,
+    basin: &BasinName,
+    access_token: &str,
+    connection: &S2ConnectionConfig,
+    style: CliStyle,
+) {
+    println!("{}", style.bold(title));
     println!();
-    for line in share_clone_command_lines(workspace_id, basin, connection) {
+    for line in share_clone_command_lines(workspace_id, basin, access_token, connection) {
         println!("  {line}");
     }
 }
@@ -1076,15 +1517,13 @@ fn print_share_clone_command(
 fn share_clone_command_lines(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
+    access_token: &str,
     connection: &S2ConnectionConfig,
 ) -> Vec<String> {
     let mut lines = vec![
         format!("{CLIENT_COMMAND} clone \\"),
         format!("  --workspace {} \\", shell_quote(&workspace_id.0)),
-        format!(
-            "  --access-token {} \\",
-            shell_quote(&connection.access_token)
-        ),
+        format!("  --access-token {} \\", shell_quote(access_token)),
     ];
     let (account_endpoint, basin_endpoint) = connection.endpoint_pair_for_metadata();
     if let Some(account_endpoint) = account_endpoint {
@@ -1125,13 +1564,10 @@ fn print_status_warning(
     context: RetentionWarningContext<'_>,
     style: CliStyle,
 ) {
-    let lines = daemon_warning_lines(warning, context);
-    let Some((first, rest)) = lines.split_first() else {
-        return;
-    };
-    print_status_row("warning", style.yellow(first), style);
-    for line in rest {
-        print_status_row("", style.yellow(line), style);
+    let text = daemon_warning_text(warning, context);
+    print_status_row("warning", style.yellow_bold(&text.headline), style);
+    for line in text.details {
+        print_status_row("", style.dim(format!("  {line}")), style);
     }
 }
 
@@ -1140,13 +1576,10 @@ fn print_warning(
     context: RetentionWarningContext<'_>,
     style: CliStyle,
 ) {
-    let lines = daemon_warning_lines(warning, context);
-    let Some((first, rest)) = lines.split_first() else {
-        return;
-    };
-    eprintln!("{} {}", style.yellow("warning:"), first);
-    for line in rest {
-        eprintln!("         {line}");
+    let text = daemon_warning_text(warning, context);
+    eprintln!("{} {}", style.yellow("warning:"), text.headline);
+    for line in text.details {
+        eprintln!("           {line}");
     }
 }
 
@@ -1158,38 +1591,51 @@ fn print_retention_check_warning(target: &str, error: &eyre::Report, style: CliS
     );
 }
 
-fn daemon_warning_lines(
+struct DaemonWarningText {
+    headline: String,
+    details: Vec<String>,
+}
+
+fn daemon_warning_text(
     warning: &ipc::DaemonWarning,
     context: RetentionWarningContext<'_>,
-) -> Vec<String> {
+) -> DaemonWarningText {
     match warning {
-        ipc::DaemonWarning::OpsStreamRetentionNotInfinite { retention } => vec![
-            format!(
-                "ops stream retention is {}; future clones may fail after records expire.",
+        ipc::DaemonWarning::OpsStreamRetentionNotInfinite { retention } => DaemonWarningText {
+            headline: format!(
+                "ops stream retention is {}",
                 retention_summary_text(retention)
             ),
-            "if this workspace is disposable, fix the basin default and recreate it.".to_string(),
-            "to keep this workspace, reconfigure the ops stream:".to_string(),
-            format!(
-                "$ s2 reconfigure-stream s2://{}/{}/ops --retention-policy infinite",
-                context.basin, context.workspace_id
-            ),
-            "this does not restore expired records; existing object streams may also need reconfiguration.".to_string(),
-        ],
-        ipc::DaemonWarning::BasinDefaultStreamRetentionNotInfinite { retention } => vec![
-            format!(
-                "basin default stream retention is {}; future multipart object streams may expire.",
-                retention_summary_text(retention)
-            ),
-            "for new/prototype workspaces, fix the basin default and recreate the opbox workspace:"
-                .to_string(),
-            format!(
-                "$ s2 reconfigure-basin {} --retention-policy infinite",
-                context.basin
-            ),
-            "this does not change existing streams or restore records that may already have expired."
-                .to_string(),
-        ],
+            details: vec![
+                "future clones may fail after records expire.".to_string(),
+                "if this workspace is disposable, fix the basin default and recreate it.".to_string(),
+                "to keep this workspace, reconfigure the ops stream:".to_string(),
+                format!(
+                    "$ s2 reconfigure-stream s2://{}/{}/ops --retention-policy infinite",
+                    context.basin, context.workspace_id
+                ),
+                "this does not restore expired records; existing object streams may also need reconfiguration.".to_string(),
+            ],
+        },
+        ipc::DaemonWarning::BasinDefaultStreamRetentionNotInfinite { retention } => {
+            DaemonWarningText {
+                headline: format!(
+                    "basin default stream retention is {}",
+                    retention_summary_text(retention)
+                ),
+                details: vec![
+                    "future multipart object streams may expire.".to_string(),
+                    "for new/prototype workspaces, fix the basin default and recreate the opbox workspace:"
+                        .to_string(),
+                    format!(
+                        "$ s2 reconfigure-basin {} --retention-policy infinite",
+                        context.basin
+                    ),
+                    "this does not change existing streams or restore records that may already have expired."
+                        .to_string(),
+                ],
+            }
+        }
     }
 }
 
@@ -1863,6 +2309,7 @@ async fn main() {
         Command::Init { config, sync_root } => with_failure_banner(
             "init",
             async {
+                let config = config.with_s2_env_fallbacks()?;
                 let progress = BootstrapProgress::new(RunMode::Init)?;
                 let user_config = load_user_config()?;
                 let bootstrap = bootstrap_init(sync_root, &user_config, &config, &progress).await?;
@@ -1878,6 +2325,7 @@ async fn main() {
         } => with_failure_banner(
             "clone",
             async {
+                let config = config.with_s2_env_fallbacks()?;
                 let progress = BootstrapProgress::new(RunMode::Clone)?;
                 let user_config = load_user_config()?;
                 let bootstrap = bootstrap_clone(
@@ -1897,6 +2345,7 @@ async fn main() {
         Command::Stop { sync_root } => run_stop(sync_root).await,
         Command::Status { sync_root } => run_status(sync_root).await,
         Command::Spy { sync_root } => run_spy(sync_root).await,
+        Command::Share { command } => with_failure_banner("share", run_share(command).await),
         Command::Logs { follow, sync_root } => run_daemon_logs(follow, sync_root),
     };
 
@@ -1944,6 +2393,105 @@ mod tests {
         Ok(())
     }
 
+    fn fake_s2_env_overrides() -> eyre::Result<WorkspaceConfigOverrides> {
+        s2_env_workspace_config_overrides_from(|name| {
+            Ok(match name {
+                S2_BASIN_ENV => Some("env-basin".to_string()),
+                S2_ACCESS_TOKEN_ENV => Some("ignored".to_string()),
+                S2_ACCOUNT_ENDPOINT_ENV => Some("http://localhost:80".to_string()),
+                S2_BASIN_ENDPOINT_ENV => Some("http://localhost:80".to_string()),
+                _ => None,
+            })
+        })
+    }
+
+    #[test]
+    fn init_s2_env_fallbacks_override_user_config() -> eyre::Result<()> {
+        let mut overrides = WorkspaceConfigOverrides::default();
+        overrides.apply_missing(fake_s2_env_overrides()?);
+        let user_config = UserConfig {
+            default_basin: Some("global-basin".to_string()),
+            access_token: Some("global-token".to_string()),
+            account_endpoint: Some("global-account.s2.test".to_string()),
+            basin_endpoint: Some("{basin}.global.s2.test".to_string()),
+            ..UserConfig::default()
+        };
+
+        let (workspace_config, basin, connection) =
+            workspace_config_from_overrides(&overrides, &user_config)?;
+
+        assert_eq!(basin.as_ref(), "env-basin");
+        assert_eq!(workspace_config.basin.as_deref(), Some("env-basin"));
+        assert_eq!(workspace_config.access_token.as_deref(), Some("ignored"));
+        assert_eq!(
+            workspace_config.account_endpoint.as_deref(),
+            Some("http://localhost:80")
+        );
+        assert_eq!(
+            workspace_config.basin_endpoint.as_deref(),
+            Some("http://localhost:80")
+        );
+        assert_eq!(connection.access_token, "ignored");
+        assert_eq!(
+            connection.account_endpoint.as_deref(),
+            Some("http://localhost:80")
+        );
+        assert_eq!(
+            connection.basin_endpoint.as_deref(),
+            Some("http://localhost:80")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn init_cli_overrides_win_over_s2_env_fallbacks() -> eyre::Result<()> {
+        let mut overrides = WorkspaceConfigOverrides {
+            basin: Some("cli-basin".to_string()),
+            access_token: Some("cli-token".to_string()),
+            account_endpoint: Some("cli-account.s2.test".to_string()),
+            basin_endpoint: Some("{basin}.cli.s2.test".to_string()),
+        };
+        overrides.apply_missing(fake_s2_env_overrides()?);
+        let user_config = UserConfig::default();
+
+        let (workspace_config, basin, connection) =
+            workspace_config_from_overrides(&overrides, &user_config)?;
+
+        assert_eq!(basin.as_ref(), "cli-basin");
+        assert_eq!(workspace_config.basin.as_deref(), Some("cli-basin"));
+        assert_eq!(connection.access_token, "cli-token");
+        assert_eq!(
+            connection.account_endpoint.as_deref(),
+            Some("cli-account.s2.test")
+        );
+        assert_eq!(
+            connection.basin_endpoint.as_deref(),
+            Some("{basin}.cli.s2.test")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_share_token_is_skipped_for_s2_lite_ignored_token() {
+        let s2_lite_connection = S2ConnectionConfig {
+            access_token: "ignored".to_string(),
+            account_endpoint: Some("https://s2-lite.example.test".to_string()),
+            basin_endpoint: Some("https://s2-lite.example.test".to_string()),
+        };
+        assert!(!should_issue_bootstrap_share_token(&s2_lite_connection));
+        assert!(should_print_configured_clone_command(&s2_lite_connection));
+
+        let cloud_connection = S2ConnectionConfig {
+            access_token: "not-ignored".to_string(),
+            account_endpoint: None,
+            basin_endpoint: None,
+        };
+        assert!(should_issue_bootstrap_share_token(&cloud_connection));
+        assert!(!should_print_configured_clone_command(&cloud_connection));
+    }
+
     #[test]
     fn share_clone_command_includes_effective_connection_config() -> eyre::Result<()> {
         let workspace_id = WorkspaceId("dwwbav5ypjgxra25s7hjzt81gvdbsbmm".to_string());
@@ -1955,11 +2503,11 @@ mod tests {
         };
 
         assert_eq!(
-            share_clone_command_lines(&workspace_id, &basin, &connection),
+            share_clone_command_lines(&workspace_id, &basin, "limited+share/token", &connection),
             vec![
                 "ob clone \\".to_string(),
                 "  --workspace dwwbav5ypjgxra25s7hjzt81gvdbsbmm \\".to_string(),
-                "  --access-token 'R3QAAAAAAABq+secret/token' \\".to_string(),
+                "  --access-token 'limited+share/token' \\".to_string(),
                 "  --account-endpoint account.example.test \\".to_string(),
                 "  --basin-endpoint '{basin}.example.test' \\".to_string(),
                 "  --basin opbox-dev-2".to_string(),
@@ -1979,11 +2527,72 @@ mod tests {
             basin_endpoint: None,
         };
 
-        let command = share_clone_command_lines(&workspace_id, &basin, &connection).join("\n");
+        let command =
+            share_clone_command_lines(&workspace_id, &basin, "limited-token", &connection)
+                .join("\n");
         assert!(!command.contains("--account-endpoint"));
         assert!(!command.contains("--basin-endpoint"));
 
         Ok(())
+    }
+
+    #[test]
+    fn share_token_id_is_scoped_to_workspace() -> eyre::Result<()> {
+        let workspace_id = WorkspaceId("dwwbav5ypjgxra25s7hjzt81gvdbsbmm".to_string());
+
+        assert_eq!(
+            share_token_id(&workspace_id, "bootstrap")?.to_string(),
+            "opbox-dwwbav5ypjgxra25s7hjzt81gvdbsbmm-bootstrap"
+        );
+        assert_eq!(
+            share_token_id_from_arg(
+                &workspace_id,
+                "opbox-dwwbav5ypjgxra25s7hjzt81gvdbsbmm-bootstrap"
+            )?
+            .to_string(),
+            "opbox-dwwbav5ypjgxra25s7hjzt81gvdbsbmm-bootstrap"
+        );
+        assert_eq!(
+            share_id_from_token_id(
+                &workspace_id,
+                "opbox-dwwbav5ypjgxra25s7hjzt81gvdbsbmm-alice"
+            ),
+            "alice"
+        );
+        assert!(share_token_id(&workspace_id, "").is_err());
+        assert!(
+            share_token_id_from_arg(
+                &workspace_id,
+                "opbox-otherworkspace000000000000000000000000-alice"
+            )
+            .is_err()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn share_token_expiration_formats_absent_expiration() {
+        assert_eq!(share_token_expiration_text(None), "none");
+    }
+
+    #[test]
+    fn daemon_warning_text_splits_headline_from_details() {
+        let text = daemon_warning_text(
+            &ipc::DaemonWarning::OpsStreamRetentionNotInfinite {
+                retention: ipc::StreamRetentionSummary::Age { seconds: 86_400 },
+            },
+            RetentionWarningContext {
+                basin: "opbox-dev",
+                workspace_id: "dwwbav5ypjgxra25s7hjzt81gvdbsbmm",
+            },
+        );
+
+        assert_eq!(text.headline, "ops stream retention is 1 day");
+        assert_eq!(
+            text.details.first().map(String::as_str),
+            Some("future clones may fail after records expire.")
+        );
     }
 
     #[test]

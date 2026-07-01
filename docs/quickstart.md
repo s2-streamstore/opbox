@@ -24,13 +24,20 @@ Go to [s2.dev](http://s2.dev) and make an account. You can sign on with SSO and 
 > [!NOTE]
 > Do put down a payment method in order to be able to make streams with infinite retention. The free tier (no payment method listed) is restricted to 28 day data retention. In other words, your workspace will break after 4 weeks unless you do this.
 
-Create an access token on the UI, and hold on to it.
+Create an access token on the UI, and hold on to it. You can accept all of the defaults when creating this token. Don't share it with anyone else!
 
 Next, create a basin, making sure that:
-- You enable automatic stream creation `on append`
-- The retention policy is set to `Infinite` (age-based will work for short-lived workspaces)
+- The retention policy is set to `Infinite` (age-based TTLs will work for short-lived workspaces)
 
 ![create_basin.png](images/create_basin.png)
+
+If you have the `s2` CLI installed, you could also use it to create a basin:
+
+```bash
+s2 create-basin \
+  my-opbox-basin \
+  --retention-policy infinite
+```
 
 Configure your local opbox using your access token and basin name:
 
@@ -60,10 +67,19 @@ You should see something like this:
 ```console
 me@mac my-opbox-workspace % ob init
 initialized opbox workspace
-  basin          opbox-dev
+  basin          my-opbox-basin 
   root           /Users/me/my-opbox-workspace
 
-your workspace is: tgyz0q5a5051djmmpsm6vy7fv3m3egy4
+your workspace is: wersq5ks6776xwqhdpycs835g4w6pg7z
+
+  share token    opbox-wersq5ks6776xwqhdpycs835g4w6pg7z-bootstrap
+
+share this clone command (contains limited access token):
+
+  ob clone \
+    --workspace wersq5ks6776xwqhdpycs835g4w6pg7z \
+    --access-token I7oAAAAAAABqRXQ5hghQl6Kc8xJtVmqcc5k5Skpnzg6jVKew \
+    --basin my-opbox-basin 
 
 run ob start to begin syncing
 ```
@@ -72,7 +88,15 @@ Great, it worked.
 
 At this point, the workspace has been created, and an initial snapshot has been successfully sent to S2.
 
-Anyone who wants to sync can clone this workspace (as long as they have a valid auth token, and also know your basin).
+Anyone who wants to sync can clone this workspace using the command printed above.
+
+> [!TIP]
+> 
+> The `access-token` printed in the `ob clone` command is created during initialization, and constrained to the current workspace. It's not a global access token.
+> 
+> Sharing it will not allow others to create new workspaces using your account.
+> 
+> You can create per-user share tokens, revoke tokens, and list all with `ob share`.
 
 To listen for local changes and apply remote changes, start the daemon:
 ```bash
@@ -97,5 +121,13 @@ cd ~/my-opbox-workspace-clone-1
 
 # the directory must be empty to start
 # then, use the workspace id from earlier
-ob clone --workspace tgyz0q5a5051djmmpsm6vy7fv3m3egy4
+ob clone \
+  --workspace wersq5ks6776xwqhdpycs835g4w6pg7z \
+  --access-token I7oAAAAAAABqRXQ5hghQl6Kc8xJtVmqcc5k5Skpnzg6jVKew \
+  --basin my-opbox-basin 
+
+# and finally, start syncing
+ob start
 ```
+
+
