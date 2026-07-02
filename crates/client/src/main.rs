@@ -1024,6 +1024,9 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
     }
     print_status_row("basin", basin.as_ref(), style);
     print_status_row("root", sync_root.display(), style);
+    if let Some(key) = &encryption_key {
+        print_status_row("cipher", key, style);
+    }
     if mode == RunMode::Init {
         println!();
         println!(

@@ -51,7 +51,7 @@ if [[ -z "${workspace_id}" ]]; then
   echo "failed to parse workspace id from ob init output" >&2
   exit 1
 fi
-cipher="$(grep -oP '(?<=--cipher )\S+' <<<"${init_output}" || true)"
+cipher="$(awk '/cipher/ {print $NF}' <<<"${init_output}" || true)"
 
 ob start "${source_dir}"
 baseline_cursor="$(ob status "${source_dir}" | awk '/stable cursor/ {print $NF}')"
