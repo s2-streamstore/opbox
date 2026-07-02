@@ -12,6 +12,8 @@ pub const KEY_LEN: usize = 32;
 /// Crockford base32 length of a 32-byte key: ceil(32 * 8 / 5).
 pub const KEY_ENCODED_LEN: usize = 52;
 const NONCE_LEN: usize = 12;
+const TAG_LEN: usize = 16;
+pub const CIPHERTEXT_OVERHEAD_LEN: usize = NONCE_LEN + TAG_LEN;
 
 /// 256-bit key for client-side AES-256-GCM encryption.
 ///

@@ -27,6 +27,78 @@ enum WriterRunError {
     Fatal(eyre::Report),
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crdt::types::{ObjectId, SharedMessage};
+    use bytes::Bytes;
+    use s2_sdk::types::MeteredBytes;
+
+    const S2_MAX_RECORD_METERED_BYTES: usize = 1024 * 1024;
+
+    fn test_cipher() -> RecordCipher {
+        RecordCipher {
+            key: CipherKey::from_bytes([0x42u8; encrypt::KEY_LEN]),
+            nonce_rng: NonceRng::seeded(7),
+        }
+    }
+
+    fn origin() -> SharedMessageOrigin {
+        SharedMessageOrigin {
+            daemon_writer_id: DaemonWriterId(Bytes::from_static(b"0123456789abcdef")),
+            outbox_id: OutboxId::new(0),
+        }
+    }
+
+    #[test]
+    fn max_inline_payload_still_fits_after_encryption() -> eyre::Result<()> {
+        let payload = Bytes::from(vec![b'x'; codec::max_inline_record_size() - 1]);
+        let package = codec::shared_to_s2_package(
+            SharedMessage::NamespaceUpdate {
+                yjs_update: payload,
+            },
+            &origin(),
+        )?;
+        let S2Package::Inlined { record } = package else {
+            eyre::bail!("expected inline package");
+        };
+
+        let encrypted = test_cipher().encrypt_record(record)?;
+        assert!(encrypted.metered_bytes() <= S2_MAX_RECORD_METERED_BYTES);
+        AppendRecordBatch::try_from_iter([encrypted])?;
+        Ok(())
+    }
+
+    #[test]
+    fn near_limit_payload_with_large_headers_uses_pointer_package() -> eyre::Result<()> {
+        let payload = Bytes::from(vec![b'x'; codec::max_inline_record_size() - 1]);
+        let package = codec::shared_to_s2_package(
+            SharedMessage::TextObjectUpdate {
+                object_id: ObjectId(Bytes::from(vec![b'o'; 1024])),
+                yjs_update: payload,
+            },
+            &origin(),
+        )?;
+        let S2Package::Pointer {
+            pointer_record,
+            parts,
+            ..
+        } = package
+        else {
+            eyre::bail!("expected pointer package");
+        };
+
+        assert!(pointer_record.metered_bytes() <= S2_MAX_RECORD_METERED_BYTES);
+        AppendRecordBatch::try_from_iter([pointer_record])?;
+        for part in parts {
+            let encrypted = test_cipher().encrypt_record(part)?;
+            assert!(encrypted.metered_bytes() <= S2_MAX_RECORD_METERED_BYTES);
+            AppendRecordBatch::try_from_iter([encrypted])?;
+        }
+        Ok(())
+    }
+}
+
 impl WriterRunError {
     fn from_s2(error: S2Error) -> Self {
         if s2_error_is_connectivity(&error) {

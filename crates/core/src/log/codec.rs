@@ -2,9 +2,10 @@ use crate::types::{DaemonWriterId, OutboxId, WorkspaceId};
 use fast32::base32;
 
 use crate::crdt::types::{ObjectId, SharedMessage};
+use crate::log::encrypt;
 use crate::log::types::SharedMessageOrigin;
 use bytes::Bytes;
-use s2_sdk::types::{AppendRecord, Header, SequencedRecord, StreamName};
+use s2_sdk::types::{AppendRecord, Header, MeteredBytes, SequencedRecord, StreamName};
 use std::str::FromStr;
 use time::OffsetDateTime;
 use xxhash_rust::xxh3::xxh3_64;
@@ -62,9 +63,18 @@ const MAX_INLINE_RECORD_SIZE: usize = 2 * 1024;
 
 #[cfg(not(feature = "sim"))]
 const MAX_INLINE_RECORD_SIZE: usize = (1024 * 1024) - (1024);
+const S2_MAX_RECORD_METERED_BYTES: usize = 1024 * 1024;
 
 pub const fn max_inline_record_size() -> usize {
     MAX_INLINE_RECORD_SIZE
+}
+
+fn encrypted_record_metered_bytes(
+    plaintext_body_len: usize,
+    headers: &[Header],
+) -> eyre::Result<usize> {
+    let header_record = AppendRecord::new(Bytes::new())?.with_headers(headers.to_vec())?;
+    Ok(header_record.metered_bytes() + plaintext_body_len + encrypt::CIPHERTEXT_OVERHEAD_LEN)
 }
 
 pub fn header_value<'a>(headers: &'a [Header], name: &str) -> Option<&'a Bytes> {
@@ -206,7 +216,11 @@ pub fn shared_to_s2_package(
     let payload = msg.payload().clone();
     let payload_size = payload.len();
     let pointer_headers = encode_common_headers(&msg, origin)?;
-    if payload_size < MAX_INLINE_RECORD_SIZE {
+    if payload_size < MAX_INLINE_RECORD_SIZE
+        && encrypted_record_metered_bytes(payload_size, &pointer_headers)
+            .map_err(|err| eyre::eyre!("inline record metered size check failed: {err}"))?
+            <= S2_MAX_RECORD_METERED_BYTES
+    {
         // Inline it.
 
         Ok(S2Package::Inlined {
