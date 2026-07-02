@@ -565,8 +565,12 @@ async fn bootstrap_init(
     let workspace_id = WorkspaceId::generate();
     debug!(?workspace_id, "generated workspace id");
     progress.set("configuring basin encryption");
-    ensure_basin_stream_cipher(&s2, basin.clone()).await?;
-    let encryption_key = generate_encryption_key();
+    let encryption_enabled = ensure_basin_stream_cipher(&s2, basin.clone()).await?;
+    let encryption_key = if encryption_enabled {
+        Some(generate_encryption_key())
+    } else {
+        None
+    };
     progress.set("creating shared log stream");
     create_workspace_stream(&s2_basin, &workspace_id).await?;
     progress.set("checking shared log retention");
@@ -580,8 +584,7 @@ async fn bootstrap_init(
         progress,
     )
     .await?;
-    let daemon_row =
-        fresh_daemon_state_row(workspace_id, basin, &s2_connection, Some(encryption_key));
+    let daemon_row = fresh_daemon_state_row(workspace_id, basin, &s2_connection, encryption_key);
     progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
     save_workspace_config(&sync_root, &workspace_config)?;

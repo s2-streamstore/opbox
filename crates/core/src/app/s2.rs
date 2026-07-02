@@ -224,17 +224,28 @@ pub async fn basin_default_stream_retention_warning(
     Ok(basin_config_retention_warning(&config))
 }
 
-pub async fn ensure_basin_stream_cipher(s2: &S2, basin: BasinName) -> eyre::Result<()> {
+pub async fn ensure_basin_stream_cipher(s2: &S2, basin: BasinName) -> eyre::Result<bool> {
     let config = s2.get_basin_config(basin.clone()).await?;
     if config.stream_cipher.is_some() {
-        return Ok(());
+        return Ok(true);
     }
-    s2.reconfigure_basin(ReconfigureBasinInput::new(
-        basin,
-        BasinReconfiguration::new().with_stream_cipher(EncryptionAlgorithm::Aes256Gcm),
-    ))
-    .await?;
-    Ok(())
+    match s2
+        .reconfigure_basin(ReconfigureBasinInput::new(
+            basin.clone(),
+            BasinReconfiguration::new().with_stream_cipher(EncryptionAlgorithm::Aes256Gcm),
+        ))
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            tracing::warn!(
+                "could not configure encryption on basin '{basin}': {e}. \
+                 Workspace will be created without encryption. \
+                 To enable encryption, ask a basin admin to set stream_cipher to aes-256-gcm."
+            );
+            Ok(false)
+        }
+    }
 }
 
 pub fn basin_config_retention_warning(config: &BasinConfig) -> Option<DaemonWarning> {

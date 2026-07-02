@@ -51,6 +51,7 @@ if [[ -z "${workspace_id}" ]]; then
   echo "failed to parse workspace id from ob init output" >&2
   exit 1
 fi
+cipher="$(grep -oP '(?<=--cipher )\S+' <<<"${init_output}" || true)"
 
 ob start "${source_dir}"
 baseline_cursor="$(ob status "${source_dir}" | awk '/stable cursor/ {print $NF}')"
@@ -107,7 +108,11 @@ if ((stable_polls < 5)); then
 fi
 
 ob stop "${source_dir}"
-ob clone --workspace "${workspace_id}" "${clone_dir}"
+clone_args=(--workspace "${workspace_id}")
+if [[ -n "${cipher}" ]]; then
+  clone_args+=(--cipher "${cipher}")
+fi
+ob clone "${clone_args[@]}" "${clone_dir}"
 
 cmp "${expected_notes}" "${clone_dir}/notes.txt"
 cmp "${expected_nested}" "${clone_dir}/nested/info.txt"
