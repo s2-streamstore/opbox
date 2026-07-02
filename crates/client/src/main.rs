@@ -101,9 +101,9 @@ enum Command {
     Clone {
         #[arg(long)]
         workspace: WorkspaceId,
-        /// Encryption key for the workspace (base64-encoded).
+        /// Encryption key for the workspace (hex-encoded).
         #[arg(long)]
-        cipher: String,
+        cipher: Option<String>,
         /// Clone only shared log records at or before this RFC3339 timestamp.
         #[arg(long, value_name = "RFC3339")]
         as_of: Option<CloneAsOf>,
@@ -604,7 +604,7 @@ async fn bootstrap_init(
 
 async fn bootstrap_clone(
     workspace: WorkspaceId,
-    cipher: String,
+    cipher: Option<String>,
     sync_root: Option<PathBuf>,
     clone_log_read_stop: Option<LogReadStop>,
     user_config: &UserConfig,
@@ -626,8 +626,9 @@ async fn bootstrap_clone(
     let s2_basin = s2.basin(basin.clone());
     progress.set("checking shared log stream");
     ensure_workspace_stream_exists(&s2_basin, &workspace).await?;
-    let encryption_key: EncryptionKey = cipher
-        .parse()
+    let encryption_key: Option<EncryptionKey> = cipher
+        .map(|c| c.parse())
+        .transpose()
         .map_err(|err| eyre::eyre!("invalid --cipher value: {err}"))?;
     progress.set("checking shared log retention");
     warn_if_retention_not_infinite(
@@ -640,7 +641,7 @@ async fn bootstrap_clone(
         progress,
     )
     .await?;
-    let daemon_row = fresh_daemon_state_row(workspace, basin, &s2_connection, Some(encryption_key));
+    let daemon_row = fresh_daemon_state_row(workspace, basin, &s2_connection, encryption_key);
     progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
     save_workspace_config(&sync_root, &workspace_config)?;
