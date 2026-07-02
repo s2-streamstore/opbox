@@ -181,6 +181,7 @@ async fn run(
         daemon_row: daemon_row.clone(),
         s2_basin,
         clone_log_read_stop: None,
+        clone_clobber: false,
         engine_status: Some(EngineStatusConfig {
             sync_root: sync_root.clone(),
             workspace_id: daemon_row.workspace_id.clone(),

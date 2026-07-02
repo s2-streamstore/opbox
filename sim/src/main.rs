@@ -12,7 +12,9 @@ use eyre::eyre;
 use fault_injecting_file_io::FaultInjectingFileIO;
 use in_memory_file_io::{InMemoryFileIO, InMemoryFileIOStats};
 use opbox_core::app::connectivity::{ConnectivitySnapshot, LinkState};
-use opbox_core::app::db::{initialize_database, open_memory_database, semantic_pool};
+use opbox_core::app::db::{
+    initialize_database, load_daemon_state_from_db, open_memory_database, semantic_pool,
+};
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::crdt::types::ObjectId;
 use opbox_core::engine::actor::{EngineCommand, EngineStatusConfig};
@@ -27,7 +29,7 @@ use s2_sdk::types::{
     AccountEndpoint, BasinEndpoint, BasinName, CreateBasinInput, ListStreamsInput, S2Config,
     S2Endpoints, S2Error,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
@@ -180,6 +182,7 @@ enum Workload {
     BinaryFileIgnore,
     PermissionDeniedIgnore,
     TooLargeIgnore,
+    CloneClobber,
 }
 
 impl Workload {
@@ -319,6 +322,9 @@ fn run_single(args: SingleArgs) -> eyre::Result<()> {
         }
         Workload::TooLargeIgnore => {
             run_too_large_ignore_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::CloneClobber => {
+            run_clone_clobber_workload(&mut sim, seed, args.common.max_steps)?
         }
     }
 
@@ -980,6 +986,126 @@ fn run_general_workload(
         Err(io_err(format!(
             "local trees did not converge; a={last_a:?} b={last_b:?}"
         )))
+    });
+
+    Ok(())
+}
+
+/// Clone into a populated sync root, the `ob clone --clobber` flow: daemon-a
+/// publishes an initial tree, then a second participant with local content
+/// clones over it. Identical files must be left untouched, divergent files
+/// must take the remote content, and local-only files must survive the clone
+/// and be shared with the workspace once the cloner starts syncing. A clone
+/// without clobber into the same kind of populated root must refuse.
+fn run_clone_clobber_workload(
+    sim: &mut turmoil::Sim<'static>,
+    seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("0000000000000000000000000000001c".to_string());
+    let daemon_a = spawn_daemon_with_initial_files(
+        sim,
+        "daemon-a",
+        0,
+        workspace_id.clone(),
+        BTreeMap::from([
+            (
+                "shared.txt".to_string(),
+                Bytes::from_static(b"same on both sides\n"),
+            ),
+            (
+                "divergent.txt".to_string(),
+                Bytes::from_static(b"remote version\n"),
+            ),
+        ]),
+    )?;
+    let clone_b = spawn_clone_daemon(
+        sim,
+        "daemon-b",
+        1,
+        workspace_id.clone(),
+        BTreeMap::from([
+            (
+                "shared.txt".to_string(),
+                Bytes::from_static(b"same on both sides\n"),
+            ),
+            (
+                "divergent.txt".to_string(),
+                Bytes::from_static(b"local version\n"),
+            ),
+            (
+                "local-only.txt".to_string(),
+                Bytes::from_static(b"local only\n"),
+            ),
+        ]),
+    )?;
+    let clone_refused = spawn_clone_daemon(
+        sim,
+        "clone-refused",
+        2,
+        workspace_id,
+        BTreeMap::from([(
+            "divergent.txt".to_string(),
+            Bytes::from_static(b"local version\n"),
+        )]),
+    )?;
+    configure_daemon_s2_link_latencies(sim);
+
+    sim.client("controller", async move {
+        // Wait until daemon-a's initial files are durably in the shared log:
+        // stable state reflects its own messages read back, and the outbox has
+        // fully drained (appends acked).
+        wait_for_stable_paths(&daemon_a, &["divergent.txt", "shared.txt"], steps).await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+
+        // Without clobber, cloning into a populated root must refuse.
+        let refusal = clone_refused
+            .run_clone(false)
+            .await?
+            .err()
+            .ok_or_else(|| io_err("clone without clobber into populated root must fail"))?;
+        if !refusal.contains("not empty") {
+            return Err(io_err(format!(
+                "clone refusal had unexpected message: {refusal}"
+            )));
+        }
+
+        clone_b.run_clone(true).await?.map_err(io_err)?;
+
+        let expected = BTreeMap::from([
+            (
+                "shared.txt".to_string(),
+                "same on both sides\n".to_string(),
+            ),
+            ("divergent.txt".to_string(), "remote version\n".to_string()),
+            ("local-only.txt".to_string(), "local only\n".to_string()),
+        ]);
+        let after_clone = clone_b.snapshot_text_files().await?;
+        if after_clone != expected {
+            return Err(io_err(format!(
+                "unexpected tree after clobber clone; expected={expected:?} observed={after_clone:?}"
+            )));
+        }
+
+        // The clone must have rewritten only the divergent file; the
+        // content-identical file short-circuits as already applied.
+        let stats = clone_b.stats().await?;
+        if stats.guarded_write_written_count != 1 || stats.guarded_write_already_applied_count != 1
+        {
+            return Err(io_err(format!(
+                "unexpected clone write stats; written={} already_applied={}",
+                stats.guarded_write_written_count, stats.guarded_write_already_applied_count
+            )));
+        }
+
+        // Once clone-b syncs, its local-only file becomes shared and both
+        // sides converge on the clobbered tree.
+        wait_for_text_files(&daemon_a, &clone_b, &expected, steps).await?;
+
+        println!("SIM_OK workload=clone-clobber seed={seed}");
+        daemon_a.shutdown().await;
+        clone_b.shutdown().await;
+        Ok(())
     });
 
     Ok(())
@@ -2478,6 +2604,29 @@ fn print_document_snapshot(moment: &str, daemon: &str, path: &str, text: &str) {
     );
 }
 
+/// Wait until the daemon's stable tree (state applied back from the shared
+/// log) contains exactly the expected paths.
+async fn wait_for_stable_paths(
+    daemon: &SimDaemonHandle,
+    expected: &[&str],
+    steps: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected: BTreeSet<String> = expected.iter().map(|path| path.to_string()).collect();
+    let mut last = BTreeSet::new();
+    for _ in 0..steps {
+        let debug = daemon.semantic_debug_snapshot().await?;
+        last = debug.stable_paths.keys().cloned().collect();
+        if last == expected {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(io_err(format!(
+        "stable paths did not converge; expected={expected:?} last={last:?}"
+    )))
+}
+
 async fn wait_for_outbox_empty(
     daemon: &SimDaemonHandle,
     steps: u64,
@@ -3147,7 +3296,63 @@ fn spawn_daemon_with_initial_files(
     })
 }
 
+/// Spawn a daemon that starts in clone mode against a pre-populated file io.
+/// It idles until the controller sends `RunClone`, then behaves like a normal
+/// sync daemon once the clone succeeds.
+fn spawn_clone_daemon(
+    sim: &mut turmoil::Sim<'static>,
+    name: &'static str,
+    daemon_index: u8,
+    workspace_id: WorkspaceId,
+    initial_files: BTreeMap<String, Bytes>,
+) -> eyre::Result<SimDaemonHandle> {
+    let daemon_row = daemon_state::Row {
+        workspace_id,
+        s2_basin: SIM_BASIN.parse()?,
+        s2_account_endpoint: None,
+        s2_basin_endpoint: None,
+        daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&[daemon_index; 16])),
+        stable_cursor: ..0,
+        next_outbox_id: OutboxId::new(0),
+    };
+
+    let file_io = FaultInjectingFileIO::new(InMemoryFileIO::new());
+    for (path, bytes) in initial_files {
+        file_io.write_file(path, bytes)?;
+    }
+    let handle_io = file_io.clone();
+    let (command_tx, command_rx) = mpsc::channel(100);
+    sim.client(name, async move {
+        run_clone_daemon_client(name, daemon_row, file_io, command_rx).await
+    });
+
+    Ok(SimDaemonHandle {
+        command_tx,
+        _io: handle_io,
+    })
+}
+
 async fn run_daemon_client(
+    name: &'static str,
+    daemon_row: daemon_state::Row,
+    file_io: FaultInjectingFileIO,
+    command_rx: mpsc::Receiver<SimDaemonCommand>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_basin_exists().await?;
+    let db = open_memory_database().await.map_err(io_err)?;
+    initialize_database(&db, &daemon_row)
+        .await
+        .map_err(io_err)?;
+    let pool = semantic_pool(db.clone()).await.map_err(io_err)?;
+    let semantic_service = SemanticService::new(pool);
+    run_sync_phase(name, daemon_row, file_io, semantic_service, command_rx).await
+}
+
+/// A daemon spawned by `spawn_clone_daemon` first waits for a `RunClone`
+/// command, runs the one-shot clone runtime against its (possibly populated)
+/// file io, and on success transitions into normal sync mode — mirroring
+/// `ob clone` followed by `ob start`.
+async fn run_clone_daemon_client(
     name: &'static str,
     daemon_row: daemon_state::Row,
     file_io: FaultInjectingFileIO,
@@ -3158,8 +3363,77 @@ async fn run_daemon_client(
     initialize_database(&db, &daemon_row)
         .await
         .map_err(io_err)?;
+
+    let (clobber, reply) = match command_rx.recv().await {
+        Some(SimDaemonCommand::RunClone { clobber, reply }) => (clobber, reply),
+        Some(_) => {
+            return Err(io_err(
+                "clone daemon cannot serve other commands before RunClone",
+            ));
+        }
+        None => {
+            warn!(name, "clone daemon command channel closed before RunClone");
+            return Ok(());
+        }
+    };
+
     let pool = semantic_pool(db.clone()).await.map_err(io_err)?;
     let semantic_service = SemanticService::new(pool);
+    let clone_result = run_clone_runtime(&daemon_row, file_io.clone(), semantic_service, clobber)
+        .await
+        .map_err(|err| err.to_string());
+    let clone_failed = clone_result.is_err();
+    let _ = reply.send(clone_result);
+    if clone_failed {
+        // The controller observed the failure; there is no sync phase.
+        return Ok(());
+    }
+
+    // Like `ob start`, sync resumes from the daemon state the clone persisted
+    // (most importantly the advanced stable cursor).
+    let daemon_row = load_daemon_state_from_db(&db).await.map_err(io_err)?;
+    let pool = semantic_pool(db.clone()).await.map_err(io_err)?;
+    let semantic_service = SemanticService::new(pool);
+    run_sync_phase(name, daemon_row, file_io, semantic_service, command_rx).await
+}
+
+async fn run_clone_runtime(
+    daemon_row: &daemon_state::Row,
+    file_io: FaultInjectingFileIO,
+    semantic_service: SemanticService,
+    clobber: bool,
+) -> eyre::Result<()> {
+    let s2_basin = sim_s2_client()?.basin(daemon_row.s2_basin.clone());
+    let cancellation_token = CancellationToken::new();
+    let mut actors = AppRuntime::new(AppRuntimeConfig {
+        mode: RunMode::Clone,
+        file_io,
+        notify_io: None::<()>,
+        semantic_service,
+        daemon_row: daemon_row.clone(),
+        s2_basin,
+        clone_log_read_stop: None,
+        clone_clobber: clobber,
+        engine_status: None,
+        spy_tx: None,
+    })
+    .spawn(cancellation_token.clone());
+
+    let first_stop = actors.wait_for_actor_stop().await;
+    let shutdown_error = actors.shutdown(cancellation_token).await;
+    match first_stop.or(shutdown_error) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+async fn run_sync_phase(
+    name: &'static str,
+    daemon_row: daemon_state::Row,
+    file_io: FaultInjectingFileIO,
+    semantic_service: SemanticService,
+    mut command_rx: mpsc::Receiver<SimDaemonCommand>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let debug_semantic_service = semantic_service.clone();
     let s2_basin = sim_s2_client()
         .map_err(io_err)?
@@ -3183,6 +3457,7 @@ async fn run_daemon_client(
         daemon_row,
         s2_basin,
         clone_log_read_stop: None,
+        clone_clobber: false,
         engine_status: Some(engine_status),
         spy_tx: None,
     });
@@ -3293,6 +3568,9 @@ async fn run_daemon_client(
                             .inject_delete_if_exists_failure(path)
                             .map_err(|err| err.to_string());
                         let _ = reply.send(result);
+                    }
+                    SimDaemonCommand::RunClone { reply, .. } => {
+                        let _ = reply.send(Err("daemon is already syncing".to_string()));
                     }
                     SimDaemonCommand::Shutdown { reply } => {
                         let result = actors.shutdown(cancellation_token).await;
@@ -3429,6 +3707,20 @@ impl SimDaemonHandle {
             .await
             .map_err(io_err)?;
         Ok(recv.await.map_err(io_err)?)
+    }
+
+    /// Returns the clone outcome itself as the inner result so workloads can
+    /// assert on expected clone failures.
+    async fn run_clone(
+        &self,
+        clobber: bool,
+    ) -> Result<Result<(), String>, Box<dyn std::error::Error>> {
+        let (reply, recv) = oneshot::channel();
+        self.command_tx
+            .send(SimDaemonCommand::RunClone { clobber, reply })
+            .await
+            .map_err(io_err)?;
+        recv.await.map_err(io_err)
     }
 
     async fn stats(&self) -> Result<InMemoryFileIOStats, Box<dyn std::error::Error>> {
@@ -3674,6 +3966,13 @@ enum SimDaemonCommand {
     },
     InjectDeleteIfExistsFailure {
         path: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Start the bounded clone phase of a daemon spawned with
+    /// `spawn_clone_daemon`. The reply carries the clone outcome; on success
+    /// the daemon transitions into normal sync mode.
+    RunClone {
+        clobber: bool,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Shutdown {
