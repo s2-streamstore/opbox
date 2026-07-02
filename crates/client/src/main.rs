@@ -23,6 +23,7 @@ use opbox_core::app::workspace::{
 };
 use opbox_core::fs::fio::local::LocalFileIO;
 use opbox_core::fs::ignore::{IGNORE_FILE_NAME, METADATA_DIR_NAME, default_ignore_file_contents};
+use opbox_core::log::encrypt::{CipherKey, NonceRng};
 use opbox_core::log::types::LogReadStop;
 use opbox_core::semantic::service::SemanticService;
 use opbox_core::semantic::table::daemon_state;
@@ -100,6 +101,10 @@ enum Command {
     Clone {
         #[arg(long)]
         workspace: WorkspaceId,
+        /// Encryption key for the workspace, as printed by `ob init` and
+        /// `ob share new`.
+        #[arg(long)]
+        cipher: String,
         /// Clone only shared log records at or before this RFC3339 timestamp.
         #[arg(long, value_name = "RFC3339")]
         as_of: Option<CloneAsOf>,
@@ -348,6 +353,7 @@ fn fresh_daemon_state_row(
     workspace_id: WorkspaceId,
     basin: BasinName,
     connection: &S2ConnectionConfig,
+    encryption_key: CipherKey,
 ) -> daemon_state::Row {
     let writer_id = rand::random::<[u8; 16]>();
     let (s2_account_endpoint, s2_basin_endpoint) = connection.endpoint_pair_for_metadata();
@@ -360,6 +366,7 @@ fn fresh_daemon_state_row(
         daemon_writer_id: DaemonWriterId(bytes::Bytes::copy_from_slice(&writer_id)),
         stable_cursor: ..0,
         next_outbox_id: OutboxId::new(0),
+        encryption_key,
     }
 }
 
@@ -558,6 +565,7 @@ async fn bootstrap_init(
     let s2_basin = s2.basin(basin.clone());
     let workspace_id = WorkspaceId::generate();
     debug!(?workspace_id, "generated workspace id");
+    let encryption_key = CipherKey::generate();
     progress.set("creating shared log stream");
     create_workspace_stream(&s2_basin, &workspace_id).await?;
     progress.set("checking shared log retention");
@@ -571,7 +579,7 @@ async fn bootstrap_init(
         progress,
     )
     .await?;
-    let daemon_row = fresh_daemon_state_row(workspace_id, basin, &s2_connection);
+    let daemon_row = fresh_daemon_state_row(workspace_id, basin, &s2_connection, encryption_key);
     progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
     save_workspace_config(&sync_root, &workspace_config)?;
@@ -592,6 +600,7 @@ async fn bootstrap_init(
 
 async fn bootstrap_clone(
     workspace: WorkspaceId,
+    cipher: String,
     sync_root: Option<PathBuf>,
     clone_log_read_stop: Option<LogReadStop>,
     clobber: bool,
@@ -614,6 +623,9 @@ async fn bootstrap_clone(
     let s2_basin = s2.basin(basin.clone());
     progress.set("checking shared log stream");
     ensure_workspace_stream_exists(&s2_basin, &workspace).await?;
+    let encryption_key: CipherKey = cipher
+        .parse()
+        .map_err(|err| eyre::eyre!("invalid --cipher value: {err}"))?;
     progress.set("checking shared log retention");
     warn_if_retention_not_infinite(
         &s2,
@@ -625,7 +637,7 @@ async fn bootstrap_clone(
         progress,
     )
     .await?;
-    let daemon_row = fresh_daemon_state_row(workspace, basin, &s2_connection);
+    let daemon_row = fresh_daemon_state_row(workspace, basin, &s2_connection, encryption_key);
     progress.set("writing local metadata");
     create_metadata_dir(&sync_root)?;
     save_workspace_config(&sync_root, &workspace_config)?;
@@ -699,6 +711,7 @@ struct ShareContext {
     workspace_id: WorkspaceId,
     basin: BasinName,
     connection: S2ConnectionConfig,
+    encryption_key: CipherKey,
 }
 
 struct IssuedShareToken {
@@ -706,16 +719,13 @@ struct IssuedShareToken {
     access_token: String,
 }
 
+/// A running daemon holds an exclusive lock on the workspace DB, so share
+/// commands fetch DB-backed state over IPC while it runs and only open the DB
+/// directly once we know the daemon is down.
 async fn load_share_context(sync_root: Option<PathBuf>) -> eyre::Result<ShareContext> {
     let root = find_workspace_root(&root_or_current(sync_root)?)?;
-    let status = match request_valid_status(&root).await {
-        Ok(status) => status,
-        Err(error) => exit_daemon_not_running_or_report(&root, error),
-    };
     let workspace_config = load_user_config_from_path(&workspace_config_path(&root))?;
     let user_config = load_user_config()?;
-    let workspace_id = status.workspace_id.parse::<WorkspaceId>()?;
-    let basin = parse_basin_config_value("basin", &status.basin)?;
     let connection = S2ConnectionConfig::from_workspace_or_user_config(
         &workspace_config,
         None,
@@ -723,11 +733,41 @@ async fn load_share_context(sync_root: Option<PathBuf>) -> eyre::Result<ShareCon
         &user_config,
     )?;
 
+    let (workspace_id, basin, encryption_key) = match request_valid_share_context(&root).await {
+        Ok(share) => (
+            share.workspace_id.parse::<WorkspaceId>()?,
+            parse_basin_config_value("basin", &share.basin)?,
+            share
+                .encryption_key
+                .parse::<CipherKey>()
+                .map_err(|err| eyre::eyre!("daemon returned an invalid encryption key: {err}"))?,
+        ),
+        // A present socket means a daemon answered badly (build mismatch,
+        // foreign root, ...); don't race it for the DB lock. A failed request
+        // already removes stale socket files, so a missing socket means the
+        // daemon is down and the DB is safe to open.
+        Err(error) if socket_link_path(&root).exists() => {
+            return Err(error.wrap_err(format!(
+                "failed to fetch share context from the opbox daemon for {}",
+                root.display()
+            )));
+        }
+        Err(_) => {
+            let (_, daemon_row) = load_configured_daemon_state(&root).await?;
+            (
+                daemon_row.workspace_id,
+                daemon_row.s2_basin,
+                daemon_row.encryption_key,
+            )
+        }
+    };
+
     Ok(ShareContext {
         root,
         workspace_id,
         basin,
         connection,
+        encryption_key,
     })
 }
 
@@ -884,6 +924,7 @@ async fn run_share(command: ShareCommand) -> eyre::Result<()> {
                 &ctx.workspace_id,
                 &ctx.basin,
                 &token.access_token,
+                &ctx.encryption_key,
                 &ctx.connection,
                 style,
             );
@@ -951,6 +992,7 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
     let workspace_id = bootstrap.daemon_row.workspace_id.clone();
     let basin = bootstrap.daemon_row.s2_basin.clone();
     let s2_connection = bootstrap.s2_connection.clone();
+    let encryption_key = bootstrap.daemon_row.encryption_key.clone();
 
     progress.set(match mode {
         RunMode::Init => "uploading initial workspace snapshot",
@@ -968,6 +1010,7 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
         semantic_service,
         daemon_row: bootstrap.daemon_row,
         s2_basin: bootstrap.s2_basin,
+        nonce_rng: NonceRng::Os,
         clone_log_read_stop: bootstrap.clone_log_read_stop,
         clone_clobber: bootstrap.clone_clobber,
         engine_status: None,
@@ -995,6 +1038,7 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
             workspace_id: workspace_id.clone(),
             basin: basin.clone(),
             connection: s2_connection.clone(),
+            encryption_key: encryption_key.clone(),
         };
         match issue_share_token(&ctx, BOOTSTRAP_SHARE_ID, None).await {
             Ok(token) => Some(token),
@@ -1031,6 +1075,7 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
     }
     print_status_row("basin", basin.as_ref(), style);
     print_status_row("root", sync_root.display(), style);
+    print_status_row("cipher", &encryption_key, style);
     if mode == RunMode::Init {
         println!();
         println!(
@@ -1045,12 +1090,19 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
                 &workspace_id,
                 &basin,
                 &token.access_token,
+                &encryption_key,
                 &s2_connection,
                 style,
             );
             println!();
         } else if should_print_configured_clone_command(&s2_connection) {
-            print_configured_clone_command(&workspace_id, &basin, &s2_connection, style);
+            print_configured_clone_command(
+                &workspace_id,
+                &basin,
+                &encryption_key,
+                &s2_connection,
+                style,
+            );
             println!();
         } else {
             print_bootstrap_share_next_step(style);
@@ -1499,6 +1551,7 @@ fn print_share_clone_command(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
     access_token: &str,
+    encryption_key: &CipherKey,
     connection: &S2ConnectionConfig,
     style: CliStyle,
 ) {
@@ -1507,6 +1560,7 @@ fn print_share_clone_command(
         workspace_id,
         basin,
         access_token,
+        encryption_key,
         connection,
         style,
     );
@@ -1515,6 +1569,7 @@ fn print_share_clone_command(
 fn print_configured_clone_command(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
+    encryption_key: &CipherKey,
     connection: &S2ConnectionConfig,
     style: CliStyle,
 ) {
@@ -1523,6 +1578,7 @@ fn print_configured_clone_command(
         workspace_id,
         basin,
         &connection.access_token,
+        encryption_key,
         connection,
         style,
     );
@@ -1533,12 +1589,19 @@ fn print_clone_command(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
     access_token: &str,
+    encryption_key: &CipherKey,
     connection: &S2ConnectionConfig,
     style: CliStyle,
 ) {
     println!("{}", style.bold(title));
     println!();
-    for line in share_clone_command_lines(workspace_id, basin, access_token, connection) {
+    for line in share_clone_command_lines(
+        workspace_id,
+        basin,
+        access_token,
+        encryption_key,
+        connection,
+    ) {
         println!("  {line}");
     }
 }
@@ -1547,12 +1610,14 @@ fn share_clone_command_lines(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
     access_token: &str,
+    encryption_key: &CipherKey,
     connection: &S2ConnectionConfig,
 ) -> Vec<String> {
     let mut lines = vec![
         format!("{CLIENT_COMMAND} clone \\"),
         format!("  --workspace {} \\", shell_quote(&workspace_id.0)),
         format!("  --access-token {} \\", shell_quote(access_token)),
+        format!("  --cipher {} \\", shell_quote(&encryption_key.to_string())),
     ];
     let (account_endpoint, basin_endpoint) = connection.endpoint_pair_for_metadata();
     if let Some(account_endpoint) = account_endpoint {
@@ -2259,24 +2324,34 @@ fn exit_daemon_not_running_or_report(root: &Path, error: eyre::Report) -> ! {
 
 async fn request_valid_status(root: &Path) -> eyre::Result<ipc::DaemonStatus> {
     let status = ipc::request_status(root).await?;
-    let status_root = PathBuf::from(&status.root);
-    let status_root = status_root.canonicalize().map_err(|error| {
+    validate_daemon_reported_root(root, &status.root)?;
+    Ok(status)
+}
+
+async fn request_valid_share_context(root: &Path) -> eyre::Result<ipc::ShareContextResponse> {
+    let share = ipc::request_share_context(root).await?;
+    validate_daemon_reported_root(root, &share.root)?;
+    Ok(share)
+}
+
+fn validate_daemon_reported_root(root: &Path, reported_root: &str) -> eyre::Result<()> {
+    let reported = PathBuf::from(reported_root);
+    let reported = reported.canonicalize().map_err(|error| {
         let _ = remove_socket_pointer(root);
         eyre::eyre!(
-            "daemon reported non-canonicalizable root {}: {error}; removed stale socket pointer",
-            status.root
+            "daemon reported non-canonicalizable root {reported_root}: {error}; removed stale socket pointer"
         )
     })?;
     let root = root.canonicalize()?;
-    if status_root != root {
+    if reported != root {
         let _ = remove_socket_pointer(&root);
         eyre::bail!(
             "daemon socket belongs to {}; expected {}; removed stale socket pointer",
-            status_root.display(),
+            reported.display(),
             root.display()
         );
     }
-    Ok(status)
+    Ok(())
 }
 
 fn daemon_command(root: &Path) -> eyre::Result<TokioCommand> {
@@ -2348,6 +2423,7 @@ async fn main() {
         ),
         Command::Clone {
             workspace,
+            cipher,
             as_of,
             clobber,
             config,
@@ -2360,6 +2436,7 @@ async fn main() {
                 let user_config = load_user_config()?;
                 let bootstrap = bootstrap_clone(
                     workspace,
+                    cipher,
                     sync_root,
                     as_of.map(CloneAsOf::log_read_stop),
                     clobber,
@@ -2396,7 +2473,9 @@ fn render_error(error: &eyre::Report) {
         eprintln!(
             "run {} to create a workspace here, or {} to fetch an existing one",
             style.bold(format!("{CLIENT_COMMAND} init")),
-            style.bold(format!("{CLIENT_COMMAND} clone --workspace <ID>")),
+            style.bold(format!(
+                "{CLIENT_COMMAND} clone --workspace <ID> --cipher <KEY>"
+            )),
         );
         return;
     }
@@ -2417,7 +2496,12 @@ mod tests {
             basin_endpoint: Some("{basin}.s2.test".to_string()),
         };
 
-        let row = fresh_daemon_state_row(workspace_id, basin, &connection);
+        let row = fresh_daemon_state_row(
+            workspace_id,
+            basin,
+            &connection,
+            CipherKey::from_bytes([0x42u8; 32]),
+        );
         assert_eq!(row.s2_account_endpoint.as_deref(), Some("account.s2.test"));
         assert_eq!(row.s2_basin_endpoint.as_deref(), Some("{basin}.s2.test"));
 
@@ -2533,12 +2617,20 @@ mod tests {
             basin_endpoint: Some("{basin}.example.test".to_string()),
         };
 
+        let encryption_key = CipherKey::from_bytes([0x42u8; 32]);
         assert_eq!(
-            share_clone_command_lines(&workspace_id, &basin, "limited+share/token", &connection),
+            share_clone_command_lines(
+                &workspace_id,
+                &basin,
+                "limited+share/token",
+                &encryption_key,
+                &connection
+            ),
             vec![
                 "ob clone \\".to_string(),
                 "  --workspace dwwbav5ypjgxra25s7hjzt81gvdbsbmm \\".to_string(),
                 "  --access-token 'limited+share/token' \\".to_string(),
+                format!("  --cipher {encryption_key} \\"),
                 "  --account-endpoint account.example.test \\".to_string(),
                 "  --basin-endpoint '{basin}.example.test' \\".to_string(),
                 "  --basin opbox-dev-2".to_string(),
@@ -2558,9 +2650,14 @@ mod tests {
             basin_endpoint: None,
         };
 
-        let command =
-            share_clone_command_lines(&workspace_id, &basin, "limited-token", &connection)
-                .join("\n");
+        let command = share_clone_command_lines(
+            &workspace_id,
+            &basin,
+            "limited-token",
+            &CipherKey::from_bytes([0x42u8; 32]),
+            &connection,
+        )
+        .join("\n");
         assert!(!command.contains("--account-endpoint"));
         assert!(!command.contains("--basin-endpoint"));
 

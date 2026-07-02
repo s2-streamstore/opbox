@@ -69,16 +69,18 @@ me@mac my-opbox-workspace % ob init
 initialized opbox workspace
   basin          my-opbox-basin 
   root           /Users/me/my-opbox-workspace
+  cipher         89abcdefghjkmnpqrstvwxyz23456789abcdefghjkmnpqrstuvw
 
 your workspace is: wersq5ks6776xwqhdpycs835g4w6pg7z
 
   share token    opbox-wersq5ks6776xwqhdpycs835g4w6pg7z-bootstrap
 
-share this clone command (contains limited access token):
+share this clone command (contains limited access token and workspace cipher):
 
   ob clone \
     --workspace wersq5ks6776xwqhdpycs835g4w6pg7z \
     --access-token I7oAAAAAAABqRXQ5hghQl6Kc8xJtVmqcc5k5Skpnzg6jVKew \
+    --cipher 89abcdefghjkmnpqrstvwxyz23456789abcdefghjkmnpqrstuvw \
     --basin my-opbox-basin 
 
 run ob start to begin syncing
@@ -94,7 +96,7 @@ Anyone who wants to sync can clone this workspace using the command printed abov
 > 
 > The `access-token` printed in the `ob clone` command is created during initialization, and constrained to the current workspace. It's not a global access token.
 > 
-> Sharing it will not allow others to create new workspaces using your account.
+> Sharing it will not allow others to create new workspaces using your account. The `cipher` is the workspace encryption key; share it only with people who should be able to decrypt workspace contents.
 > 
 > You can create per-user share tokens, revoke tokens, and list all with `ob share`.
 
@@ -111,7 +113,7 @@ ob start
 ## Cloning an existing workspace
 
 > [!NOTE]
-> Make sure your opbox config is correct. If you did the S2 setup steps, send the access token and basin to anyone you want to share your workspace with. They can set those values globally with `ob config`, or for one clone with `ob clone --workspace ... --basin ... --access-token ...`.
+> Make sure your opbox config is correct. If you did the S2 setup steps, send the access token, cipher, and basin to anyone you want to share your workspace with. They can set the S2 values globally with `ob config`, or for one clone with `ob clone --workspace ... --cipher ... --basin ... --access-token ...`.
 
 This will likely be done on another computer.
 
@@ -124,10 +126,10 @@ cd ~/my-opbox-workspace-clone-1
 ob clone \
   --workspace wersq5ks6776xwqhdpycs835g4w6pg7z \
   --access-token I7oAAAAAAABqRXQ5hghQl6Kc8xJtVmqcc5k5Skpnzg6jVKew \
+  --cipher 89abcdefghjkmnpqrstvwxyz23456789abcdefghjkmnpqrstuvw \
   --basin my-opbox-basin 
 
 # and finally, start syncing
 ob start
 ```
-
 

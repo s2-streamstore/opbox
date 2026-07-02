@@ -57,6 +57,17 @@ pub struct StopResponse {
     pub pid: u32,
 }
 
+/// Context `ob share` needs from a running daemon. The daemon holds an
+/// exclusive lock on the workspace DB, so the CLI must not open it directly
+/// while the daemon runs; this response carries the DB-backed fields instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareContextResponse {
+    pub workspace_id: String,
+    pub basin: String,
+    pub root: String,
+    pub encryption_key: String,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DaemonBuildMismatch {
     pub client_version: String,
@@ -89,6 +100,16 @@ pub async fn request_status(sync_root: &Path) -> eyre::Result<DaemonStatus> {
         sync_root,
         Method::GET,
         "/status",
+        DaemonMetadataPolicy::Strict,
+    )
+    .await
+}
+
+pub async fn request_share_context(sync_root: &Path) -> eyre::Result<ShareContextResponse> {
+    request_json(
+        sync_root,
+        Method::GET,
+        "/share-context",
         DaemonMetadataPolicy::Strict,
     )
     .await
@@ -465,6 +486,15 @@ async fn handle_control_request(
                 text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
             }
         },
+        (&Method::GET, "/share-context") => json_response(
+            StatusCode::OK,
+            &ShareContextResponse {
+                workspace_id: config.daemon_state.workspace_id.0.clone(),
+                basin: config.daemon_state.s2_basin.as_ref().to_string(),
+                root: config.sync_root.display().to_string(),
+                encryption_key: config.daemon_state.encryption_key.to_string(),
+            },
+        ),
         (&Method::GET, "/spy") => match request_engine_spy(&config).await {
             Ok(open) => Ok(spy_response(open, token)),
             Err(error) => {
@@ -750,6 +780,7 @@ mod tests {
             daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),
+            encryption_key: crate::log::encrypt::CipherKey::from_bytes([0x42u8; 32]),
         };
 
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
@@ -812,6 +843,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn share_context_serves_daemon_state_without_engine_round_trip() -> eyre::Result<()> {
+        let sync_root =
+            std::env::temp_dir().join(format!("opbox-ipc-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&sync_root)?;
+        std::fs::create_dir(metadata_dir(&sync_root))?;
+        let writer_bytes = rand::random::<[u8; 16]>();
+        let encryption_key = crate::log::encrypt::CipherKey::from_bytes([0x42u8; 32]);
+
+        let daemon_row = daemon_state::Row {
+            workspace_id: WorkspaceId("0123456789abcdefghijklmnopqrstuv".to_string()),
+            s2_basin: "test-basin".parse()?,
+            s2_account_endpoint: None,
+            s2_basin_endpoint: None,
+            daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
+            stable_cursor: ..0,
+            next_outbox_id: OutboxId::new(0),
+            encryption_key: encryption_key.clone(),
+        };
+
+        // No engine task: the share-context route must answer straight from
+        // ControlServerConfig.daemon_state.
+        let (engine_tx, _engine_rx) = mpsc::unbounded_channel();
+        let token = CancellationToken::new();
+        let server = tokio::spawn({
+            let token = token.clone();
+            let config = ControlServerConfig {
+                sync_root: sync_root.clone(),
+                daemon_state: daemon_row.clone(),
+                engine_tx,
+            };
+            async move { serve_control(config, token).await }
+        });
+
+        wait_for_socket(&sync_root).await?;
+
+        let share = request_share_context(&sync_root).await?;
+        assert_eq!(share.workspace_id, daemon_row.workspace_id.0);
+        assert_eq!(share.basin, daemon_row.s2_basin.as_ref());
+        assert_eq!(share.root, sync_root.display().to_string());
+        assert_eq!(share.encryption_key, encryption_key.to_string());
+
+        token.cancel();
+        server.await??;
+        let _ = std::fs::remove_dir_all(&sync_root);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn spy_stream_opens_through_engine_mailbox() -> eyre::Result<()> {
         let sync_root =
             std::env::temp_dir().join(format!("opbox-ipc-test-{}", rand::random::<u64>()));
@@ -827,6 +906,7 @@ mod tests {
             daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),
+            encryption_key: crate::log::encrypt::CipherKey::from_bytes([0x42u8; 32]),
         };
 
         let (spy_tx, _) = broadcast::channel(8);
@@ -903,6 +983,7 @@ mod tests {
             daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),
+            encryption_key: crate::log::encrypt::CipherKey::from_bytes([0x42u8; 32]),
         };
 
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
@@ -1011,6 +1092,7 @@ mod tests {
             daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),
+            encryption_key: crate::log::encrypt::CipherKey::from_bytes([0x42u8; 32]),
         };
 
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
@@ -1132,6 +1214,7 @@ mod tests {
             daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&writer_bytes)),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),
+            encryption_key: crate::log::encrypt::CipherKey::from_bytes([0x42u8; 32]),
         };
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
         let engine = tokio::spawn(async move {

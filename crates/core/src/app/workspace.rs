@@ -238,7 +238,7 @@ pub async fn load_configured_daemon_state(
     let db_path = storage_db_path(sync_root);
     if !db_path.try_exists()? {
         eyre::bail!(
-            "sync root is not configured for opbox: {} is missing; run `ob init` or `ob clone --workspace WORKSPACE_ID` first",
+            "sync root is not configured for opbox: {} is missing; run `ob init` or `ob clone --workspace WORKSPACE_ID --cipher KEY` first",
             db_path.display()
         );
     }
@@ -354,6 +354,7 @@ mod tests {
             daemon_writer_id: DaemonWriterId(Bytes::from_static(b"0123456789abcdef")),
             stable_cursor: ..0,
             next_outbox_id: OutboxId::new(0),
+            encryption_key: crate::log::encrypt::CipherKey::from_bytes([0x42u8; 32]),
         };
         let db_path = storage_db_path(&sync_root);
         create_initialized_database(&db_path, &daemon_row).await?;

@@ -51,6 +51,13 @@ if [[ -z "${workspace_id}" ]]; then
   echo "failed to parse workspace id from ob init output" >&2
   exit 1
 fi
+# Exact-field match: init output can also contain a `--cipher <key> \` line
+# inside the printed clone command, which a bare /cipher/ regex would match.
+cipher="$(awk '$1 == "cipher" {print $2}' <<<"${init_output}")"
+if [[ -z "${cipher}" ]]; then
+  echo "failed to parse cipher from ob init output" >&2
+  exit 1
+fi
 
 ob start "${source_dir}"
 baseline_cursor="$(ob status "${source_dir}" | awk '/stable cursor/ {print $NF}')"
@@ -107,7 +114,7 @@ if ((stable_polls < 5)); then
 fi
 
 ob stop "${source_dir}"
-ob clone --workspace "${workspace_id}" "${clone_dir}"
+ob clone --workspace "${workspace_id}" --cipher "${cipher}" "${clone_dir}"
 
 cmp "${expected_notes}" "${clone_dir}/notes.txt"
 cmp "${expected_nested}" "${clone_dir}/nested/info.txt"

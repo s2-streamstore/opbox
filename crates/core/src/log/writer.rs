@@ -1,6 +1,7 @@
 use crate::app::s2::s2_error_is_connectivity;
 use crate::log::codec;
 use crate::log::codec::{ObjectPointer, S2Package};
+use crate::log::encrypt::{self, CipherKey, NonceRng};
 use crate::log::types::{LogWriterRequest, LogWriterResponse, SharedMessageOrigin};
 use crate::types::{DaemonWriterId, OutboxId, WorkspaceId};
 use futures::StreamExt;
@@ -9,7 +10,7 @@ use futures::stream::FuturesOrdered;
 use s2_sdk::append_session::AppendSessionConfig;
 use s2_sdk::batching::BatchingConfig;
 use s2_sdk::producer::{IndexedAppendAck, ProducerConfig};
-use s2_sdk::types::{AppendInput, AppendRecord, AppendRecordBatch, CreateStreamInput};
+use s2_sdk::types::{AppendInput, AppendRecord, AppendRecordBatch, CreateStreamInput, Header};
 use s2_sdk::{
     S2Basin,
     types::{AppendAck, S2Error, StreamName},
@@ -24,6 +25,78 @@ use tracing::{debug, info};
 enum WriterRunError {
     Disconnected(String),
     Fatal(eyre::Report),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crdt::types::{ObjectId, SharedMessage};
+    use bytes::Bytes;
+    use s2_sdk::types::MeteredBytes;
+
+    const S2_MAX_RECORD_METERED_BYTES: usize = 1024 * 1024;
+
+    fn test_cipher() -> RecordCipher {
+        RecordCipher {
+            key: CipherKey::from_bytes([0x42u8; encrypt::KEY_LEN]),
+            nonce_rng: NonceRng::seeded(7),
+        }
+    }
+
+    fn origin() -> SharedMessageOrigin {
+        SharedMessageOrigin {
+            daemon_writer_id: DaemonWriterId(Bytes::from_static(b"0123456789abcdef")),
+            outbox_id: OutboxId::new(0),
+        }
+    }
+
+    #[test]
+    fn max_inline_payload_still_fits_after_encryption() -> eyre::Result<()> {
+        let payload = Bytes::from(vec![b'x'; codec::max_inline_record_size() - 1]);
+        let package = codec::shared_to_s2_package(
+            SharedMessage::NamespaceUpdate {
+                yjs_update: payload,
+            },
+            &origin(),
+        )?;
+        let S2Package::Inlined { record } = package else {
+            eyre::bail!("expected inline package");
+        };
+
+        let encrypted = test_cipher().encrypt_record(record)?;
+        assert!(encrypted.metered_bytes() <= S2_MAX_RECORD_METERED_BYTES);
+        AppendRecordBatch::try_from_iter([encrypted])?;
+        Ok(())
+    }
+
+    #[test]
+    fn near_limit_payload_with_large_headers_uses_pointer_package() -> eyre::Result<()> {
+        let payload = Bytes::from(vec![b'x'; codec::max_inline_record_size() - 1]);
+        let package = codec::shared_to_s2_package(
+            SharedMessage::TextObjectUpdate {
+                object_id: ObjectId(Bytes::from(vec![b'o'; 1024])),
+                yjs_update: payload,
+            },
+            &origin(),
+        )?;
+        let S2Package::Pointer {
+            pointer_record,
+            parts,
+            ..
+        } = package
+        else {
+            eyre::bail!("expected pointer package");
+        };
+
+        assert!(pointer_record.metered_bytes() <= S2_MAX_RECORD_METERED_BYTES);
+        AppendRecordBatch::try_from_iter([pointer_record])?;
+        for part in parts {
+            let encrypted = test_cipher().encrypt_record(part)?;
+            assert!(encrypted.metered_bytes() <= S2_MAX_RECORD_METERED_BYTES);
+            AppendRecordBatch::try_from_iter([encrypted])?;
+        }
+        Ok(())
+    }
 }
 
 impl WriterRunError {
@@ -48,8 +121,31 @@ pub struct LogWriterActor {
     basin: S2Basin,
     workspace: WorkspaceId,
     daemon_writer_id: DaemonWriterId,
+    cipher: RecordCipher,
     req_rx: mpsc::UnboundedReceiver<LogWriterRequest>,
     resp_tx: mpsc::UnboundedSender<LogWriterResponse>,
+}
+
+#[derive(Clone)]
+struct RecordCipher {
+    key: CipherKey,
+    nonce_rng: NonceRng,
+}
+
+impl RecordCipher {
+    fn encrypt_record(&self, record: AppendRecord) -> eyre::Result<AppendRecord> {
+        let encrypted_body = encrypt::encrypt(&self.key, &self.nonce_rng, record.body())?;
+        let headers: Vec<Header> = record.headers().to_vec();
+        // This rebuild carries only body and headers. Client-set record
+        // timestamps are intentionally unsupported: S2 assigns arrival time,
+        // so encrypted and plaintext records order identically for
+        // `clone --as-of`.
+        let mut new_record = AppendRecord::new(encrypted_body)?;
+        if !headers.is_empty() {
+            new_record = new_record.with_headers(headers)?;
+        }
+        Ok(new_record)
+    }
 }
 
 impl LogWriterActor {
@@ -68,6 +164,8 @@ impl LogWriterActor {
         basin: S2Basin,
         workspace: WorkspaceId,
         daemon_writer_id: DaemonWriterId,
+        encryption_key: CipherKey,
+        nonce_rng: NonceRng,
         req_rx: mpsc::UnboundedReceiver<LogWriterRequest>,
         resp_tx: mpsc::UnboundedSender<LogWriterResponse>,
     ) -> Self {
@@ -75,6 +173,10 @@ impl LogWriterActor {
             basin,
             workspace,
             daemon_writer_id,
+            cipher: RecordCipher {
+                key: encryption_key,
+                nonce_rng,
+            },
             req_rx,
             resp_tx,
         }
@@ -84,6 +186,7 @@ impl LogWriterActor {
     async fn upload_parts(
         s2: S2Basin,
         workspace_id: WorkspaceId,
+        cipher: RecordCipher,
         outbox_id: OutboxId,
         pointer_record: AppendRecord,
         pointer: ObjectPointer,
@@ -101,6 +204,7 @@ impl LogWriterActor {
         let mut set = JoinSet::new();
 
         for (idx, part) in parts.into_iter().enumerate() {
+            let part = cipher.encrypt_record(part).map_err(WriterRunError::fatal)?;
             let batch = AppendRecordBatch::try_from_iter([part]).map_err(WriterRunError::fatal)?;
             let input = AppendInput::new(batch).with_match_seq_num(idx as u64);
             let ticket = session
@@ -258,6 +362,7 @@ impl LogWriterActor {
                             match codec::shared_to_s2_package(shared_message, &origin)
                                 .map_err(WriterRunError::fatal)? {
                                 S2Package::Inlined{ record } => {
+                                    let record = self.cipher.encrypt_record(record).map_err(WriterRunError::fatal)?;
                                     inflight += 1;
                                     let ticket = producer
                                         .submit(record)
@@ -277,7 +382,7 @@ impl LogWriterActor {
                                         checksum = pointer.checksum,
                                         "log writer using pointer package"
                                     );
-                                    let upload = tokio::spawn(Self::upload_parts(self.basin.clone(), self.workspace.clone(), outbox_id, pointer_record, pointer, parts));
+                                    let upload = tokio::spawn(Self::upload_parts(self.basin.clone(), self.workspace.clone(), self.cipher.clone(), outbox_id, pointer_record, pointer, parts));
                                     big_upload = Some(upload);
                                 }
                             }

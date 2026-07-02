@@ -1,3 +1,4 @@
+use crate::log::encrypt::CipherKey;
 use crate::log::types::SequenceNumber;
 use crate::types::{DaemonWriterId, OutboxId, WorkspaceId};
 use eyre::eyre;
@@ -16,6 +17,7 @@ pub struct Row {
     ///  - (..1) means we have applied only a single message at seqNum=0
     pub stable_cursor: RangeTo<SequenceNumber>,
     pub next_outbox_id: OutboxId,
+    pub encryption_key: CipherKey,
 }
 
 impl Row {
@@ -29,6 +31,7 @@ impl Row {
             optional_endpoint(row.get::<Option<String>>(5)?, "s2_account_endpoint")?;
         let s2_basin_endpoint =
             optional_endpoint(row.get::<Option<String>>(6)?, "s2_basin_endpoint")?;
+        let encryption_key_raw = row.get::<Option<String>>(7)?;
 
         if workspace_id.0.is_empty() {
             return Err(eyre!("daemon_state.workspace_id missing"));
@@ -54,6 +57,11 @@ impl Row {
             .map_err(|err| eyre!("invalid daemon_state.s2_basin {s2_basin_raw:?}: {err}"))?;
         validate_endpoint_pair(&s2_account_endpoint, &s2_basin_endpoint)?;
 
+        let encryption_key = encryption_key_raw
+            .ok_or_else(|| eyre!("daemon_state.encryption_key missing"))?
+            .parse::<CipherKey>()
+            .map_err(|err| eyre!("invalid daemon_state.encryption_key: {err}"))?;
+
         Ok(Self {
             workspace_id,
             s2_basin,
@@ -62,6 +70,7 @@ impl Row {
             daemon_writer_id,
             stable_cursor: ..stable_cursor_end,
             next_outbox_id,
+            encryption_key,
         })
     }
 }

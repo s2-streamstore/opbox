@@ -19,6 +19,7 @@ use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::crdt::types::ObjectId;
 use opbox_core::engine::actor::{EngineCommand, EngineStatusConfig};
 use opbox_core::fs::types::{RelativePath, ScanScope};
+use opbox_core::log::encrypt::{CipherKey, NonceRng};
 use opbox_core::notify::nio::channel_notify_io;
 use opbox_core::semantic::service::{SemanticDebugSnapshot, SemanticService};
 use opbox_core::semantic::table::daemon_state;
@@ -26,8 +27,8 @@ use opbox_core::types::{DaemonWriterId, OutboxId, WorkspaceId};
 use rand::SeedableRng;
 use s2_sdk::S2;
 use s2_sdk::types::{
-    AccountEndpoint, BasinEndpoint, BasinName, CreateBasinInput, ListStreamsInput, S2Config,
-    S2Endpoints, S2Error,
+    AccountEndpoint, BasinEndpoint, BasinName, CreateBasinInput, ListStreamsInput, ReadFrom,
+    ReadInput, ReadStart, S2Config, S2Endpoints, S2Error, StreamName,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read};
@@ -182,6 +183,7 @@ enum Workload {
     BinaryFileIgnore,
     PermissionDeniedIgnore,
     TooLargeIgnore,
+    WrongCipherClone,
     CloneClobber,
 }
 
@@ -322,6 +324,9 @@ fn run_single(args: SingleArgs) -> eyre::Result<()> {
         }
         Workload::TooLargeIgnore => {
             run_too_large_ignore_workload(&mut sim, seed, args.common.max_steps)?
+        }
+        Workload::WrongCipherClone => {
+            run_wrong_cipher_clone_workload(&mut sim, seed, args.common.max_steps)?
         }
         Workload::CloneClobber => {
             run_clone_clobber_workload(&mut sim, seed, args.common.max_steps)?
@@ -3270,6 +3275,31 @@ fn spawn_daemon_with_initial_files(
     workspace_id: WorkspaceId,
     initial_files: BTreeMap<String, Bytes>,
 ) -> eyre::Result<SimDaemonHandle> {
+    // Default daemons encrypt with the fixed sim key; nonces come from a
+    // per-daemon RNG seeded off the run seed (sim_nonce_rng), so meta
+    // determinism comparisons still see identical wire bytes across runs.
+    spawn_daemon_with_config(
+        sim,
+        name,
+        daemon_index,
+        workspace_id,
+        initial_files,
+        sim_encryption_key(),
+    )
+}
+
+fn sim_encryption_key() -> CipherKey {
+    CipherKey::from_bytes([0x42u8; 32])
+}
+
+fn spawn_daemon_with_config(
+    sim: &mut turmoil::Sim<'static>,
+    name: &'static str,
+    daemon_index: u8,
+    workspace_id: WorkspaceId,
+    initial_files: BTreeMap<String, Bytes>,
+    encryption_key: CipherKey,
+) -> eyre::Result<SimDaemonHandle> {
     let daemon_row = daemon_state::Row {
         workspace_id,
         s2_basin: SIM_BASIN.parse()?,
@@ -3278,6 +3308,7 @@ fn spawn_daemon_with_initial_files(
         daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&[daemon_index; 16])),
         stable_cursor: ..0,
         next_outbox_id: OutboxId::new(0),
+        encryption_key,
     };
 
     let file_io = FaultInjectingFileIO::new(InMemoryFileIO::new());
@@ -3285,9 +3316,10 @@ fn spawn_daemon_with_initial_files(
         file_io.write_file(path, bytes)?;
     }
     let handle_io = file_io.clone();
+    let nonce_rng = sim_nonce_rng(daemon_index);
     let (command_tx, command_rx) = mpsc::channel(100);
     sim.client(name, async move {
-        run_daemon_client(name, daemon_row, file_io, command_rx).await
+        run_daemon_client(name, daemon_row, file_io, nonce_rng, command_rx).await
     });
 
     Ok(SimDaemonHandle {
@@ -3314,6 +3346,7 @@ fn spawn_clone_daemon(
         daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&[daemon_index; 16])),
         stable_cursor: ..0,
         next_outbox_id: OutboxId::new(0),
+        encryption_key: sim_encryption_key(),
     };
 
     let file_io = FaultInjectingFileIO::new(InMemoryFileIO::new());
@@ -3321,9 +3354,10 @@ fn spawn_clone_daemon(
         file_io.write_file(path, bytes)?;
     }
     let handle_io = file_io.clone();
+    let nonce_rng = sim_nonce_rng(daemon_index);
     let (command_tx, command_rx) = mpsc::channel(100);
     sim.client(name, async move {
-        run_clone_daemon_client(name, daemon_row, file_io, command_rx).await
+        run_clone_daemon_client(name, daemon_row, file_io, nonce_rng, command_rx).await
     });
 
     Ok(SimDaemonHandle {
@@ -3336,6 +3370,7 @@ async fn run_daemon_client(
     name: &'static str,
     daemon_row: daemon_state::Row,
     file_io: FaultInjectingFileIO,
+    nonce_rng: NonceRng,
     command_rx: mpsc::Receiver<SimDaemonCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_basin_exists().await?;
@@ -3345,7 +3380,15 @@ async fn run_daemon_client(
         .map_err(io_err)?;
     let pool = semantic_pool(db.clone()).await.map_err(io_err)?;
     let semantic_service = SemanticService::new(pool);
-    run_sync_phase(name, daemon_row, file_io, semantic_service, command_rx).await
+    run_sync_phase(
+        name,
+        daemon_row,
+        file_io,
+        semantic_service,
+        nonce_rng,
+        command_rx,
+    )
+    .await
 }
 
 /// A daemon spawned by `spawn_clone_daemon` first waits for a `RunClone`
@@ -3356,6 +3399,7 @@ async fn run_clone_daemon_client(
     name: &'static str,
     daemon_row: daemon_state::Row,
     file_io: FaultInjectingFileIO,
+    nonce_rng: NonceRng,
     mut command_rx: mpsc::Receiver<SimDaemonCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_basin_exists().await?;
@@ -3379,9 +3423,15 @@ async fn run_clone_daemon_client(
 
     let pool = semantic_pool(db.clone()).await.map_err(io_err)?;
     let semantic_service = SemanticService::new(pool);
-    let clone_result = run_clone_runtime(&daemon_row, file_io.clone(), semantic_service, clobber)
-        .await
-        .map_err(|err| err.to_string());
+    let clone_result = run_clone_runtime(
+        &daemon_row,
+        file_io.clone(),
+        semantic_service,
+        nonce_rng.clone(),
+        clobber,
+    )
+    .await
+    .map_err(|err| err.to_string());
     let clone_failed = clone_result.is_err();
     let _ = reply.send(clone_result);
     if clone_failed {
@@ -3394,13 +3444,22 @@ async fn run_clone_daemon_client(
     let daemon_row = load_daemon_state_from_db(&db).await.map_err(io_err)?;
     let pool = semantic_pool(db.clone()).await.map_err(io_err)?;
     let semantic_service = SemanticService::new(pool);
-    run_sync_phase(name, daemon_row, file_io, semantic_service, command_rx).await
+    run_sync_phase(
+        name,
+        daemon_row,
+        file_io,
+        semantic_service,
+        nonce_rng,
+        command_rx,
+    )
+    .await
 }
 
 async fn run_clone_runtime(
     daemon_row: &daemon_state::Row,
     file_io: FaultInjectingFileIO,
     semantic_service: SemanticService,
+    nonce_rng: NonceRng,
     clobber: bool,
 ) -> eyre::Result<()> {
     let s2_basin = sim_s2_client()?.basin(daemon_row.s2_basin.clone());
@@ -3412,6 +3471,7 @@ async fn run_clone_runtime(
         semantic_service,
         daemon_row: daemon_row.clone(),
         s2_basin,
+        nonce_rng,
         clone_log_read_stop: None,
         clone_clobber: clobber,
         engine_status: None,
@@ -3432,6 +3492,7 @@ async fn run_sync_phase(
     daemon_row: daemon_state::Row,
     file_io: FaultInjectingFileIO,
     semantic_service: SemanticService,
+    nonce_rng: NonceRng,
     mut command_rx: mpsc::Receiver<SimDaemonCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let debug_semantic_service = semantic_service.clone();
@@ -3456,6 +3517,7 @@ async fn run_sync_phase(
         semantic_service,
         daemon_row,
         s2_basin,
+        nonce_rng,
         clone_log_read_stop: None,
         clone_clobber: false,
         engine_status: Some(engine_status),
@@ -3978,6 +4040,101 @@ enum SimDaemonCommand {
     Shutdown {
         reply: oneshot::Sender<Option<String>>,
     },
+}
+
+fn run_wrong_cipher_clone_workload(
+    sim: &mut turmoil::Sim<'static>,
+    _seed: u64,
+    steps: u64,
+) -> eyre::Result<()> {
+    let workspace_id = WorkspaceId("00000000000000000000000000000099".to_string());
+    let correct_key = sim_encryption_key();
+    let wrong_key = CipherKey::from_bytes([0x24u8; 32]);
+
+    let daemon_a = spawn_daemon_with_config(
+        sim,
+        "daemon-a",
+        0,
+        workspace_id.clone(),
+        BTreeMap::new(),
+        correct_key,
+    )?;
+    sim.set_link_latency(
+        "daemon-a",
+        "s2-lite",
+        Duration::from_millis(DAEMON_A_S2_LINK_LATENCY_MS),
+    );
+
+    // daemon-b reads raw records from S2 and tries to decrypt with wrong key.
+    let workspace_id_b = workspace_id.clone();
+    sim.client("daemon-b-wrong-cipher", async move {
+        ensure_basin_exists().await?;
+        let basin: BasinName = SIM_BASIN.parse().map_err(io_err)?;
+        let s2_basin = sim_s2_client().map_err(io_err)?.basin(basin);
+        let stream_name: StreamName = format!("{}/ops", workspace_id_b.0)
+            .parse()
+            .map_err(io_err)?;
+        let stream = s2_basin.stream(stream_name);
+
+        // Poll until there are records to read.
+        loop {
+            let tail = stream.check_tail().await.map_err(io_err)?;
+            if tail.seq_num > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Read a record (ciphertext) and try to decrypt with the wrong key.
+        let output = stream
+            .read(ReadInput::new().with_start(ReadStart::new().with_from(ReadFrom::SeqNum(0))))
+            .await
+            .map_err(io_err)?;
+        let record = output
+            .records
+            .into_iter()
+            .next()
+            .ok_or_else(|| io_err("no records returned"))?;
+        let result = opbox_core::log::encrypt::decrypt(&wrong_key, &record.body);
+        match result {
+            Err(err) => {
+                let msg = err.to_string();
+                if msg.contains("decrypt") || msg.contains("wrong key") {
+                    info!("daemon-b correctly failed with decryption error: {msg}");
+                    Ok(())
+                } else {
+                    Err(io_err(format!(
+                        "daemon-b failed with unexpected error (expected decryption error): {msg}"
+                    )))
+                }
+            }
+            Ok(_) => Err(io_err(
+                "daemon-b decrypted with wrong key without error (should have failed)",
+            )),
+        }
+    });
+
+    sim.set_link_latency(
+        "daemon-b-wrong-cipher",
+        "s2-lite",
+        Duration::from_millis(DAEMON_B_S2_LINK_LATENCY_MS),
+    );
+
+    sim.client("controller", async move {
+        let path = "test.txt";
+        let content = Bytes::from("encrypted content\n");
+        daemon_a.write_file(path, content).await?;
+        daemon_a.request_single_file_scan(path).await?;
+        wait_for_outbox_empty(&daemon_a, steps).await?;
+        // Give daemon-b time to attempt reading and fail.
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        daemon_a.shutdown().await;
+        Ok(())
+    });
+
+    Ok(())
 }
 
 fn sim_s2_client() -> eyre::Result<S2> {
@@ -4610,8 +4767,19 @@ fn init_sim(seed: u64, failure_rate: f64) -> turmoil::Sim<'static> {
 }
 
 fn seed_rng(seed: u64) {
+    SIM_SEED.set(seed).expect("seed_rng called more than once");
     mad_turmoil::rand::set_rng(rand::rngs::StdRng::seed_from_u64(seed));
     fastrand::seed(seed);
+}
+
+/// The run's seed, kept for deriving per-daemon nonce RNG streams.
+static SIM_SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Deterministic AES-GCM nonce stream for one sim daemon. Spaced per daemon so
+/// nonce assignment does not depend on actor scheduling order across daemons.
+fn sim_nonce_rng(daemon_index: u8) -> NonceRng {
+    let seed = SIM_SEED.get().copied().expect("sim seed not initialized");
+    NonceRng::seeded(seed ^ ((daemon_index as u64 + 1) << 48))
 }
 
 /// Stamps each log line with the simulation step (sim-elapsed ms; the sim

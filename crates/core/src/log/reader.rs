@@ -1,6 +1,7 @@
 use crate::app::s2::s2_error_is_connectivity;
 use crate::crdt::types::SharedMessage;
 use crate::log::codec::{self, ObjectPointer};
+use crate::log::encrypt::{self, CipherKey};
 use crate::log::types::{
     LogReadStop, LogReaderEvent, LogReaderRequest, SequenceNumber, SharedMessageEnvelope,
 };
@@ -47,6 +48,7 @@ enum ReaderRunOutcome {
 pub struct LogReaderActor {
     basin: S2Basin,
     workspace: WorkspaceId,
+    encryption_key: CipherKey,
     start_at: SequenceNumber,
     stop: Option<LogReadStop>,
     req_rx: mpsc::UnboundedReceiver<LogReaderRequest>,
@@ -57,6 +59,7 @@ impl LogReaderActor {
     pub fn new(
         basin: S2Basin,
         workspace: WorkspaceId,
+        encryption_key: CipherKey,
         start_at: SequenceNumber,
         stop: Option<LogReadStop>,
         req_rx: mpsc::UnboundedReceiver<LogReaderRequest>,
@@ -65,6 +68,7 @@ impl LogReaderActor {
         Self {
             basin,
             workspace,
+            encryption_key,
             start_at,
             stop,
             req_rx,
@@ -88,6 +92,7 @@ impl LogReaderActor {
     async fn read_full_multipart(
         basin: S2Basin,
         workspace_id: WorkspaceId,
+        encryption_key: CipherKey,
         message_headers: Vec<Header>,
         object_pointer: ObjectPointer,
     ) -> Result<SharedMessage, ReaderRunError> {
@@ -128,7 +133,9 @@ impl LogReaderActor {
             let ReadBatch { records, .. } = batch.map_err(ReaderRunError::from_s2)?;
             for record in records {
                 record_count += 1;
-                buf.extend_from_slice(&record.body);
+                let body = encrypt::decrypt(&encryption_key, &record.body)
+                    .map_err(ReaderRunError::fatal)?;
+                buf.extend_from_slice(&body);
             }
         }
 
@@ -297,15 +304,16 @@ impl LogReaderActor {
                                 Self::read_full_multipart(
                                     self.basin.clone(),
                                     self.workspace.clone(),
+                                    self.encryption_key.clone(),
                                     record.headers,
                                     object_pointer,
                                 )
                                 .await?
-                            } else if let Some(shared_message) = codec::inline_record_to_shared_message(record)
-                                .map_err(ReaderRunError::fatal)? {
-                                shared_message
                             } else {
-                                return Err(ReaderRunError::fatal(eyre::eyre!("invalid log record")));
+                                let decrypted_body = encrypt::decrypt(&self.encryption_key, &record.body)
+                                    .map_err(ReaderRunError::fatal)?;
+                                codec::s2_payload_to_shared_message(&record.headers, decrypted_body)
+                                    .map_err(ReaderRunError::fatal)?
                             };
 
                         let envelope = SharedMessageEnvelope {

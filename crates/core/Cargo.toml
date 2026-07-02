@@ -7,6 +7,7 @@ edition.workspace = true
 sim = []
 
 [dependencies]
+aes-gcm = "0.10.3"
 tokio = { version = "1.52.0", features = ["fs", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-muxt = "0.7"
 eyre = "0.6.12"

@@ -6,6 +6,7 @@ use crate::engine::init as engine_init;
 use crate::fs::actor::FsActor;
 use crate::fs::client::FsClient;
 use crate::fs::fio::FileIO;
+use crate::log::encrypt::NonceRng;
 use crate::log::reader::LogReaderActor;
 use crate::log::types::{LOG_READER_EVENT_CHANNEL_CAPACITY, LogReadStop};
 use crate::log::writer::LogWriterActor;
@@ -41,6 +42,7 @@ pub struct AppRuntimeConfig<IO, NIO = ()> {
     pub semantic_service: SemanticService,
     pub daemon_row: daemon_state::Row,
     pub s2_basin: S2Basin,
+    pub nonce_rng: NonceRng,
     pub clone_log_read_stop: Option<LogReadStop>,
     pub clone_clobber: bool,
     pub engine_status: Option<EngineStatusConfig>,
@@ -68,6 +70,7 @@ where
             semantic_service,
             daemon_row,
             s2_basin,
+            nonce_rng,
             clone_log_read_stop,
             clone_clobber,
             engine_status,
@@ -104,6 +107,8 @@ where
                     s2_basin.clone(),
                     daemon_row.workspace_id.clone(),
                     daemon_row.daemon_writer_id.clone(),
+                    daemon_row.encryption_key.clone(),
+                    nonce_rng,
                     log_writer_req_rx,
                     log_writer_resp_tx,
                 );
@@ -139,6 +144,7 @@ where
                 let log_reader = LogReaderActor::new(
                     s2_basin.clone(),
                     daemon_row.workspace_id.clone(),
+                    daemon_row.encryption_key.clone(),
                     daemon_row.stable_cursor.end,
                     clone_log_read_stop,
                     log_reader_req_rx,
@@ -178,6 +184,8 @@ where
                     s2_basin.clone(),
                     daemon_row.workspace_id.clone(),
                     daemon_row.daemon_writer_id.clone(),
+                    daemon_row.encryption_key.clone(),
+                    nonce_rng,
                     log_writer_req_rx,
                     log_writer_resp_tx,
                 );
@@ -191,6 +199,7 @@ where
                 let log_reader = LogReaderActor::new(
                     s2_basin.clone(),
                     daemon_row.workspace_id.clone(),
+                    daemon_row.encryption_key.clone(),
                     daemon_row.stable_cursor.end,
                     None,
                     log_reader_req_rx,
