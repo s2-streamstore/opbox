@@ -3126,14 +3126,10 @@ fn spawn_daemon_with_initial_files(
     workspace_id: WorkspaceId,
     initial_files: BTreeMap<String, Bytes>,
 ) -> eyre::Result<SimDaemonHandle> {
-    spawn_daemon_with_config(
-        sim,
-        name,
-        daemon_index,
-        workspace_id,
-        initial_files,
-        sim_encryption_key(),
-    )
+    // No encryption for default daemons — deterministic meta tests compare
+    // exact wire bytes, and random AES-GCM nonces break reproducibility.
+    // The wrong-cipher-clone workload tests encryption via spawn_daemon_with_config.
+    spawn_daemon_with_config(sim, name, daemon_index, workspace_id, initial_files, None)
 }
 
 fn sim_encryption_key() -> Option<CipherKey> {
