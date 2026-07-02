@@ -215,11 +215,14 @@ pub fn create_metadata_dir(sync_root: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
-pub fn ensure_clean_clone_root(sync_root: &Path) -> eyre::Result<PathBuf> {
+pub fn ensure_clone_root(sync_root: &Path, allow_populated: bool) -> eyre::Result<PathBuf> {
     if sync_root.try_exists()? {
         ensure_sync_root_exists(sync_root)?;
-        if std::fs::read_dir(sync_root)?.next().transpose()?.is_some() {
-            eyre::bail!("clone sync root is not empty: {}", sync_root.display());
+        if !allow_populated && std::fs::read_dir(sync_root)?.next().transpose()?.is_some() {
+            eyre::bail!(
+                "clone sync root is not empty: {}; pass --clobber to clone into a populated directory (existing files that differ from the workspace will be overwritten)",
+                sync_root.display()
+            );
         }
     } else {
         std::fs::create_dir_all(sync_root)?;

@@ -42,6 +42,7 @@ pub struct AppRuntimeConfig<IO, NIO = ()> {
     pub daemon_row: daemon_state::Row,
     pub s2_basin: S2Basin,
     pub clone_log_read_stop: Option<LogReadStop>,
+    pub clone_clobber: bool,
     pub engine_status: Option<EngineStatusConfig>,
     pub spy_tx: Option<broadcast::Sender<SpyEvent>>,
 }
@@ -68,6 +69,7 @@ where
             daemon_row,
             s2_basin,
             clone_log_read_stop,
+            clone_clobber,
             engine_status,
             spy_tx,
         } = self.config;
@@ -159,6 +161,7 @@ where
                             log_reader: log_reader_resp_rx,
                         },
                         log_read_stop: clone_log_read_stop,
+                        clobber: clone_clobber,
                     })
                     .await
                     .map(|result| {
