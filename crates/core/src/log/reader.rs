@@ -1,6 +1,7 @@
-use crate::app::s2::{s2_error_is_connectivity, s2_error_is_encryption, wrap_s2_encryption_error};
+use crate::app::s2::s2_error_is_connectivity;
 use crate::crdt::types::SharedMessage;
 use crate::log::codec::{self, ObjectPointer};
+use crate::log::encrypt::{self, CipherKey};
 use crate::log::types::{
     LogReadStop, LogReaderEvent, LogReaderRequest, SequenceNumber, SharedMessageEnvelope,
 };
@@ -8,7 +9,6 @@ use crate::types::WorkspaceId;
 use bytes::BytesMut;
 use futures::StreamExt;
 use s2_sdk::S2Basin;
-use s2_sdk::types::EncryptionKey;
 use s2_sdk::types::ReadFrom::SeqNum;
 use s2_sdk::types::{
     CreateStreamInput, Header, ReadBatch, ReadFrom, ReadInput, ReadLimits, ReadStart, ReadStop,
@@ -29,9 +29,7 @@ enum ReaderRunError {
 
 impl ReaderRunError {
     fn from_s2(error: S2Error) -> Self {
-        if s2_error_is_encryption(&error) {
-            Self::Fatal(wrap_s2_encryption_error(error))
-        } else if s2_error_is_connectivity(&error) {
+        if s2_error_is_connectivity(&error) {
             Self::Disconnected(error.to_string())
         } else {
             Self::Fatal(error.into())
@@ -50,7 +48,7 @@ enum ReaderRunOutcome {
 pub struct LogReaderActor {
     basin: S2Basin,
     workspace: WorkspaceId,
-    encryption_key: Option<EncryptionKey>,
+    encryption_key: Option<CipherKey>,
     start_at: SequenceNumber,
     stop: Option<LogReadStop>,
     req_rx: mpsc::UnboundedReceiver<LogReaderRequest>,
@@ -61,7 +59,7 @@ impl LogReaderActor {
     pub fn new(
         basin: S2Basin,
         workspace: WorkspaceId,
-        encryption_key: Option<EncryptionKey>,
+        encryption_key: Option<CipherKey>,
         start_at: SequenceNumber,
         stop: Option<LogReadStop>,
         req_rx: mpsc::UnboundedReceiver<LogReaderRequest>,
@@ -94,7 +92,7 @@ impl LogReaderActor {
     async fn read_full_multipart(
         basin: S2Basin,
         workspace_id: WorkspaceId,
-        encryption_key: Option<EncryptionKey>,
+        encryption_key: Option<CipherKey>,
         message_headers: Vec<Header>,
         object_pointer: ObjectPointer,
     ) -> Result<SharedMessage, ReaderRunError> {
@@ -112,10 +110,7 @@ impl LogReaderActor {
         let stream_name = object_pointer
             .stream_name(workspace_id)
             .map_err(ReaderRunError::fatal)?;
-        let mut stream = basin.stream(stream_name);
-        if let Some(key) = encryption_key {
-            stream = stream.with_encryption_key(key);
-        }
+        let stream = basin.stream(stream_name);
         let mut read_session = stream
             .read_session(
                 ReadInput::new()
@@ -138,7 +133,9 @@ impl LogReaderActor {
             let ReadBatch { records, .. } = batch.map_err(ReaderRunError::from_s2)?;
             for record in records {
                 record_count += 1;
-                buf.extend_from_slice(&record.body);
+                let body =
+                    decrypt_body(&record.body, &encryption_key).map_err(ReaderRunError::fatal)?;
+                buf.extend_from_slice(&body);
             }
         }
 
@@ -228,10 +225,7 @@ impl LogReaderActor {
         Self::ensure_stream_exists(&self.basin, main_stream_name.clone())
             .await
             .map_err(ReaderRunError::from_s2)?;
-        let mut stream = self.basin.stream(main_stream_name);
-        if let Some(key) = &self.encryption_key {
-            stream = stream.with_encryption_key(key.clone());
-        }
+        let stream = self.basin.stream(main_stream_name);
 
         let mut read_input =
             ReadInput::new().with_start(ReadStart::new().with_from(ReadFrom::SeqNum(start_at)));
@@ -315,11 +309,11 @@ impl LogReaderActor {
                                     object_pointer,
                                 )
                                 .await?
-                            } else if let Some(shared_message) = codec::inline_record_to_shared_message(record)
-                                .map_err(ReaderRunError::fatal)? {
-                                shared_message
                             } else {
-                                return Err(ReaderRunError::fatal(eyre::eyre!("invalid log record")));
+                                let decrypted_body = decrypt_body(&record.body, &self.encryption_key)
+                                    .map_err(ReaderRunError::fatal)?;
+                                codec::s2_payload_to_shared_message(&record.headers, decrypted_body)
+                                    .map_err(ReaderRunError::fatal)?
                             };
 
                         let envelope = SharedMessageEnvelope {
@@ -342,5 +336,12 @@ impl LogReaderActor {
 
             }
         }
+    }
+}
+
+fn decrypt_body(body: &bytes::Bytes, key: &Option<CipherKey>) -> eyre::Result<bytes::Bytes> {
+    match key {
+        Some(key) => encrypt::decrypt(key, body),
+        None => Ok(body.clone()),
     }
 }

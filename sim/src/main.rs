@@ -17,6 +17,7 @@ use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::crdt::types::ObjectId;
 use opbox_core::engine::actor::{EngineCommand, EngineStatusConfig};
 use opbox_core::fs::types::{RelativePath, ScanScope};
+use opbox_core::log::encrypt::CipherKey;
 use opbox_core::notify::nio::channel_notify_io;
 use opbox_core::semantic::service::{SemanticDebugSnapshot, SemanticService};
 use opbox_core::semantic::table::daemon_state;
@@ -24,9 +25,8 @@ use opbox_core::types::{DaemonWriterId, OutboxId, WorkspaceId};
 use rand::SeedableRng;
 use s2_sdk::S2;
 use s2_sdk::types::{
-    AccountEndpoint, BasinConfig, BasinEndpoint, BasinName, BasinReconfiguration, CreateBasinInput,
-    EncryptionAlgorithm, EncryptionKey, ListStreamsInput, ReadFrom, ReadInput, ReadStart,
-    ReconfigureBasinInput, S2Config, S2Endpoints, S2Error, StreamName,
+    AccountEndpoint, BasinEndpoint, BasinName, CreateBasinInput, ListStreamsInput, ReadFrom,
+    ReadInput, ReadStart, S2Config, S2Endpoints, S2Error, StreamName,
 };
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
@@ -3136,8 +3136,8 @@ fn spawn_daemon_with_initial_files(
     )
 }
 
-fn sim_encryption_key() -> Option<EncryptionKey> {
-    Some(EncryptionKey::new([0x42u8; 32]))
+fn sim_encryption_key() -> Option<CipherKey> {
+    Some(CipherKey::from_bytes([0x42u8; 32]))
 }
 
 fn spawn_daemon_with_config(
@@ -3146,7 +3146,7 @@ fn spawn_daemon_with_config(
     daemon_index: u8,
     workspace_id: WorkspaceId,
     initial_files: BTreeMap<String, Bytes>,
-    encryption_key: Option<EncryptionKey>,
+    encryption_key: Option<CipherKey>,
 ) -> eyre::Result<SimDaemonHandle> {
     let daemon_row = daemon_state::Row {
         workspace_id,
@@ -3716,7 +3716,7 @@ fn run_wrong_cipher_clone_workload(
 ) -> eyre::Result<()> {
     let workspace_id = WorkspaceId("00000000000000000000000000000099".to_string());
     let correct_key = sim_encryption_key();
-    let wrong_key = EncryptionKey::new([0x24u8; 32]);
+    let wrong_key = CipherKey::from_bytes([0x24u8; 32]);
 
     let daemon_a = spawn_daemon_with_config(
         sim,
@@ -3732,8 +3732,7 @@ fn run_wrong_cipher_clone_workload(
         Duration::from_millis(DAEMON_A_S2_LINK_LATENCY_MS),
     );
 
-    // daemon-b uses the wrong encryption key to try reading.
-    let wrong_key_value = wrong_key;
+    // daemon-b reads raw records from S2 and tries to decrypt with wrong key.
     let workspace_id_b = workspace_id.clone();
     sim.client("daemon-b-wrong-cipher", async move {
         ensure_basin_exists().await?;
@@ -3742,11 +3741,9 @@ fn run_wrong_cipher_clone_workload(
         let stream_name: StreamName = format!("{}/ops", workspace_id_b.0)
             .parse()
             .map_err(io_err)?;
-        let stream = s2_basin
-            .stream(stream_name)
-            .with_encryption_key(wrong_key_value);
+        let stream = s2_basin.stream(stream_name);
 
-        // Poll until there are records to read, then try reading.
+        // Poll until there are records to read.
         loop {
             let tail = stream.check_tail().await.map_err(io_err)?;
             if tail.seq_num > 0 {
@@ -3755,24 +3752,31 @@ fn run_wrong_cipher_clone_workload(
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        // Attempt a read with the wrong key; expect decryption error.
-        let result = stream
+        // Read a record (ciphertext) and try to decrypt with the wrong key.
+        let output = stream
             .read(ReadInput::new().with_start(ReadStart::new().with_from(ReadFrom::SeqNum(0))))
-            .await;
+            .await
+            .map_err(io_err)?;
+        let record = output
+            .records
+            .into_iter()
+            .next()
+            .ok_or_else(|| io_err("no records returned"))?;
+        let result = opbox_core::log::encrypt::decrypt(&wrong_key, &record.body);
         match result {
             Err(err) => {
                 let msg = err.to_string();
-                if msg.contains("decrypt") || msg.contains("encrypt") {
-                    info!("daemon-b correctly failed with encryption error: {msg}");
+                if msg.contains("decrypt") || msg.contains("wrong key") {
+                    info!("daemon-b correctly failed with decryption error: {msg}");
                     Ok(())
                 } else {
                     Err(io_err(format!(
-                        "daemon-b failed with unexpected error (expected encryption error): {msg}"
+                        "daemon-b failed with unexpected error (expected decryption error): {msg}"
                     )))
                 }
             }
             Ok(_) => Err(io_err(
-                "daemon-b read succeeded with wrong key (expected decryption error)",
+                "daemon-b decrypted with wrong key without error (should have failed)",
             )),
         }
     });
@@ -3816,21 +3820,9 @@ fn sim_s2_client() -> eyre::Result<S2> {
 async fn ensure_basin_exists() -> Result<(), Box<dyn std::error::Error>> {
     let basin_name: BasinName = SIM_BASIN.parse().map_err(io_err)?;
     let s2 = sim_s2_client().map_err(io_err)?;
-    let config = BasinConfig::default().with_stream_cipher(EncryptionAlgorithm::Aes256Gcm);
-    match s2
-        .create_basin(CreateBasinInput::new(basin_name.clone()).with_config(config))
-        .await
-    {
+    match s2.create_basin(CreateBasinInput::new(basin_name)).await {
         Ok(_) => Ok(()),
-        Err(S2Error::Server(err)) if err.code == "resource_already_exists" => {
-            s2.reconfigure_basin(ReconfigureBasinInput::new(
-                basin_name,
-                BasinReconfiguration::new().with_stream_cipher(EncryptionAlgorithm::Aes256Gcm),
-            ))
-            .await
-            .map_err(io_err)?;
-            Ok(())
-        }
+        Err(S2Error::Server(err)) if err.code == "resource_already_exists" => Ok(()),
         Err(err) => Err(io_err(err)),
     }
 }

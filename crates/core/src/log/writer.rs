@@ -1,6 +1,7 @@
-use crate::app::s2::{s2_error_is_connectivity, s2_error_is_encryption, wrap_s2_encryption_error};
+use crate::app::s2::s2_error_is_connectivity;
 use crate::log::codec;
 use crate::log::codec::{ObjectPointer, S2Package};
+use crate::log::encrypt::{self, CipherKey};
 use crate::log::types::{LogWriterRequest, LogWriterResponse, SharedMessageOrigin};
 use crate::types::{DaemonWriterId, OutboxId, WorkspaceId};
 use futures::StreamExt;
@@ -9,9 +10,7 @@ use futures::stream::FuturesOrdered;
 use s2_sdk::append_session::AppendSessionConfig;
 use s2_sdk::batching::BatchingConfig;
 use s2_sdk::producer::{IndexedAppendAck, ProducerConfig};
-use s2_sdk::types::{
-    AppendInput, AppendRecord, AppendRecordBatch, CreateStreamInput, EncryptionKey,
-};
+use s2_sdk::types::{AppendInput, AppendRecord, AppendRecordBatch, CreateStreamInput, Header};
 use s2_sdk::{
     S2Basin,
     types::{AppendAck, S2Error, StreamName},
@@ -30,9 +29,7 @@ enum WriterRunError {
 
 impl WriterRunError {
     fn from_s2(error: S2Error) -> Self {
-        if s2_error_is_encryption(&error) {
-            Self::Fatal(wrap_s2_encryption_error(error))
-        } else if s2_error_is_connectivity(&error) {
+        if s2_error_is_connectivity(&error) {
             Self::Disconnected(error.to_string())
         } else {
             Self::Fatal(error.into())
@@ -52,7 +49,7 @@ pub struct LogWriterActor {
     basin: S2Basin,
     workspace: WorkspaceId,
     daemon_writer_id: DaemonWriterId,
-    encryption_key: Option<EncryptionKey>,
+    encryption_key: Option<CipherKey>,
     req_rx: mpsc::UnboundedReceiver<LogWriterRequest>,
     resp_tx: mpsc::UnboundedSender<LogWriterResponse>,
 }
@@ -73,7 +70,7 @@ impl LogWriterActor {
         basin: S2Basin,
         workspace: WorkspaceId,
         daemon_writer_id: DaemonWriterId,
-        encryption_key: Option<EncryptionKey>,
+        encryption_key: Option<CipherKey>,
         req_rx: mpsc::UnboundedReceiver<LogWriterRequest>,
         resp_tx: mpsc::UnboundedSender<LogWriterResponse>,
     ) -> Self {
@@ -91,7 +88,7 @@ impl LogWriterActor {
     async fn upload_parts(
         s2: S2Basin,
         workspace_id: WorkspaceId,
-        encryption_key: Option<EncryptionKey>,
+        encryption_key: Option<CipherKey>,
         outbox_id: OutboxId,
         pointer_record: AppendRecord,
         pointer: ObjectPointer,
@@ -103,15 +100,13 @@ impl LogWriterActor {
         Self::ensure_stream_exists(&s2, stream_name.clone())
             .await
             .map_err(WriterRunError::from_s2)?;
-        let mut stream = s2.stream(stream_name);
-        if let Some(key) = encryption_key {
-            stream = stream.with_encryption_key(key);
-        }
+        let stream = s2.stream(stream_name);
 
         let session = stream.append_session(AppendSessionConfig::new());
         let mut set = JoinSet::new();
 
         for (idx, part) in parts.into_iter().enumerate() {
+            let part = encrypt_record(part, &encryption_key).map_err(WriterRunError::fatal)?;
             let batch = AppendRecordBatch::try_from_iter([part]).map_err(WriterRunError::fatal)?;
             let input = AppendInput::new(batch).with_match_seq_num(idx as u64);
             let ticket = session
@@ -178,10 +173,7 @@ impl LogWriterActor {
             .await
             .map_err(WriterRunError::from_s2)?;
 
-        let mut stream = self.basin.stream(main_stream_name);
-        if let Some(key) = &self.encryption_key {
-            stream = stream.with_encryption_key(key.clone());
-        }
+        let stream = self.basin.stream(main_stream_name);
         let producer = stream.producer(
             ProducerConfig::new()
                 .with_max_unacked_bytes(1024 * 1024 * 100)
@@ -272,6 +264,7 @@ impl LogWriterActor {
                             match codec::shared_to_s2_package(shared_message, &origin)
                                 .map_err(WriterRunError::fatal)? {
                                 S2Package::Inlined{ record } => {
+                                    let record = encrypt_record(record, &self.encryption_key).map_err(WriterRunError::fatal)?;
                                     inflight += 1;
                                     let ticket = producer
                                         .submit(record)
@@ -307,4 +300,17 @@ impl LogWriterActor {
             }
         }
     }
+}
+
+fn encrypt_record(record: AppendRecord, key: &Option<CipherKey>) -> eyre::Result<AppendRecord> {
+    let Some(key) = key else {
+        return Ok(record);
+    };
+    let encrypted_body = encrypt::encrypt(key, record.body())?;
+    let headers: Vec<Header> = record.headers().to_vec();
+    let mut new_record = AppendRecord::new(encrypted_body)?;
+    if !headers.is_empty() {
+        new_record = new_record.with_headers(headers)?;
+    }
+    Ok(new_record)
 }

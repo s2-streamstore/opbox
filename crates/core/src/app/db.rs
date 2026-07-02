@@ -140,10 +140,7 @@ pub async fn insert_daemon_state(conn: &Connection, row: &daemon_state::Row) -> 
     let next_outbox_id = i64::try_from(row.next_outbox_id.get())
         .map_err(|_| eyre!("next_outbox_id out of range: {}", row.next_outbox_id.get()))?;
 
-    let encryption_key_str = row
-        .encryption_key
-        .as_ref()
-        .map(|k| k.to_header_value().to_str().unwrap().to_owned());
+    let encryption_key_str = row.encryption_key.as_ref().map(|k| k.to_string());
 
     conn.execute(
         "INSERT INTO daemon_state (

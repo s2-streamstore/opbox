@@ -7,8 +7,7 @@ use opbox_core::app::ipc;
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::app::s2::{
     S2ConnectionConfig, basin_default_stream_retention_warning, create_workspace_stream,
-    ensure_basin_stream_cipher, ensure_workspace_stream_exists, s2_client_from_config,
-    workspace_stream_retention_warning,
+    ensure_workspace_stream_exists, s2_client_from_config, workspace_stream_retention_warning,
 };
 use opbox_core::app::user_config::{
     UserConfig, UserConfigKey, load_user_config, load_user_config_from_path,
@@ -23,6 +22,7 @@ use opbox_core::app::workspace::{
 };
 use opbox_core::fs::fio::local::LocalFileIO;
 use opbox_core::fs::ignore::{IGNORE_FILE_NAME, METADATA_DIR_NAME, default_ignore_file_contents};
+use opbox_core::log::encrypt::CipherKey;
 use opbox_core::log::types::LogReadStop;
 use opbox_core::semantic::service::SemanticService;
 use opbox_core::semantic::table::daemon_state;
@@ -34,9 +34,8 @@ use s2_sdk::{
     S2, S2Basin,
     types::{
         AccessTokenId, AccessTokenIdPrefix, AccessTokenMatcher, AccessTokenScopeInput,
-        AccountEndpoint, BasinEndpoint, BasinMatcher, BasinName, EncryptionKey,
-        IssueAccessTokenInput, ListAccessTokensInput, Operation, S2DateTime, S2Error,
-        StreamMatcher, StreamNamePrefix,
+        AccountEndpoint, BasinEndpoint, BasinMatcher, BasinName, IssueAccessTokenInput,
+        ListAccessTokensInput, Operation, S2DateTime, S2Error, StreamMatcher, StreamNamePrefix,
     },
 };
 use std::io::IsTerminal;
@@ -344,7 +343,7 @@ fn fresh_daemon_state_row(
     workspace_id: WorkspaceId,
     basin: BasinName,
     connection: &S2ConnectionConfig,
-    encryption_key: Option<EncryptionKey>,
+    encryption_key: Option<CipherKey>,
 ) -> daemon_state::Row {
     let writer_id = rand::random::<[u8; 16]>();
     let (s2_account_endpoint, s2_basin_endpoint) = connection.endpoint_pair_for_metadata();
@@ -361,12 +360,8 @@ fn fresh_daemon_state_row(
     }
 }
 
-fn generate_encryption_key() -> EncryptionKey {
-    EncryptionKey::new(rand::random::<[u8; 32]>())
-}
-
-fn encryption_key_string(key: &EncryptionKey) -> String {
-    key.to_header_value().to_str().unwrap().to_owned()
+fn generate_encryption_key() -> CipherKey {
+    CipherKey::generate()
 }
 
 fn create_default_ignore_file(sync_root: &Path) -> eyre::Result<()> {
@@ -564,13 +559,7 @@ async fn bootstrap_init(
     let s2_basin = s2.basin(basin.clone());
     let workspace_id = WorkspaceId::generate();
     debug!(?workspace_id, "generated workspace id");
-    progress.set("configuring basin encryption");
-    let encryption_enabled = ensure_basin_stream_cipher(&s2, basin.clone()).await?;
-    let encryption_key = if encryption_enabled {
-        Some(generate_encryption_key())
-    } else {
-        None
-    };
+    let encryption_key = Some(generate_encryption_key());
     progress.set("creating shared log stream");
     create_workspace_stream(&s2_basin, &workspace_id).await?;
     progress.set("checking shared log retention");
@@ -626,7 +615,7 @@ async fn bootstrap_clone(
     let s2_basin = s2.basin(basin.clone());
     progress.set("checking shared log stream");
     ensure_workspace_stream_exists(&s2_basin, &workspace).await?;
-    let encryption_key: Option<EncryptionKey> = cipher
+    let encryption_key: Option<CipherKey> = cipher
         .map(|c| c.parse())
         .transpose()
         .map_err(|err| eyre::eyre!("invalid --cipher value: {err}"))?;
@@ -714,7 +703,7 @@ struct ShareContext {
     workspace_id: WorkspaceId,
     basin: BasinName,
     connection: S2ConnectionConfig,
-    encryption_key: Option<EncryptionKey>,
+    encryption_key: Option<CipherKey>,
 }
 
 struct IssuedShareToken {
@@ -1510,7 +1499,7 @@ fn print_share_clone_command(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
     access_token: &str,
-    encryption_key: Option<&EncryptionKey>,
+    encryption_key: Option<&CipherKey>,
     connection: &S2ConnectionConfig,
     style: CliStyle,
 ) {
@@ -1528,7 +1517,7 @@ fn print_share_clone_command(
 fn print_configured_clone_command(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
-    encryption_key: Option<&EncryptionKey>,
+    encryption_key: Option<&CipherKey>,
     connection: &S2ConnectionConfig,
     style: CliStyle,
 ) {
@@ -1548,7 +1537,7 @@ fn print_clone_command(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
     access_token: &str,
-    encryption_key: Option<&EncryptionKey>,
+    encryption_key: Option<&CipherKey>,
     connection: &S2ConnectionConfig,
     style: CliStyle,
 ) {
@@ -1569,7 +1558,7 @@ fn share_clone_command_lines(
     workspace_id: &WorkspaceId,
     basin: &BasinName,
     access_token: &str,
-    encryption_key: Option<&EncryptionKey>,
+    encryption_key: Option<&CipherKey>,
     connection: &S2ConnectionConfig,
 ) -> Vec<String> {
     let mut lines = vec![
@@ -1578,10 +1567,7 @@ fn share_clone_command_lines(
         format!("  --access-token {} \\", shell_quote(access_token)),
     ];
     if let Some(key) = encryption_key {
-        lines.push(format!(
-            "  --cipher {} \\",
-            shell_quote(&encryption_key_string(key))
-        ));
+        lines.push(format!("  --cipher {} \\", shell_quote(&key.to_string())));
     }
     let (account_endpoint, basin_endpoint) = connection.endpoint_pair_for_metadata();
     if let Some(account_endpoint) = account_endpoint {

@@ -1,7 +1,8 @@
+use crate::log::encrypt::CipherKey;
 use crate::log::types::SequenceNumber;
 use crate::types::{DaemonWriterId, OutboxId, WorkspaceId};
 use eyre::eyre;
-use s2_sdk::types::{AccountEndpoint, BasinEndpoint, BasinName, EncryptionKey, S2Endpoints};
+use s2_sdk::types::{AccountEndpoint, BasinEndpoint, BasinName, S2Endpoints};
 use std::ops::RangeTo;
 
 #[derive(Debug, Clone)]
@@ -16,7 +17,7 @@ pub struct Row {
     ///  - (..1) means we have applied only a single message at seqNum=0
     pub stable_cursor: RangeTo<SequenceNumber>,
     pub next_outbox_id: OutboxId,
-    pub encryption_key: Option<EncryptionKey>,
+    pub encryption_key: Option<CipherKey>,
 }
 
 impl Row {
@@ -57,7 +58,7 @@ impl Row {
         validate_endpoint_pair(&s2_account_endpoint, &s2_basin_endpoint)?;
 
         let encryption_key = encryption_key_raw
-            .map(|s| s.parse::<EncryptionKey>())
+            .map(|s| s.parse::<CipherKey>())
             .transpose()
             .map_err(|err| eyre!("invalid daemon_state.encryption_key: {err}"))?;
 
