@@ -1,9 +1,12 @@
 use super::shared_message_buffer::SharedMessageBuffer;
 use crate::fs::client::{FsClient, FsClientResponse};
-use crate::fs::types::ScanScope;
+use crate::fs::types::{ExpectedBefore, ScanScope};
 use crate::log::types::{LogReadStop, LogReaderEvent, LogReaderRequest, SequenceNumber};
 use crate::semantic::client::{SemanticClient, SemanticClientResponse};
-use crate::semantic::types::{NextWork, ProjectionActionResult, ProjectionEpochEndReason};
+use crate::semantic::types::{
+    NextWork, ProjectionAction, ProjectionActionKind, ProjectionActionResult,
+    ProjectionEpochEndReason,
+};
 use crate::types::SharedMessageBatch;
 use eyre::eyre;
 use std::ops::RangeTo;
@@ -27,6 +30,12 @@ pub struct CloneConfig {
     pub clients: CloneClients,
     pub events: CloneEvents,
     pub log_read_stop: Option<LogReadStop>,
+    /// Clone into a possibly-populated sync root: skip the emptiness check and
+    /// project remote state over whatever is on disk. Files whose content
+    /// already matches are left untouched; divergent files are overwritten.
+    /// Local-only files are never deleted (a clone plan contains no deletes;
+    /// they are imported and published on the next sync start).
+    pub clobber: bool,
 }
 
 #[derive(Debug)]
@@ -40,6 +49,7 @@ pub async fn run(config: CloneConfig) -> eyre::Result<CloneResult> {
         clients,
         events,
         log_read_stop,
+        clobber,
     } = config;
     let CloneClients {
         mut fs,
@@ -50,13 +60,15 @@ pub async fn run(config: CloneConfig) -> eyre::Result<CloneResult> {
         log_reader: mut log_reader_rx,
     } = events;
 
-    fs.scan(ScanScope::Full)?;
-    let scan = await_scan(&mut fs).await?;
-    if !scan.tree.entries().is_empty() {
-        eyre::bail!(
-            "clone sync root is not empty; observed {} entries",
-            scan.tree.entries().len()
-        );
+    if !clobber {
+        fs.scan(ScanScope::Full)?;
+        let scan = await_scan(&mut fs).await?;
+        if !scan.tree.entries().is_empty() {
+            eyre::bail!(
+                "clone sync root is not empty; observed {} entries",
+                scan.tree.entries().len()
+            );
+        }
     }
 
     let applied_log_cursor = if log_read_stop.is_some() {
@@ -76,6 +88,11 @@ pub async fn run(config: CloneConfig) -> eyre::Result<CloneResult> {
             let mut projected_actions = 0;
 
             for action in started.plan.actions {
+                let action = if clobber {
+                    unguard_write_action(action)?
+                } else {
+                    action
+                };
                 fs.apply_projection_action(action)?;
                 let result = await_projection_action(&mut fs).await?;
                 fail_if_projection_action_invalidated(&result)?;
@@ -96,6 +113,33 @@ pub async fn run(config: CloneConfig) -> eyre::Result<CloneResult> {
         applied_log_cursor,
         projected_actions,
     })
+}
+
+/// A clobbering clone projects into a sync root that may hold arbitrary local
+/// content, while the plan's guards were computed against the empty prior
+/// tree. Drop the write precondition so remote state replaces whatever is on
+/// disk. Deletes are left guarded: a clone plan cannot contain them (nothing
+/// is tracked yet), so one showing up means the plan is not a clone plan.
+fn unguard_write_action(action: ProjectionAction) -> eyre::Result<ProjectionAction> {
+    let ProjectionAction {
+        id,
+        kind,
+        commit_context,
+    } = action;
+    match kind {
+        ProjectionActionKind::WriteFile { path, bytes, .. } => Ok(ProjectionAction {
+            id,
+            kind: ProjectionActionKind::WriteFile {
+                path,
+                bytes,
+                expected_before: ExpectedBefore::Anything,
+            },
+            commit_context,
+        }),
+        ProjectionActionKind::DeleteFile { path, .. } => {
+            eyre::bail!("clone projection plan unexpectedly contains a delete for {path}");
+        }
+    }
 }
 
 async fn pull_shared_log_to_reader_end(

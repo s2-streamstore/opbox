@@ -1,5 +1,6 @@
 use clap::builder::styling;
 use clap::{Parser, Subcommand, ValueEnum};
+use eyre::WrapErr;
 use indicatif::{ProgressBar, ProgressStyle};
 use opbox_core::app::connectivity::{ConnectivityOverallState, LinkState, LinkStatus};
 use opbox_core::app::db::{open_database, semantic_pool};
@@ -16,8 +17,8 @@ use opbox_core::app::user_config::{
 };
 use opbox_core::app::workspace::{
     NotInWorkspace, canonicalize_existing_dir, create_metadata_dir, current_dir, daemon_log_path,
-    ensure_clean_clone_root, ensure_sync_root_unconfigured, find_workspace_root,
-    load_configured_daemon_state, pid_path, remove_pid, remove_socket_pointer,
+    ensure_clone_root, ensure_sync_root_unconfigured, find_workspace_root,
+    load_configured_daemon_state, metadata_dir, pid_path, remove_pid, remove_socket_pointer,
     remove_stale_socket_files, socket_link_path, storage_db_path, workspace_config_path,
 };
 use opbox_core::fs::fio::local::LocalFileIO;
@@ -107,6 +108,13 @@ enum Command {
         /// Clone only shared log records at or before this RFC3339 timestamp.
         #[arg(long, value_name = "RFC3339")]
         as_of: Option<CloneAsOf>,
+        /// Allow cloning into a populated directory. Existing files that
+        /// differ from the workspace are OVERWRITTEN with workspace content;
+        /// identical files are left untouched. Files not in the workspace are
+        /// kept, and will be shared with the workspace on the next
+        /// `ob start`.
+        #[arg(long)]
+        clobber: bool,
         #[command(flatten)]
         config: WorkspaceConfigOverrides,
         sync_root: Option<PathBuf>,
@@ -274,6 +282,7 @@ struct Bootstrap {
     s2_connection: S2ConnectionConfig,
     s2_basin: S2Basin,
     clone_log_read_stop: Option<LogReadStop>,
+    clone_clobber: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -585,6 +594,7 @@ async fn bootstrap_init(
         s2_connection,
         s2_basin,
         clone_log_read_stop: None,
+        clone_clobber: false,
     })
 }
 
@@ -593,6 +603,7 @@ async fn bootstrap_clone(
     cipher: String,
     sync_root: Option<PathBuf>,
     clone_log_read_stop: Option<LogReadStop>,
+    clobber: bool,
     user_config: &UserConfig,
     overrides: &WorkspaceConfigOverrides,
     progress: &BootstrapProgress,
@@ -605,7 +616,7 @@ async fn bootstrap_clone(
     if requested_root.try_exists()? && requested_root.is_dir() {
         ensure_sync_root_unconfigured(&requested_root).await?;
     }
-    let sync_root = ensure_clean_clone_root(&requested_root)?;
+    let sync_root = ensure_clone_root(&requested_root, clobber)?;
     ensure_sync_root_unconfigured(&sync_root).await?;
     progress.set(format!("connecting to basin {}", basin.as_ref()));
     let s2 = s2_client_from_config(&s2_connection)?;
@@ -639,6 +650,7 @@ async fn bootstrap_clone(
         s2_connection,
         s2_basin,
         clone_log_read_stop,
+        clone_clobber: clobber,
     })
 }
 
@@ -991,7 +1003,7 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
     let pool = semantic_pool(db).await?;
     let semantic_service = SemanticService::new(pool);
 
-    AppRuntime::new(AppRuntimeConfig {
+    let runtime_result = AppRuntime::new(AppRuntimeConfig {
         mode: bootstrap.mode,
         file_io: LocalFileIO::new(&bootstrap.sync_root),
         notify_io: None::<opbox_core::notify::nio::LocalNotifyIO>,
@@ -1000,11 +1012,22 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
         s2_basin: bootstrap.s2_basin,
         nonce_rng: NonceRng::Os,
         clone_log_read_stop: bootstrap.clone_log_read_stop,
+        clone_clobber: bootstrap.clone_clobber,
         engine_status: None,
         spy_tx: None,
     })
     .run_until_shutdown()
-    .await?;
+    .await;
+    if mode == RunMode::Clone {
+        runtime_result.wrap_err_with(|| {
+            format!(
+                "clone did not complete; delete the {} directory and re-run clone",
+                metadata_dir(&sync_root).display()
+            )
+        })?;
+    } else {
+        runtime_result?;
+    }
 
     let bootstrap_share_token = if mode == RunMode::Init
         && should_issue_bootstrap_share_token(&s2_connection)
@@ -1031,6 +1054,12 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
     if mode == RunMode::Clone {
         progress.set("writing local ignore rules");
         create_default_ignore_file(&sync_root)?;
+        if bootstrap.clone_clobber {
+            // A clobber clone usually lands in a git checkout; keep `.opbox/`
+            // out of git status just like init does. Runs after projection so
+            // a workspace-tracked .gitignore has already been materialized.
+            add_metadata_dir_to_gitignore_if_present(&sync_root)?;
+        }
     }
 
     progress.finish();
@@ -2396,6 +2425,7 @@ async fn main() {
             workspace,
             cipher,
             as_of,
+            clobber,
             config,
             sync_root,
         } => with_failure_banner(
@@ -2409,6 +2439,7 @@ async fn main() {
                     cipher,
                     sync_root,
                     as_of.map(CloneAsOf::log_read_stop),
+                    clobber,
                     &user_config,
                     &config,
                     &progress,

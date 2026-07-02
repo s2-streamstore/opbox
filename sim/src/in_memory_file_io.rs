@@ -284,6 +284,7 @@ impl InMemoryFileIO {
 
     fn observed_matches_expected(observed: Option<&Entry>, expected: &ExpectedBefore) -> bool {
         match expected {
+            ExpectedBefore::Anything => true,
             ExpectedBefore::Missing => observed.is_none(),
             ExpectedBefore::PresentWithFingerprint(expected) => {
                 observed.is_some_and(|entry| Self::entry_matches_fingerprint(entry, expected))

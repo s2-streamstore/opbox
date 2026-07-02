@@ -205,6 +205,7 @@ impl LocalFileIO {
 
     fn observed_matches_expected(observed: &Option<TreeEntry>, expected: &ExpectedBefore) -> bool {
         match expected {
+            ExpectedBefore::Anything => true,
             ExpectedBefore::Missing => observed.is_none(),
             ExpectedBefore::PresentWithFingerprint(expected) => observed
                 .as_ref()

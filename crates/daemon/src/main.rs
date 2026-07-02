@@ -183,6 +183,7 @@ async fn run(
         s2_basin,
         nonce_rng: NonceRng::Os,
         clone_log_read_stop: None,
+        clone_clobber: false,
         engine_status: Some(EngineStatusConfig {
             sync_root: sync_root.clone(),
             workspace_id: daemon_row.workspace_id.clone(),

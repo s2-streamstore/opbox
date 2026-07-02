@@ -7,6 +7,10 @@ use tokio::sync::oneshot;
 
 #[derive(Debug)]
 pub enum ExpectedBefore {
+    /// No precondition: apply the effect regardless of what is currently at
+    /// the path. Used by clobbering clones, where remote state overwrites
+    /// whatever local content exists.
+    Anything,
     Missing,
     /// The path must exist and match this fingerprint. `StatOnly` guards use
     /// metadata only; `StatAndContent` guards include the content hash.

@@ -44,6 +44,10 @@ pub async fn initialize_database(
 
 pub async fn load_daemon_state(db_path: &Path) -> eyre::Result<daemon_state::Row> {
     let db = open_database(db_path).await?;
+    load_daemon_state_from_db(&db).await
+}
+
+pub async fn load_daemon_state_from_db(db: &Database) -> eyre::Result<daemon_state::Row> {
     let conn = db.connect()?;
     configure_connection(&conn).await?;
     let mut rows = conn
