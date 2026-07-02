@@ -25,8 +25,8 @@ use rand::SeedableRng;
 use s2_sdk::S2;
 use s2_sdk::types::{
     AccountEndpoint, BasinConfig, BasinEndpoint, BasinName, BasinReconfiguration, CreateBasinInput,
-    EncryptionAlgorithm, EncryptionKey, ListStreamsInput, ReconfigureBasinInput, S2Config,
-    S2Endpoints, S2Error,
+    EncryptionAlgorithm, EncryptionKey, ListStreamsInput, ReadFrom, ReadInput, ReadStart,
+    ReconfigureBasinInput, S2Config, S2Endpoints, S2Error, StreamName,
 };
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
@@ -3716,7 +3716,7 @@ fn run_wrong_cipher_clone_workload(
 ) -> eyre::Result<()> {
     let workspace_id = WorkspaceId("00000000000000000000000000000099".to_string());
     let correct_key = sim_encryption_key();
-    let wrong_key = Some(EncryptionKey::new([0x24u8; 32]));
+    let wrong_key = EncryptionKey::new([0x24u8; 32]);
 
     let daemon_a = spawn_daemon_with_config(
         sim,
@@ -3732,70 +3732,48 @@ fn run_wrong_cipher_clone_workload(
         Duration::from_millis(DAEMON_A_S2_LINK_LATENCY_MS),
     );
 
-    // daemon-b uses the wrong encryption key.
-    let wrong_key_clone = wrong_key.clone();
+    // daemon-b uses the wrong encryption key to try reading.
+    let wrong_key_value = wrong_key;
     let workspace_id_b = workspace_id.clone();
     sim.client("daemon-b-wrong-cipher", async move {
         ensure_basin_exists().await?;
-        let daemon_row = daemon_state::Row {
-            workspace_id: workspace_id_b,
-            s2_basin: SIM_BASIN.parse().map_err(io_err)?,
-            s2_account_endpoint: None,
-            s2_basin_endpoint: None,
-            daemon_writer_id: DaemonWriterId(Bytes::copy_from_slice(&[1u8; 16])),
-            stable_cursor: ..0,
-            next_outbox_id: OutboxId::new(0),
-            encryption_key: wrong_key_clone,
-        };
-        let db = open_memory_database().await.map_err(io_err)?;
-        initialize_database(&db, &daemon_row)
-            .await
+        let basin: BasinName = SIM_BASIN.parse().map_err(io_err)?;
+        let s2_basin = sim_s2_client().map_err(io_err)?.basin(basin);
+        let stream_name: StreamName = format!("{}/ops", workspace_id_b.0)
+            .parse()
             .map_err(io_err)?;
-        let pool = semantic_pool(db).await.map_err(io_err)?;
-        let semantic_service = SemanticService::new(pool);
-        let s2_basin = sim_s2_client()
-            .map_err(io_err)?
-            .basin(daemon_row.s2_basin.clone());
-        let engine_status = EngineStatusConfig {
-            sync_root: PathBuf::from("/sim/daemon-b-wrong-cipher"),
-            workspace_id: daemon_row.workspace_id.clone(),
-            basin: daemon_row.s2_basin.clone(),
-            daemon_writer_id: daemon_row.daemon_writer_id.clone(),
-            stable_cursor: daemon_row.stable_cursor.clone(),
-            started_at: time::OffsetDateTime::now_utc(),
-            warnings: Vec::new(),
-        };
-        let cancellation_token = CancellationToken::new();
-        let (notify_io, _notify_handle) = channel_notify_io();
-        let file_io = FaultInjectingFileIO::new(InMemoryFileIO::new());
-        let runtime = AppRuntime::new(AppRuntimeConfig {
-            mode: RunMode::Sync,
-            file_io,
-            notify_io: Some(notify_io),
-            semantic_service,
-            daemon_row,
-            s2_basin,
-            clone_log_read_stop: None,
-            engine_status: Some(engine_status),
-            spy_tx: None,
-        });
-        let mut actors = runtime.spawn(cancellation_token.clone());
+        let stream = s2_basin
+            .stream(stream_name)
+            .with_encryption_key(wrong_key_value);
 
-        // Wait for the runtime to fail due to wrong encryption key.
-        let error = actors.wait_for_actor_stop().await;
-        let _ = actors.shutdown(cancellation_token).await;
-        match error {
-            Some(err)
-                if err.to_string().contains("encryption")
-                    || err.to_string().contains("decryption") =>
-            {
-                info!("daemon-b correctly failed with encryption error: {err}");
-                Ok(())
+        // Poll until there are records to read, then try reading.
+        loop {
+            let tail = stream.check_tail().await.map_err(io_err)?;
+            if tail.seq_num > 0 {
+                break;
             }
-            Some(err) => Err(io_err(format!(
-                "daemon-b failed with unexpected error (expected encryption error): {err}"
-            ))),
-            None => Err(io_err("daemon-b did not fail (expected encryption error)")),
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Attempt a read with the wrong key; expect decryption error.
+        let result = stream
+            .read(ReadInput::new().with_start(ReadStart::new().with_from(ReadFrom::SeqNum(0))))
+            .await;
+        match result {
+            Err(err) => {
+                let msg = err.to_string();
+                if msg.contains("decrypt") || msg.contains("encrypt") {
+                    info!("daemon-b correctly failed with encryption error: {msg}");
+                    Ok(())
+                } else {
+                    Err(io_err(format!(
+                        "daemon-b failed with unexpected error (expected encryption error): {msg}"
+                    )))
+                }
+            }
+            Ok(_) => Err(io_err(
+                "daemon-b read succeeded with wrong key (expected decryption error)",
+            )),
         }
     });
 
