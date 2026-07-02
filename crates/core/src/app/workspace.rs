@@ -238,7 +238,7 @@ pub async fn load_configured_daemon_state(
     let db_path = storage_db_path(sync_root);
     if !db_path.try_exists()? {
         eyre::bail!(
-            "sync root is not configured for opbox: {} is missing; run `ob init` or `ob clone --workspace WORKSPACE_ID` first",
+            "sync root is not configured for opbox: {} is missing; run `ob init` or `ob clone --workspace WORKSPACE_ID --cipher KEY` first",
             db_path.display()
         );
     }

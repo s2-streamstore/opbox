@@ -2473,7 +2473,9 @@ fn render_error(error: &eyre::Report) {
         eprintln!(
             "run {} to create a workspace here, or {} to fetch an existing one",
             style.bold(format!("{CLIENT_COMMAND} init")),
-            style.bold(format!("{CLIENT_COMMAND} clone --workspace <ID>")),
+            style.bold(format!(
+                "{CLIENT_COMMAND} clone --workspace <ID> --cipher <KEY>"
+            )),
         );
         return;
     }
