@@ -7,7 +7,6 @@ default-run = "ob"
 [dependencies]
 bytes = "1.10"
 clap = { version = "4.6.1", features = ["derive"] }
-color-print = "0.3.7"
 eyre = "0.6.12"
 indicatif = "0.18.0"
 opbox-core = { path = "../core" }
