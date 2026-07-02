@@ -11,13 +11,13 @@
 - `stable_tree` represents stable desired filesystem view derived from stable namespace/objects.
 - Prior namespace/tree/text state is separate from stable state; prior may reference paths/objects no longer present in stable while projection/delete is pending.
 - `objects` is append-only object identity, not stable/prior. All prior object ids were once stable object ids.
-- Core tables: `daemon_state`, `objects`, `stable_namespace`, `prior_namespace`, `stable_text_objects`, `prior_text_objects`, `stable_tree`, `prior_tree`, `outbox`.
-- Startup modes are explicit: `init`, `pull`, `sync`.
+- Core tables: `daemon_state`, `objects`, `stable_namespace`, `prior_namespace`, `stable_text_objects`, `prior_text_objects`, `stable_tree`, `prior_tree`, `outbox`, `import_staged_files`, `projection_write_intents`, `projection_applied_write_intents`, `ignored_files`.
+- Startup modes are explicit: `init`, `clone`, `sync`.
 - `init`: one-shot bootstrap of a new empty shared workspace from local disk. Local disk is accepted, so it writes stable and prior together and inserts outbox messages. Then exits.
-- `pull`: one-shot checkout of an existing workspace into an empty local dir. Builds stable from shared log, projects to disk, records prior, then exits.
+- `clone`: one-shot checkout of an existing workspace into an empty local dir. Builds stable from shared log, projects to disk, records prior, then exits.
 - `sync`: long-running mode for an already bootstrapped checkout. Loads DB, starts actors, runs startup scan, then processes scans/log/projection.
 - Engine sequences work and may drop invalid projection plans. Semantic actor owns semantic decisions and follow-up import/projection requests.
-- Binary/LWW support, watcher suppression, expected writes, and provenance/event tables are deferred. See `BINARY_LWW_DESIGN.md` for the current binary design sketch.
+- Binary/LWW support and provenance/event tables are deferred. Expected writes are tracked as projection write intents (`projection_write_intents`, `projection_applied_write_intents`). See `BINARY_LWW_DESIGN.md` for the current binary design sketch.
 
 ## Stable/Prior Tree
 
@@ -40,7 +40,7 @@
 - `scan != prior && scan != stable`: local drift; Semantic returns an import plan with guarded reads for files whose contents are needed.
 - New path with no prior entry: guarded read; if UTF-8, create object, update stable/prior namespace/tree/text state, and insert outbox in one transaction.
 - Existing text path with changed fingerprint: guarded read, diff disk text against `prior_text_objects`, apply resulting CRDT update to `stable_text_objects`, update `prior_*`, and insert outbox.
-- v0 uses full scans only. Partial/subtree scans are deferred.
+- Scans carry a scope: full, subtree, or single file. Startup uses a full scan; notify hints trigger scoped scans.
 - Missing path in a full scan is delete evidence. Semantic can commit namespace deletes/outbox without Engine file I/O follow-up.
 - Deletes are committed immediately as tombstones rather than hard-deleting all prior evidence. This keeps enough information to reason about later same-path reappearance/safe-save patterns.
 - Import action IDs are assigned by Semantic.
@@ -57,20 +57,15 @@
 ```rust
 enum EnginePhase {
     Idle,
-    Scanning,
-    Importing {
-        epoch: ImportEpoch,
-        queue: VecDeque<ImportAction>,
-        in_flight: usize,
-    },
-    Projecting {
-        epoch: ProjectionEngineEpoch,
-        plan: VecDeque<ProjectionAction>,
-        in_flight: BTreeMap<ProjectionActionId, ProjectionAction>,
-        invalidated: bool,
-    },
+    AwaitingNextWork { boundary: BoundarySeq, dirty: bool },
+    Scanning { scope: ScanScope },
+    PlanningImport,
+    Importing(ImportPhase),      // Dispatching { queue, in_flight } | Committing
+    Projecting(ProjectionPhase), // Dispatching | Draining | Committing
 }
 ```
+
+(See `crates/core/src/engine/actor.rs` for the authoritative shape.)
 
 - v0 projection should run with `max_in_flight = 1`.
 - The `Projecting` shape still supports multiple in-flight actions later, once we have a deterministic independence/admission policy.
@@ -82,9 +77,9 @@ enum EnginePhase {
 - Engine owns operational sequencing: scan, schedule FS actions, track when FS actions finish, and decide when to ask Semantic to close an epoch.
 - Semantic owns semantic truth and durability: expected action set, action completion accounting, stable/prior updates, outbox writes, and next-work decisions.
 - Individual import/projection action completions can be fire-and-forget from Engine to Semantic.
-- `CommitImportEpoch` and `CommitProjectionEpoch` are barriers. They must account for all expected action commits before returning next work.
+- `CommitImportEpoch` and `CommitProjectionEpoch` are barriers. They must account for all expected action commits before the commit confirms; Engine then fetches next work at the phase boundary via `GetNextWork`.
 - Import epoch start returns an `ImportEpoch` plus an `ImportPlan`. Projection epoch start returns a `ProjectionEpoch` plus a `ProjectionPlan`.
-- Import epoch commit fails or asks for retry/rescan if expected imports are missing, failed, or stale. Successful commit returns `NextWork`.
+- Import epoch commit fails or asks for retry/rescan if expected imports are missing, failed, or stale.
 - Projection epoch close can end cleanly or invalidated. Successful projection actions update `prior_*`; conflicts or invalidation cause Semantic to return fresh import/projection work.
 - These epochs are not atomic DB+filesystem transactions. Filesystem side effects cannot be rolled back, so failure handling is rescan/retry/replan rather than rollback.
 - `Idle` is only an Engine phase. Semantic responds with `NextWork::None` when no semantic work is needed.
@@ -98,13 +93,13 @@ enum NextWork {
 ```
 
 ```rust
-SemanticRequest::StartImportEpoch { ... }
-SemanticRequest::CommitImportAction { ... } // no reply
-SemanticRequest::CommitImportEpoch { ... }  // barrier, returns NextWork
+SemanticRequest::ApplyScan { ... }              // returns NextWork; epochs created internally
+SemanticRequest::CommitImportAction { ... }     // optional reply (fire-and-forget in normal sync)
+SemanticRequest::CommitImportEpoch { ... }      // barrier
 
-SemanticRequest::StartProjectionEpoch { ... }
-SemanticRequest::CommitProjectionAction { ... } // no reply
-SemanticRequest::CommitProjectionEpoch { ... }  // barrier, returns NextWork
+SemanticRequest::CommitProjectionAction { ... } // optional reply (fire-and-forget in normal sync)
+SemanticRequest::CommitProjectionEpoch { ... }  // barrier
+SemanticRequest::GetNextWork { ... }            // returns NextWork at a phase boundary
 ```
 
 ## Projection Conflicts
@@ -113,22 +108,17 @@ SemanticRequest::CommitProjectionEpoch { ... }  // barrier, returns NextWork
 
 ```rust
 enum GuardedWriteResult {
-    Written {
-        new_fingerprint: FileFingerprint,
-    },
-    ConflictBeforeWrite {
-        current_fingerprint: Option<FileFingerprint>,
-    },
-    ConflictAfterWrite {
-        intended_fingerprint: FileFingerprint,
-        current_fingerprint: Option<FileFingerprint>,
-    },
+    Written { fingerprint: FileFingerprint },
+    AlreadyApplied { fingerprint: FileFingerprint },
+    ConflictBeforeSwap { swap_path: RelativePath, observed: Option<TreeEntry> },
+    ConflictAfterSwap { observed: Option<TreeEntry> },
 }
 ```
 
-- `ConflictBeforeWrite`: disk changed before any swap/write side effect. Semantic should invalidate the projection epoch and pivot to importing current disk evidence.
-- `ConflictAfterWrite`: the guarded write performed the swap, but final stat did not match the intended fingerprint. Prior state for that path is unknown; Semantic should invalidate the projection epoch and force rescan/import for that path.
+- `ConflictBeforeSwap`: disk changed before any swap/write side effect. Semantic should invalidate the projection epoch and pivot to importing current disk evidence.
+- `ConflictAfterSwap`: the guarded write performed the swap, but final stat did not match the intended fingerprint. Prior state for that path is unknown; Semantic should invalidate the projection epoch and force rescan/import for that path.
 - `Written`: projected content reached disk. Semantic can update `prior_*` for that action.
+- `AlreadyApplied`: disk already matches the intended content; treated like a successful write.
 - If stable semantic state changes during projection, Semantic emits `ProjectionChanged { generation }`.
 - On `ProjectionChanged`, Engine marks the current projection invalidated, stops scheduling new projection actions, lets in-flight actions finish, commits finished action results, then commits the projection epoch. Semantic returns fresh `NextWork`.
 

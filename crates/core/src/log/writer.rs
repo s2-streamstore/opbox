@@ -72,9 +72,10 @@ mod tests {
     #[test]
     fn near_limit_payload_with_large_headers_uses_pointer_package() -> eyre::Result<()> {
         let payload = Bytes::from(vec![b'x'; codec::max_inline_record_size() - 1]);
+        let object_id_len = S2_MAX_RECORD_METERED_BYTES - codec::max_inline_record_size();
         let package = codec::shared_to_s2_package(
             SharedMessage::TextObjectUpdate {
-                object_id: ObjectId(Bytes::from(vec![b'o'; 1024])),
+                object_id: ObjectId(Bytes::from(vec![b'o'; object_id_len])),
                 yjs_update: payload,
             },
             &origin(),

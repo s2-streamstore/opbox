@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait = "0.1.89"
-bb8 = "0.9"
 bytes = "1.10"
 bytesize = "2.3.1"
 clap = { version = "4.6.1", features = ["derive"] }
@@ -38,5 +37,4 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 turmoil = "0.7.0"
-turso = { version = "0.6.0-pre.18", default-features = false }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
