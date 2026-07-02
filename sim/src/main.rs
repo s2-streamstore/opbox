@@ -17,7 +17,7 @@ use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::crdt::types::ObjectId;
 use opbox_core::engine::actor::{EngineCommand, EngineStatusConfig};
 use opbox_core::fs::types::{RelativePath, ScanScope};
-use opbox_core::log::encrypt::CipherKey;
+use opbox_core::log::encrypt::{CipherKey, NonceRng};
 use opbox_core::notify::nio::channel_notify_io;
 use opbox_core::semantic::service::{SemanticDebugSnapshot, SemanticService};
 use opbox_core::semantic::table::daemon_state;
@@ -3126,14 +3126,21 @@ fn spawn_daemon_with_initial_files(
     workspace_id: WorkspaceId,
     initial_files: BTreeMap<String, Bytes>,
 ) -> eyre::Result<SimDaemonHandle> {
-    // No encryption for default daemons — deterministic meta tests compare
-    // exact wire bytes, and random AES-GCM nonces break reproducibility.
-    // The wrong-cipher-clone workload tests encryption via spawn_daemon_with_config.
-    spawn_daemon_with_config(sim, name, daemon_index, workspace_id, initial_files, None)
+    // Default daemons encrypt with the fixed sim key; nonces come from a
+    // per-daemon RNG seeded off the run seed (sim_nonce_rng), so meta
+    // determinism comparisons still see identical wire bytes across runs.
+    spawn_daemon_with_config(
+        sim,
+        name,
+        daemon_index,
+        workspace_id,
+        initial_files,
+        sim_encryption_key(),
+    )
 }
 
-fn sim_encryption_key() -> Option<CipherKey> {
-    Some(CipherKey::from_bytes([0x42u8; 32]))
+fn sim_encryption_key() -> CipherKey {
+    CipherKey::from_bytes([0x42u8; 32])
 }
 
 fn spawn_daemon_with_config(
@@ -3142,7 +3149,7 @@ fn spawn_daemon_with_config(
     daemon_index: u8,
     workspace_id: WorkspaceId,
     initial_files: BTreeMap<String, Bytes>,
-    encryption_key: Option<CipherKey>,
+    encryption_key: CipherKey,
 ) -> eyre::Result<SimDaemonHandle> {
     let daemon_row = daemon_state::Row {
         workspace_id,
@@ -3160,9 +3167,10 @@ fn spawn_daemon_with_config(
         file_io.write_file(path, bytes)?;
     }
     let handle_io = file_io.clone();
+    let nonce_rng = sim_nonce_rng(daemon_index);
     let (command_tx, command_rx) = mpsc::channel(100);
     sim.client(name, async move {
-        run_daemon_client(name, daemon_row, file_io, command_rx).await
+        run_daemon_client(name, daemon_row, file_io, nonce_rng, command_rx).await
     });
 
     Ok(SimDaemonHandle {
@@ -3175,6 +3183,7 @@ async fn run_daemon_client(
     name: &'static str,
     daemon_row: daemon_state::Row,
     file_io: FaultInjectingFileIO,
+    nonce_rng: NonceRng,
     mut command_rx: mpsc::Receiver<SimDaemonCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_basin_exists().await?;
@@ -3206,6 +3215,7 @@ async fn run_daemon_client(
         semantic_service,
         daemon_row,
         s2_basin,
+        nonce_rng,
         clone_log_read_stop: None,
         engine_status: Some(engine_status),
         spy_tx: None,
@@ -4430,8 +4440,19 @@ fn init_sim(seed: u64, failure_rate: f64) -> turmoil::Sim<'static> {
 }
 
 fn seed_rng(seed: u64) {
+    SIM_SEED.set(seed).expect("seed_rng called more than once");
     mad_turmoil::rand::set_rng(rand::rngs::StdRng::seed_from_u64(seed));
     fastrand::seed(seed);
+}
+
+/// The run's seed, kept for deriving per-daemon nonce RNG streams.
+static SIM_SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Deterministic AES-GCM nonce stream for one sim daemon. Spaced per daemon so
+/// nonce assignment does not depend on actor scheduling order across daemons.
+fn sim_nonce_rng(daemon_index: u8) -> NonceRng {
+    let seed = SIM_SEED.get().copied().expect("sim seed not initialized");
+    NonceRng::seeded(seed ^ ((daemon_index as u64 + 1) << 48))
 }
 
 /// Stamps each log line with the simulation step (sim-elapsed ms; the sim

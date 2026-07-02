@@ -48,7 +48,7 @@ enum ReaderRunOutcome {
 pub struct LogReaderActor {
     basin: S2Basin,
     workspace: WorkspaceId,
-    encryption_key: Option<CipherKey>,
+    encryption_key: CipherKey,
     start_at: SequenceNumber,
     stop: Option<LogReadStop>,
     req_rx: mpsc::UnboundedReceiver<LogReaderRequest>,
@@ -59,7 +59,7 @@ impl LogReaderActor {
     pub fn new(
         basin: S2Basin,
         workspace: WorkspaceId,
-        encryption_key: Option<CipherKey>,
+        encryption_key: CipherKey,
         start_at: SequenceNumber,
         stop: Option<LogReadStop>,
         req_rx: mpsc::UnboundedReceiver<LogReaderRequest>,
@@ -92,7 +92,7 @@ impl LogReaderActor {
     async fn read_full_multipart(
         basin: S2Basin,
         workspace_id: WorkspaceId,
-        encryption_key: Option<CipherKey>,
+        encryption_key: CipherKey,
         message_headers: Vec<Header>,
         object_pointer: ObjectPointer,
     ) -> Result<SharedMessage, ReaderRunError> {
@@ -133,8 +133,8 @@ impl LogReaderActor {
             let ReadBatch { records, .. } = batch.map_err(ReaderRunError::from_s2)?;
             for record in records {
                 record_count += 1;
-                let body =
-                    decrypt_body(&record.body, &encryption_key).map_err(ReaderRunError::fatal)?;
+                let body = encrypt::decrypt(&encryption_key, &record.body)
+                    .map_err(ReaderRunError::fatal)?;
                 buf.extend_from_slice(&body);
             }
         }
@@ -310,7 +310,7 @@ impl LogReaderActor {
                                 )
                                 .await?
                             } else {
-                                let decrypted_body = decrypt_body(&record.body, &self.encryption_key)
+                                let decrypted_body = encrypt::decrypt(&self.encryption_key, &record.body)
                                     .map_err(ReaderRunError::fatal)?;
                                 codec::s2_payload_to_shared_message(&record.headers, decrypted_body)
                                     .map_err(ReaderRunError::fatal)?
@@ -336,12 +336,5 @@ impl LogReaderActor {
 
             }
         }
-    }
-}
-
-fn decrypt_body(body: &bytes::Bytes, key: &Option<CipherKey>) -> eyre::Result<bytes::Bytes> {
-    match key {
-        Some(key) => encrypt::decrypt(key, body),
-        None => Ok(body.clone()),
     }
 }

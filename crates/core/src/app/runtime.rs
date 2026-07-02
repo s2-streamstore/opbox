@@ -6,6 +6,7 @@ use crate::engine::init as engine_init;
 use crate::fs::actor::FsActor;
 use crate::fs::client::FsClient;
 use crate::fs::fio::FileIO;
+use crate::log::encrypt::NonceRng;
 use crate::log::reader::LogReaderActor;
 use crate::log::types::{LOG_READER_EVENT_CHANNEL_CAPACITY, LogReadStop};
 use crate::log::writer::LogWriterActor;
@@ -41,6 +42,7 @@ pub struct AppRuntimeConfig<IO, NIO = ()> {
     pub semantic_service: SemanticService,
     pub daemon_row: daemon_state::Row,
     pub s2_basin: S2Basin,
+    pub nonce_rng: NonceRng,
     pub clone_log_read_stop: Option<LogReadStop>,
     pub engine_status: Option<EngineStatusConfig>,
     pub spy_tx: Option<broadcast::Sender<SpyEvent>>,
@@ -67,6 +69,7 @@ where
             semantic_service,
             daemon_row,
             s2_basin,
+            nonce_rng,
             clone_log_read_stop,
             engine_status,
             spy_tx,
@@ -103,6 +106,7 @@ where
                     daemon_row.workspace_id.clone(),
                     daemon_row.daemon_writer_id.clone(),
                     daemon_row.encryption_key.clone(),
+                    nonce_rng,
                     log_writer_req_rx,
                     log_writer_resp_tx,
                 );
@@ -178,6 +182,7 @@ where
                     daemon_row.workspace_id.clone(),
                     daemon_row.daemon_writer_id.clone(),
                     daemon_row.encryption_key.clone(),
+                    nonce_rng,
                     log_writer_req_rx,
                     log_writer_resp_tx,
                 );

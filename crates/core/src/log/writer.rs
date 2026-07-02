@@ -1,7 +1,7 @@
 use crate::app::s2::s2_error_is_connectivity;
 use crate::log::codec;
 use crate::log::codec::{ObjectPointer, S2Package};
-use crate::log::encrypt::{self, CipherKey};
+use crate::log::encrypt::{self, CipherKey, NonceRng};
 use crate::log::types::{LogWriterRequest, LogWriterResponse, SharedMessageOrigin};
 use crate::types::{DaemonWriterId, OutboxId, WorkspaceId};
 use futures::StreamExt;
@@ -49,9 +49,31 @@ pub struct LogWriterActor {
     basin: S2Basin,
     workspace: WorkspaceId,
     daemon_writer_id: DaemonWriterId,
-    encryption_key: Option<CipherKey>,
+    cipher: RecordCipher,
     req_rx: mpsc::UnboundedReceiver<LogWriterRequest>,
     resp_tx: mpsc::UnboundedSender<LogWriterResponse>,
+}
+
+#[derive(Clone)]
+struct RecordCipher {
+    key: CipherKey,
+    nonce_rng: NonceRng,
+}
+
+impl RecordCipher {
+    fn encrypt_record(&self, record: AppendRecord) -> eyre::Result<AppendRecord> {
+        let encrypted_body = encrypt::encrypt(&self.key, &self.nonce_rng, record.body())?;
+        let headers: Vec<Header> = record.headers().to_vec();
+        // This rebuild carries only body and headers. Client-set record
+        // timestamps are intentionally unsupported: S2 assigns arrival time,
+        // so encrypted and plaintext records order identically for
+        // `clone --as-of`.
+        let mut new_record = AppendRecord::new(encrypted_body)?;
+        if !headers.is_empty() {
+            new_record = new_record.with_headers(headers)?;
+        }
+        Ok(new_record)
+    }
 }
 
 impl LogWriterActor {
@@ -70,7 +92,8 @@ impl LogWriterActor {
         basin: S2Basin,
         workspace: WorkspaceId,
         daemon_writer_id: DaemonWriterId,
-        encryption_key: Option<CipherKey>,
+        encryption_key: CipherKey,
+        nonce_rng: NonceRng,
         req_rx: mpsc::UnboundedReceiver<LogWriterRequest>,
         resp_tx: mpsc::UnboundedSender<LogWriterResponse>,
     ) -> Self {
@@ -78,7 +101,10 @@ impl LogWriterActor {
             basin,
             workspace,
             daemon_writer_id,
-            encryption_key,
+            cipher: RecordCipher {
+                key: encryption_key,
+                nonce_rng,
+            },
             req_rx,
             resp_tx,
         }
@@ -88,7 +114,7 @@ impl LogWriterActor {
     async fn upload_parts(
         s2: S2Basin,
         workspace_id: WorkspaceId,
-        encryption_key: Option<CipherKey>,
+        cipher: RecordCipher,
         outbox_id: OutboxId,
         pointer_record: AppendRecord,
         pointer: ObjectPointer,
@@ -106,7 +132,7 @@ impl LogWriterActor {
         let mut set = JoinSet::new();
 
         for (idx, part) in parts.into_iter().enumerate() {
-            let part = encrypt_record(part, &encryption_key).map_err(WriterRunError::fatal)?;
+            let part = cipher.encrypt_record(part).map_err(WriterRunError::fatal)?;
             let batch = AppendRecordBatch::try_from_iter([part]).map_err(WriterRunError::fatal)?;
             let input = AppendInput::new(batch).with_match_seq_num(idx as u64);
             let ticket = session
@@ -264,7 +290,7 @@ impl LogWriterActor {
                             match codec::shared_to_s2_package(shared_message, &origin)
                                 .map_err(WriterRunError::fatal)? {
                                 S2Package::Inlined{ record } => {
-                                    let record = encrypt_record(record, &self.encryption_key).map_err(WriterRunError::fatal)?;
+                                    let record = self.cipher.encrypt_record(record).map_err(WriterRunError::fatal)?;
                                     inflight += 1;
                                     let ticket = producer
                                         .submit(record)
@@ -284,7 +310,7 @@ impl LogWriterActor {
                                         checksum = pointer.checksum,
                                         "log writer using pointer package"
                                     );
-                                    let upload = tokio::spawn(Self::upload_parts(self.basin.clone(), self.workspace.clone(), self.encryption_key.clone(), outbox_id, pointer_record, pointer, parts));
+                                    let upload = tokio::spawn(Self::upload_parts(self.basin.clone(), self.workspace.clone(), self.cipher.clone(), outbox_id, pointer_record, pointer, parts));
                                     big_upload = Some(upload);
                                 }
                             }
@@ -300,17 +326,4 @@ impl LogWriterActor {
             }
         }
     }
-}
-
-fn encrypt_record(record: AppendRecord, key: &Option<CipherKey>) -> eyre::Result<AppendRecord> {
-    let Some(key) = key else {
-        return Ok(record);
-    };
-    let encrypted_body = encrypt::encrypt(key, record.body())?;
-    let headers: Vec<Header> = record.headers().to_vec();
-    let mut new_record = AppendRecord::new(encrypted_body)?;
-    if !headers.is_empty() {
-        new_record = new_record.with_headers(headers)?;
-    }
-    Ok(new_record)
 }

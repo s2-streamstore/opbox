@@ -15,6 +15,7 @@ use opbox_core::app::workspace::{
 };
 use opbox_core::engine::actor::EngineStatusConfig;
 use opbox_core::fs::fio::local::LocalFileIO;
+use opbox_core::log::encrypt::NonceRng;
 use opbox_core::notify::nio::LocalNotifyIO;
 use opbox_core::semantic::service::SemanticService;
 use opbox_core::semantic::table::daemon_state;
@@ -180,6 +181,7 @@ async fn run(
         semantic_service,
         daemon_row: daemon_row.clone(),
         s2_basin,
+        nonce_rng: NonceRng::Os,
         clone_log_read_stop: None,
         engine_status: Some(EngineStatusConfig {
             sync_root: sync_root.clone(),
