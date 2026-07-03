@@ -27,9 +27,13 @@ cargo install --locked --path crates/daemon
 
 You should have `ob` and `opbox-daemon` in your `$PATH` now.
 
-### S2 configuration
+## S2 configuration
 
-#### Using `s2.dev`
+S2 is used as the shared journal across opbox daemons. This is how CRDT ops are shared.
+
+It can be used in its serverless offering (s2.dev), or you can run S2 yourself.
+
+### Using `s2.dev`
 
 Go to [s2.dev](http://s2.dev) and make an account. You can sign on with SSO and get started immediately. All new signups get $10 of credits, which is way more than enough for any reasonable `opbox` workspace.
 
@@ -61,6 +65,33 @@ ob config set default-basin "MY_BASIN"
 `ob config` writes to an OS user-level opbox config file by default. These values become the defaults for every opbox workspace you create or clone as this OS user. Use `ob config --workspace ...` inside a workspace when one workspace needs its own basin, access token, endpoints, or daemon log level.
 
 At this point, you're set.
+
+### Using `s2-lite` (self-hosted)
+
+If you want to run S2 yourself, follow the instructions [here](https://github.com/s2-streamstore/s2).
+
+Your S2 instance will need to be accessible to all opbox daemons.
+
+For quickly testing opbox out, you can simply run multiple daemons on the same machine that you are running s2-lite on, and access it via localhost.
+
+```bash
+# start s2-lite
+s2 lite
+```
+Then in terminals where you want to use opbox, or otherwise interact with S2, set the following environment variables:
+```bash
+export S2_ACCOUNT_ENDPOINT=http://localhost:80
+export S2_BASIN_ENDPOINT=http://localhost:80
+export S2_ACCESS_TOKEN=ignored
+export S2_BASIN=my-test-basin
+```
+
+You will also need to create a basin:
+```bash
+s2 create-basin \
+  $S2_BASIN \
+  --retention-policy infinite
+```
 
 ## Create your first workspace
 
