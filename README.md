@@ -31,6 +31,8 @@ The only external service this relies on is [s2.dev](https://s2.dev). You can si
 
 See the in-progress [architecture notes](docs/architecture.md) and [design notes](docs/design-notes.md).
 
+Sync correctness is exercised with deterministic simulation testing — see [sim/](sim/README.md) for the setup and how to run it.
+
 ### spy
 
 Monitor the shared log (CRDT operations being read from S2) in real time within a workspace:
