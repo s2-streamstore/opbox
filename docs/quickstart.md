@@ -4,6 +4,20 @@
 
 ### Install opbox
 
+#### Install script (recommended)
+
+```bash
+curl -fsSL https://opbox.dev/install.sh | bash
+```
+
+This installs the latest release binaries (`ob` and `opbox-daemon`) into `~/.local/bin`. Feel free to [read the script](https://opbox.dev/install.sh) before running it.
+
+Options such as `OPBOX_VERSION`, `OPBOX_INSTALL_DIR`, and `OPBOX_INSTALL_FROM_SOURCE=1` are documented at the top of the script.
+
+#### From a release archive
+
+Download an archive for your platform from [GitHub releases](https://github.com/s2-streamstore/opbox/releases), then place both `ob` and `opbox-daemon` in the same directory on your `$PATH`.
+
 #### From source
 
 ```bash
@@ -12,8 +26,6 @@ cargo install --locked --path crates/daemon
 ```
 
 You should have `ob` and `opbox-daemon` in your `$PATH` now.
-
-If you install from a release archive, place both `ob` and `opbox-daemon` in the same directory on your `$PATH`.
 
 ### S2 configuration
 

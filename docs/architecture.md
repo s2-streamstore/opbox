@@ -45,11 +45,18 @@
 
 
 
-## Sharp edges
+## Sharp edges / future features
 
+- Every clone needs to read the entire shared log from the beginning
+  - A snapshot scheme + using log as WAL for messages since last snapshot would be nice
+  - Catch-up reads from s2 are high throughput, but consolidating messages before materialization has not been optimized
+- Support for binary data, via a simple last-write-win register, would be nice
+- Not all editors deal well with concurrent writes to a file on disk; we should document useful configs
 
 ## Questions
 
+Answers TODO (or left as exercise for reader :))
+
 - Why is a db needed?
 - Why Turso?
-- Why not a mountable VFS?
+- Why a sync daemon, not a mountable VFS?
