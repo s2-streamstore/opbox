@@ -3,7 +3,7 @@
 ## Concepts
 
 - CRDTs
-  - [Conflict-free replicate data type](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type)
+  - [Conflict-free replicated data type](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type)
   - Sync works in `opbox` by distributing messages representing operations (ops) on CRDT data structures.
   - Our ops represent changes (to text files, or to the namespace representing what files exist); because they are CRDT operations, they can be applied in any order, any amount of times, and our workspaces should still meaningfully converge to a single stable representation.
 - Workspace
