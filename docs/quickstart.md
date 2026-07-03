@@ -27,16 +27,20 @@ cargo install --locked --path crates/daemon
 
 You should have `ob` and `opbox-daemon` in your `$PATH` now.
 
-### S2 configuration
+## S2 configuration
 
-#### Using `s2.dev`
+S2 is used as the shared journal across opbox daemons. This is how CRDT ops are shared.
 
-Go to [s2.dev](http://s2.dev) and make an account. You can sign on with SSO and get started immediately. All new signups get $10 of credits, which is way more than enough for any reasonable `opbox` workspace.
+You can use the hosted service at s2.dev, or run `s2-lite` yourself.
+
+### Using `s2.dev`
+
+Go to [s2.dev](https://s2.dev), make an account, and create an access token.
 
 > [!NOTE]
 > Do put down a payment method in order to be able to make streams with infinite retention. The free tier (no payment method listed) is restricted to 28 day data retention. In other words, your workspace will break after 4 weeks unless you do this.
 
-Create an access token on the UI, and hold on to it. You can accept all of the defaults when creating this token. Don't share it with anyone else!
+Hold on to the access token. You can accept the defaults when creating it. Don't share it with anyone else.
 
 Next, create a basin, making sure that:
 - The retention policy is set to `Infinite` (age-based TTLs will work for short-lived workspaces)
@@ -61,6 +65,51 @@ ob config set default-basin "MY_BASIN"
 `ob config` writes to an OS user-level opbox config file by default. These values become the defaults for every opbox workspace you create or clone as this OS user. Use `ob config --workspace ...` inside a workspace when one workspace needs its own basin, access token, endpoints, or daemon log level.
 
 At this point, you're set.
+
+### Using `s2-lite`
+
+If you want to run S2 yourself, use [`s2-lite`](https://github.com/s2-streamstore/s2#s2-lite). This assumes you have the `s2` CLI installed.
+
+Your S2 instance needs to be reachable by every opbox daemon that should sync through it.
+
+For a quick local test, run `s2-lite` on the same machine as your opbox workspaces and point opbox at `localhost`.
+
+```bash
+# leave this running in one terminal
+s2 lite
+```
+
+In each terminal where you want to run `s2` or `ob`, set:
+
+```bash
+export S2_ACCOUNT_ENDPOINT=http://localhost:80
+export S2_BASIN_ENDPOINT=http://localhost:80
+export S2_ACCESS_TOKEN=ignored
+export S2_BASIN=my-test-basin
+```
+
+`S2_ACCESS_TOKEN=ignored` is intentional: `s2-lite` does not check access tokens, but the SDK still expects a value.
+
+If `s2-lite` is running on another host or port, replace both endpoint URLs with the address your opbox daemons can reach.
+
+Create a basin:
+
+```bash
+s2 create-basin \
+  $S2_BASIN \
+  --retention-policy infinite
+```
+
+`ob init` and `ob clone` also read these `S2_*` environment variables. For a throwaway local test, that is usually enough.
+
+If you would rather persist the s2-lite settings in opbox config, use:
+
+```bash
+ob config set default-basin "$S2_BASIN"
+ob config set access-token "$S2_ACCESS_TOKEN"
+ob config set account-endpoint "$S2_ACCOUNT_ENDPOINT"
+ob config set basin-endpoint "$S2_BASIN_ENDPOINT"
+```
 
 ## Create your first workspace
 
@@ -144,4 +193,3 @@ ob clone \
 # and finally, start syncing
 ob start
 ```
-
