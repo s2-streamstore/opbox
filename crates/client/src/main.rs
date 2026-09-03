@@ -33,10 +33,11 @@ use opbox_core::types::{
 };
 use s2_sdk::{
     S2, S2Basin,
+    error::RequestError,
     types::{
         AccessTokenId, AccessTokenIdPrefix, AccessTokenMatcher, AccessTokenScopeInput,
         AccountEndpoint, BasinEndpoint, BasinMatcher, BasinName, IssueAccessTokenInput,
-        ListAccessTokensInput, Operation, S2DateTime, S2Error, StreamMatcher, StreamNamePrefix,
+        ListAccessTokensInput, Operation, S2DateTime, StreamMatcher, StreamNamePrefix,
     },
 };
 use std::io::IsTerminal;
@@ -874,7 +875,7 @@ fn share_token_management_report(
     required_permission: &'static str,
     error: eyre::Report,
 ) -> eyre::Report {
-    if error.downcast_ref::<S2Error>().is_some() {
+    if error.downcast_ref::<RequestError>().is_some() {
         share_token_management_error(action, required_permission, format!("{error:#}"))
     } else {
         error

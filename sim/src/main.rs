@@ -26,9 +26,10 @@ use opbox_core::semantic::table::daemon_state;
 use opbox_core::types::{DaemonWriterId, OutboxId, WorkspaceId};
 use rand::SeedableRng;
 use s2_sdk::S2;
+use s2_sdk::error::RequestError;
 use s2_sdk::types::{
     AccountEndpoint, BasinEndpoint, BasinName, CreateBasinInput, ListStreamsInput, ReadFrom,
-    ReadInput, ReadStart, S2Config, S2Endpoints, S2Error, StreamName,
+    ReadInput, ReadStart, S2Config, S2Endpoints, StreamName,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read};
@@ -4155,7 +4156,7 @@ async fn ensure_basin_exists() -> Result<(), Box<dyn std::error::Error>> {
     let s2 = sim_s2_client().map_err(io_err)?;
     match s2.create_basin(CreateBasinInput::new(basin_name)).await {
         Ok(_) => Ok(()),
-        Err(S2Error::Server(err)) if err.code == "resource_already_exists" => Ok(()),
+        Err(RequestError::Server(err)) if err.code == "resource_already_exists" => Ok(()),
         Err(err) => Err(io_err(err)),
     }
 }
