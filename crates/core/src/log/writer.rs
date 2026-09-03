@@ -1,4 +1,7 @@
-use crate::app::s2::s2_error_is_connectivity;
+use crate::app::s2::{
+    append_session_error_is_connectivity, producer_error_is_connectivity,
+    request_error_is_connectivity,
+};
 use crate::log::codec;
 use crate::log::codec::{ObjectPointer, S2Package};
 use crate::log::encrypt::{self, CipherKey, NonceRng};
@@ -9,11 +12,12 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesOrdered;
 use s2_sdk::append_session::AppendSessionConfig;
 use s2_sdk::batching::BatchingConfig;
+use s2_sdk::error::{AppendSessionError, ProducerError, RequestError};
 use s2_sdk::producer::{IndexedAppendAck, ProducerConfig};
 use s2_sdk::types::{AppendInput, AppendRecord, AppendRecordBatch, CreateStreamInput, Header};
 use s2_sdk::{
     S2Basin,
-    types::{AppendAck, S2Error, StreamName},
+    types::{AppendAck, StreamName},
 };
 use std::str::FromStr;
 use std::time::Duration;
@@ -101,8 +105,24 @@ mod tests {
 }
 
 impl WriterRunError {
-    fn from_s2(error: S2Error) -> Self {
-        if s2_error_is_connectivity(&error) {
+    fn from_request(error: RequestError) -> Self {
+        if request_error_is_connectivity(&error) {
+            Self::Disconnected(error.to_string())
+        } else {
+            Self::Fatal(error.into())
+        }
+    }
+
+    fn from_append_session(error: AppendSessionError) -> Self {
+        if append_session_error_is_connectivity(&error) {
+            Self::Disconnected(error.to_string())
+        } else {
+            Self::Fatal(error.into())
+        }
+    }
+
+    fn from_producer(error: ProducerError) -> Self {
+        if producer_error_is_connectivity(&error) {
             Self::Disconnected(error.to_string())
         } else {
             Self::Fatal(error.into())
@@ -150,13 +170,16 @@ impl RecordCipher {
 }
 
 impl LogWriterActor {
-    async fn ensure_stream_exists(basin: &S2Basin, stream_name: StreamName) -> Result<(), S2Error> {
+    async fn ensure_stream_exists(
+        basin: &S2Basin,
+        stream_name: StreamName,
+    ) -> Result<(), RequestError> {
         match basin
             .create_stream(CreateStreamInput::new(stream_name))
             .await
         {
             Ok(_) => Ok(()),
-            Err(S2Error::Server(err)) if err.code == "resource_already_exists" => Ok(()),
+            Err(RequestError::Server(err)) if err.code == "resource_already_exists" => Ok(()),
             Err(err) => Err(err),
         }
     }
@@ -198,7 +221,7 @@ impl LogWriterActor {
             .map_err(WriterRunError::fatal)?;
         Self::ensure_stream_exists(&s2, stream_name.clone())
             .await
-            .map_err(WriterRunError::from_s2)?;
+            .map_err(WriterRunError::from_request)?;
         let stream = s2.stream(stream_name);
 
         let session = stream.append_session(AppendSessionConfig::new());
@@ -211,15 +234,15 @@ impl LogWriterActor {
             let ticket = session
                 .submit(input)
                 .await
-                .map_err(WriterRunError::from_s2)?;
+                .map_err(WriterRunError::from_append_session)?;
             set.spawn(ticket);
         }
 
         set.join_all()
             .await
             .into_iter()
-            .collect::<Result<Vec<AppendAck>, S2Error>>()
-            .map_err(WriterRunError::from_s2)?;
+            .collect::<Result<Vec<AppendAck>, AppendSessionError>>()
+            .map_err(WriterRunError::from_append_session)?;
 
         Ok((outbox_id, pointer_record))
     }
@@ -270,7 +293,7 @@ impl LogWriterActor {
             .map_err(WriterRunError::fatal)?;
         Self::ensure_stream_exists(&self.basin, main_stream_name.clone())
             .await
-            .map_err(WriterRunError::from_s2)?;
+            .map_err(WriterRunError::from_request)?;
 
         let stream = self.basin.stream(main_stream_name);
         let producer = stream.producer(
@@ -286,7 +309,7 @@ impl LogWriterActor {
         let mut inflight = 0;
         let mut next_expected_outbox_id: Option<OutboxId> = None;
         let mut pending_appends: FuturesOrdered<
-            BoxFuture<'static, (OutboxId, Result<IndexedAppendAck, S2Error>)>,
+            BoxFuture<'static, (OutboxId, Result<IndexedAppendAck, ProducerError>)>,
         > = FuturesOrdered::new();
 
         loop {
@@ -299,7 +322,7 @@ impl LogWriterActor {
 
                 Some((outbox_id, res)) = pending_appends.next(), if !pending_appends.is_empty() => {
                     inflight -= 1;
-                    let _res = res.map_err(WriterRunError::from_s2)?;
+                    let _res = res.map_err(WriterRunError::from_producer)?;
                     self.resp_tx.send(LogWriterResponse::Durable {
                         outbox_range: ..=outbox_id
                     }).map_err(WriterRunError::fatal)?;
@@ -322,8 +345,8 @@ impl LogWriterActor {
                             let ticket = producer
                                 .submit(pointer_record)
                                 .await
-                                .map_err(WriterRunError::from_s2)?;
-                            let f: BoxFuture<'static, (OutboxId, Result<IndexedAppendAck, S2Error>)> = Box::pin(async move {
+                                .map_err(WriterRunError::from_producer)?;
+                            let f: BoxFuture<'static, (OutboxId, Result<IndexedAppendAck, ProducerError>)> = Box::pin(async move {
                                 (outbox_id, ticket.await)
                             });
                             pending_appends.push_back(f);
@@ -368,8 +391,8 @@ impl LogWriterActor {
                                     let ticket = producer
                                         .submit(record)
                                         .await
-                                        .map_err(WriterRunError::from_s2)?;
-                                    let f: BoxFuture<'static, (OutboxId, Result<IndexedAppendAck, S2Error>)> = Box::pin(async move {
+                                        .map_err(WriterRunError::from_producer)?;
+                                    let f: BoxFuture<'static, (OutboxId, Result<IndexedAppendAck, ProducerError>)> = Box::pin(async move {
                                         (outbox_id, ticket.await)
                                     });
                                     pending_appends.push_back(f);

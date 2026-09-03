@@ -1,4 +1,6 @@
-use crate::app::s2::s2_error_is_connectivity;
+use crate::app::s2::{
+    read_error_is_connectivity, read_session_error_is_connectivity, request_error_is_connectivity,
+};
 use crate::crdt::types::SharedMessage;
 use crate::log::codec::{self, ObjectPointer};
 use crate::log::encrypt::{self, CipherKey};
@@ -9,10 +11,11 @@ use crate::types::WorkspaceId;
 use bytes::BytesMut;
 use futures::StreamExt;
 use s2_sdk::S2Basin;
+use s2_sdk::error::{ReadError, ReadSessionError, RequestError};
 use s2_sdk::types::ReadFrom::SeqNum;
 use s2_sdk::types::{
-    CreateStreamInput, Header, ReadBatch, ReadFrom, ReadInput, ReadLimits, ReadStart, ReadStop,
-    S2Error, StreamName,
+    CreateStreamInput, Header, ReadBatch, ReadFrom, ReadInput, ReadLimits, ReadSessionConfig,
+    ReadStart, ReadStop, StreamName,
 };
 use std::str::FromStr;
 use time::OffsetDateTime;
@@ -28,8 +31,24 @@ enum ReaderRunError {
 }
 
 impl ReaderRunError {
-    fn from_s2(error: S2Error) -> Self {
-        if s2_error_is_connectivity(&error) {
+    fn from_request(error: RequestError) -> Self {
+        if request_error_is_connectivity(&error) {
+            Self::Disconnected(error.to_string())
+        } else {
+            Self::Fatal(error.into())
+        }
+    }
+
+    fn from_read_session(error: ReadSessionError) -> Self {
+        if read_session_error_is_connectivity(&error) {
+            Self::Disconnected(error.to_string())
+        } else {
+            Self::Fatal(error.into())
+        }
+    }
+
+    fn from_read(error: ReadError) -> Self {
+        if read_error_is_connectivity(&error) {
             Self::Disconnected(error.to_string())
         } else {
             Self::Fatal(error.into())
@@ -76,15 +95,16 @@ impl LogReaderActor {
         }
     }
 
-    async fn ensure_stream_exists(basin: &S2Basin, stream_name: StreamName) -> Result<(), S2Error> {
+    async fn ensure_stream_exists(
+        basin: &S2Basin,
+        stream_name: StreamName,
+    ) -> Result<(), RequestError> {
         match basin
             .create_stream(CreateStreamInput::new(stream_name))
             .await
         {
             Ok(_) => Ok(()),
-            Err(s2_sdk::types::S2Error::Server(err)) if err.code == "resource_already_exists" => {
-                Ok(())
-            }
+            Err(RequestError::Server(err)) if err.code == "resource_already_exists" => Ok(()),
             Err(err) => Err(err),
         }
     }
@@ -119,9 +139,10 @@ impl LogReaderActor {
                         ReadStop::new()
                             .with_limits(ReadLimits::new().with_count(object_pointer.n_records)),
                     ),
+                ReadSessionConfig::default(),
             )
             .await
-            .map_err(ReaderRunError::from_s2)?;
+            .map_err(ReaderRunError::from_read_session)?;
 
         let expected_size = usize::try_from(object_pointer.size_bytes).map_err(|_| {
             ReaderRunError::fatal(eyre::eyre!("multipart payload size does not fit usize"))
@@ -130,7 +151,7 @@ impl LogReaderActor {
         let mut record_count = 0usize;
 
         while let Some(batch) = read_session.next().await {
-            let ReadBatch { records, .. } = batch.map_err(ReaderRunError::from_s2)?;
+            let ReadBatch { records, .. } = batch.map_err(ReaderRunError::from_read_session)?;
             for record in records {
                 record_count += 1;
                 let body = encrypt::decrypt(&encryption_key, &record.body)
@@ -224,7 +245,7 @@ impl LogReaderActor {
             .map_err(ReaderRunError::fatal)?;
         Self::ensure_stream_exists(&self.basin, main_stream_name.clone())
             .await
-            .map_err(ReaderRunError::from_s2)?;
+            .map_err(ReaderRunError::from_request)?;
         let stream = self.basin.stream(main_stream_name);
 
         let mut read_input =
@@ -236,9 +257,9 @@ impl LogReaderActor {
             read_input = read_input.with_stop(read_stop);
         }
         let mut batches = stream
-            .read_session(read_input)
+            .read_session(read_input, ReadSessionConfig::default())
             .await
-            .map_err(ReaderRunError::from_s2)?;
+            .map_err(ReaderRunError::from_read_session)?;
         let mut next_sequence_number = start_at;
         self.event_tx
             .send(LogReaderEvent::Connected)
@@ -259,7 +280,7 @@ impl LogReaderActor {
                             let tail = stream
                                 .check_tail()
                                 .await
-                                .map_err(ReaderRunError::from_s2)?;
+                                .map_err(ReaderRunError::from_read)?;
                             self.event_tx.send(LogReaderEvent::Status {
                                 tail: ..tail.seq_num,
                             }).await.map_err(ReaderRunError::fatal)?;
@@ -279,7 +300,7 @@ impl LogReaderActor {
                         }
                         return Err(ReaderRunError::fatal(eyre::eyre!("log reader read session ended")));
                     };
-                    let batch = batch.map_err(ReaderRunError::from_s2)?;
+                    let batch = batch.map_err(ReaderRunError::from_read_session)?;
 
                     trace!(
                         record_count = batch.records.len(),

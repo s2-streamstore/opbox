@@ -1,9 +1,10 @@
 use crate::app::control::{DaemonWarning, StreamRetentionSummary};
 use crate::types::WorkspaceId;
 use eyre::eyre;
+use s2_sdk::error::{AppendSessionError, ProducerError, ReadError, ReadSessionError, RequestError};
 use s2_sdk::types::{
     AccountEndpoint, BasinConfig, BasinEndpoint, BasinName, CreateStreamInput, RetentionPolicy,
-    RetryConfig, S2Config, S2Endpoints, S2Error, StreamConfig, StreamName,
+    RetryConfig, S2Config, S2Endpoints, StreamConfig, StreamName,
 };
 use s2_sdk::{S2, S2Basin};
 use std::num::NonZeroU32;
@@ -92,13 +93,10 @@ pub fn s2_client_from_config(connection: &S2ConnectionConfig) -> eyre::Result<S2
 }
 
 #[allow(unreachable_patterns)]
-pub fn s2_error_is_connectivity(error: &S2Error) -> bool {
+pub fn request_error_is_connectivity(error: &RequestError) -> bool {
     match error {
-        S2Error::Client(message) => {
-            let message = message.to_ascii_lowercase();
-            !message.contains("malformed access token")
-        }
-        S2Error::Server(err) => matches!(
+        RequestError::Client(_) => true,
+        RequestError::Server(err) => matches!(
             err.code.as_str(),
             "client_hangup"
                 | "hot_server"
@@ -110,25 +108,57 @@ pub fn s2_error_is_connectivity(error: &S2Error) -> bool {
                 | "unavailable"
                 | "upstream_timeout"
         ),
-        S2Error::Validation(_) | S2Error::AppendConditionFailed(_) | S2Error::ReadUnwritten(_) => {
-            false
-        }
+        RequestError::AccessTokenProvider(_) => error.is_retryable(),
+        RequestError::MalformedAccessToken(_) | RequestError::Validation(_) => false,
         _ => false,
     }
 }
 
-pub fn s2_error_is_not_found(error: &S2Error) -> bool {
-    matches!(
-        error,
-        S2Error::Server(err)
-            if matches!(err.code.as_str(), "basin_not_found" | "stream_not_found")
-    )
+pub fn read_session_error_is_connectivity(error: &ReadSessionError) -> bool {
+    error
+        .request_error()
+        .map(request_error_is_connectivity)
+        .unwrap_or_else(|| matches!(error, ReadSessionError::HeartbeatTimeout))
+}
+
+pub fn read_error_is_connectivity(error: &ReadError) -> bool {
+    error
+        .request_error()
+        .is_some_and(request_error_is_connectivity)
+}
+
+pub fn append_session_error_is_connectivity(error: &AppendSessionError) -> bool {
+    error
+        .request_error()
+        .map(request_error_is_connectivity)
+        .unwrap_or_else(|| {
+            matches!(
+                error,
+                AppendSessionError::AckTimeout
+                    | AppendSessionError::ServerDisconnected
+                    | AppendSessionError::StreamClosedEarly
+            )
+        })
+}
+
+pub fn producer_error_is_connectivity(error: &ProducerError) -> bool {
+    match error {
+        ProducerError::Append(error) => append_session_error_is_connectivity(error),
+        ProducerError::Validation(_)
+        | ProducerError::ProducerClosed
+        | ProducerError::ProducerClosing
+        | ProducerError::ProducerDropped => false,
+        _ => false,
+    }
 }
 
 pub fn report_is_s2_connectivity(error: &eyre::Report) -> bool {
     error
-        .downcast_ref::<S2Error>()
-        .is_some_and(s2_error_is_connectivity)
+        .downcast_ref::<RequestError>()
+        .is_some_and(request_error_is_connectivity)
+        || error
+            .downcast_ref::<ReadError>()
+            .is_some_and(read_error_is_connectivity)
 }
 
 pub async fn s2_basin_from_config(
@@ -158,7 +188,7 @@ pub async fn create_workspace_stream(
         .await
     {
         Ok(_) => Ok(()),
-        Err(S2Error::Server(err)) if err.code == "resource_already_exists" => {
+        Err(RequestError::Server(err)) if err.code == "resource_already_exists" => {
             Err(eyre!("workspace {} already exists", workspace_id.0))
         }
         Err(err) => Err(err.into()),
@@ -173,7 +203,7 @@ pub async fn ensure_workspace_stream_exists(
     let stream = s2_basin.stream(stream_name);
     match stream.check_tail().await {
         Ok(_) => Ok(()),
-        Err(S2Error::Server(err)) if err.code == "stream_not_found" => {
+        Err(ReadError::Request(RequestError::Server(err))) if err.code == "stream_not_found" => {
             Err(eyre!("workspace {} does not exist", workspace_id.0))
         }
         Err(err) => Err(err.into()),
