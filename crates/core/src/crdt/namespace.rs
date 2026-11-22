@@ -95,9 +95,9 @@ impl NamespaceDoc {
     const FIELD_OBJECT_ID: &'static str = "o";
     const FIELD_PATH: &'static str = "p";
 
-    pub fn new(client_id: ClientID) -> Self {
+    pub fn new(client_id: u64) -> Self {
         let doc = Doc::with_options(Options {
-            client_id,
+            client_id: ClientID::new(client_id),
             skip_gc: false,
             ..Default::default()
         });
@@ -117,14 +117,14 @@ impl NamespaceDoc {
         }
     }
 
-    pub fn from_full_state(client_id: ClientID, state: impl AsRef<[u8]>) -> Result<Self> {
+    pub fn from_full_state(client_id: u64, state: impl AsRef<[u8]>) -> Result<Self> {
         let state = state.as_ref();
         if state.is_empty() {
             return Ok(Self::new(client_id));
         }
 
         let doc = Doc::with_options(Options {
-            client_id,
+            client_id: ClientID::new(client_id),
             skip_gc: false,
             ..Default::default()
         });

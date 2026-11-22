@@ -36,6 +36,6 @@ tokio-muxt = "0.7"
 tokio-util = "0.7.18"
 toml = "0.9.8"
 tracing = "0.1.41"
-turso = { version = "0.6.0-pre.18", default-features = false }
+turso = { version = "0.8", default-features = false }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-yrs = "0.22"
+yrs = "0.28"

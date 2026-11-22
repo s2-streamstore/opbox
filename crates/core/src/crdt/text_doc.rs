@@ -47,7 +47,7 @@ pub struct TextObjectDoc {
 impl TextObjectDoc {
     pub fn new(client_id: u64) -> Self {
         let doc = Doc::with_options(Options {
-            client_id,
+            client_id: ClientID::new(client_id),
             skip_gc: false,
             ..Default::default()
         });
@@ -64,13 +64,13 @@ impl TextObjectDoc {
         doc
     }
 
-    pub fn from_full_state(client_id: ClientID, state_bytes: &[u8]) -> Result<Self> {
+    pub fn from_full_state(client_id: u64, state_bytes: &[u8]) -> Result<Self> {
         if state_bytes.is_empty() {
             return Ok(Self::new(client_id));
         }
 
         let doc = Doc::with_options(Options {
-            client_id,
+            client_id: ClientID::new(client_id),
             skip_gc: false,
             ..Default::default()
         });
@@ -510,7 +510,7 @@ mod tests {
             .expect("text changed");
 
         let doc = TextObjectDoc::from_full_state(1, capture.full_state_bytes.as_ref())?;
-        let clock = doc.state_vector().get(&client_id);
+        let clock = doc.state_vector().get(&ClientID::new(client_id));
         assert!(
             clock > 0,
             "capture ops must be attributed to the writer-derived client id, got clock {clock}"
