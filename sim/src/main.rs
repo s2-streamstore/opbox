@@ -4144,9 +4144,12 @@ fn sim_s2_client() -> eyre::Result<S2> {
 }
 
 // For the harness's own S2 calls. Turmoil never retransmits, so one lost
-// segment fails a whole attempt and a bounded retry budget can run out.
+// segment fails a whole attempt and the SDK's default 3 attempts can run out.
+// Bounded so an unreachable S2 fails the run instead of hanging it.
 fn sim_harness_s2_client() -> eyre::Result<S2> {
-    sim_s2_client_with_retry(RetryConfig::new().with_max_attempts(NonZeroU32::MAX))
+    sim_s2_client_with_retry(
+        RetryConfig::new().with_max_attempts(NonZeroU32::new(100).expect("non-zero")),
+    )
 }
 
 fn sim_s2_client_with_retry(retry: RetryConfig) -> eyre::Result<S2> {
