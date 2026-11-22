@@ -29,10 +29,11 @@ use s2_sdk::S2;
 use s2_sdk::error::RequestError;
 use s2_sdk::types::{
     AccountEndpoint, BasinEndpoint, BasinName, CreateBasinInput, ListStreamsInput, ReadFrom,
-    ReadInput, ReadStart, S2Config, S2Endpoints, StreamName,
+    ReadInput, ReadStart, RetryConfig, S2Config, S2Endpoints, StreamName,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::time::{Duration, SystemTime};
@@ -2468,7 +2469,7 @@ async fn multipart_object_stream_stats(
     workspace_id: &WorkspaceId,
 ) -> Result<MultipartObjectStreamStats, Box<dyn std::error::Error>> {
     let basin_name: BasinName = SIM_BASIN.parse().map_err(io_err)?;
-    let basin = sim_s2_client().map_err(io_err)?.basin(basin_name);
+    let basin = sim_harness_s2_client().map_err(io_err)?.basin(basin_name);
     let prefix = format!("{}/objects/", workspace_id.0)
         .parse()
         .map_err(io_err)?;
@@ -4071,7 +4072,7 @@ fn run_wrong_cipher_clone_workload(
     sim.client("daemon-b-wrong-cipher", async move {
         ensure_basin_exists().await?;
         let basin: BasinName = SIM_BASIN.parse().map_err(io_err)?;
-        let s2_basin = sim_s2_client().map_err(io_err)?.basin(basin);
+        let s2_basin = sim_harness_s2_client().map_err(io_err)?.basin(basin);
         let stream_name: StreamName = format!("{}/ops", workspace_id_b.0)
             .parse()
             .map_err(io_err)?;
@@ -4139,13 +4140,25 @@ fn run_wrong_cipher_clone_workload(
 }
 
 fn sim_s2_client() -> eyre::Result<S2> {
+    sim_s2_client_with_retry(RetryConfig::new())
+}
+
+// For the harness's own S2 calls. Turmoil never retransmits, so one lost
+// segment fails a whole attempt and a bounded retry budget can run out.
+fn sim_harness_s2_client() -> eyre::Result<S2> {
+    sim_s2_client_with_retry(RetryConfig::new().with_max_attempts(NonZeroU32::MAX))
+}
+
+fn sim_s2_client_with_retry(retry: RetryConfig) -> eyre::Result<S2> {
     let endpoints = S2Endpoints::new(
         AccountEndpoint::new("http://s2-lite:80")?,
         BasinEndpoint::new("http://s2-lite:80")?,
     )?;
 
     S2::new_with_connector(
-        S2Config::new("ignored").with_endpoints(endpoints),
+        S2Config::new("ignored")
+            .with_endpoints(endpoints)
+            .with_retry(retry),
         s2_connector::TurmoilConnector,
     )
     .map_err(Into::into)
@@ -4153,7 +4166,7 @@ fn sim_s2_client() -> eyre::Result<S2> {
 
 async fn ensure_basin_exists() -> Result<(), Box<dyn std::error::Error>> {
     let basin_name: BasinName = SIM_BASIN.parse().map_err(io_err)?;
-    let s2 = sim_s2_client().map_err(io_err)?;
+    let s2 = sim_harness_s2_client().map_err(io_err)?;
     match s2.create_basin(CreateBasinInput::new(basin_name)).await {
         Ok(_) => Ok(()),
         Err(RequestError::Server(err)) if err.code == "resource_already_exists" => Ok(()),
