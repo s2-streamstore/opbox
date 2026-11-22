@@ -1063,6 +1063,8 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let _ = stream.write_all(response_head.as_bytes()).await;
                 let _ = stream.write_all(&body).await;
+                // Keep the socket open until the client is done writing its request.
+                let _ = tokio::io::copy(&mut stream, &mut tokio::io::sink()).await;
             }
         });
 
@@ -1276,6 +1278,8 @@ mod tests {
                         b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}",
                     )
                     .await;
+                // Keep the socket open until the client is done writing its request.
+                let _ = tokio::io::copy(&mut stream, &mut tokio::io::sink()).await;
             }
         });
 

@@ -1,3 +1,4 @@
+use crate::app::s2::S2BasinConnector;
 use crate::app::s2::{
     append_session_error_is_connectivity, producer_error_is_connectivity,
     request_error_is_connectivity,
@@ -139,7 +140,7 @@ enum WriterRunOutcome {
 }
 
 pub struct LogWriterActor {
-    basin: S2Basin,
+    connect_basin: S2BasinConnector,
     workspace: WorkspaceId,
     daemon_writer_id: DaemonWriterId,
     cipher: RecordCipher,
@@ -185,7 +186,7 @@ impl LogWriterActor {
     }
 
     pub fn new(
-        basin: S2Basin,
+        connect_basin: S2BasinConnector,
         workspace: WorkspaceId,
         daemon_writer_id: DaemonWriterId,
         encryption_key: CipherKey,
@@ -194,7 +195,7 @@ impl LogWriterActor {
         resp_tx: mpsc::UnboundedSender<LogWriterResponse>,
     ) -> Self {
         Self {
-            basin,
+            connect_basin,
             workspace,
             daemon_writer_id,
             cipher: RecordCipher {
@@ -291,11 +292,12 @@ impl LogWriterActor {
         let mut big_upload = None;
         let main_stream_name = StreamName::from_str(&format!("{}/ops", self.workspace.0.as_str()))
             .map_err(WriterRunError::fatal)?;
-        Self::ensure_stream_exists(&self.basin, main_stream_name.clone())
+        let basin = (self.connect_basin)().map_err(WriterRunError::fatal)?;
+        Self::ensure_stream_exists(&basin, main_stream_name.clone())
             .await
             .map_err(WriterRunError::from_request)?;
 
-        let stream = self.basin.stream(main_stream_name);
+        let stream = basin.stream(main_stream_name);
         let producer = stream.producer(
             ProducerConfig::new()
                 .with_max_unacked_bytes(1024 * 1024 * 100)
@@ -406,7 +408,7 @@ impl LogWriterActor {
                                         checksum = pointer.checksum,
                                         "log writer using pointer package"
                                     );
-                                    let upload = tokio::spawn(Self::upload_parts(self.basin.clone(), self.workspace.clone(), self.cipher.clone(), outbox_id, pointer_record, pointer, parts));
+                                    let upload = tokio::spawn(Self::upload_parts(basin.clone(), self.workspace.clone(), self.cipher.clone(), outbox_id, pointer_record, pointer, parts));
                                     big_upload = Some(upload);
                                 }
                             }

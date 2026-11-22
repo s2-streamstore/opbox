@@ -3463,7 +3463,7 @@ async fn run_clone_runtime(
     nonce_rng: NonceRng,
     clobber: bool,
 ) -> eyre::Result<()> {
-    let s2_basin = sim_s2_client()?.basin(daemon_row.s2_basin.clone());
+    let s2_basin = sim_s2_basin_connector(daemon_row.s2_basin.clone());
     let cancellation_token = CancellationToken::new();
     let mut actors = AppRuntime::new(AppRuntimeConfig {
         mode: RunMode::Clone,
@@ -3497,9 +3497,7 @@ async fn run_sync_phase(
     mut command_rx: mpsc::Receiver<SimDaemonCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let debug_semantic_service = semantic_service.clone();
-    let s2_basin = sim_s2_client()
-        .map_err(io_err)?
-        .basin(daemon_row.s2_basin.clone());
+    let s2_basin = sim_s2_basin_connector(daemon_row.s2_basin.clone());
     let (notify_io, notify_handle) = channel_notify_io();
     let engine_status = EngineStatusConfig {
         sync_root: PathBuf::from(format!("/sim/{name}")),
@@ -4136,6 +4134,10 @@ fn run_wrong_cipher_clone_workload(
     });
 
     Ok(())
+}
+
+fn sim_s2_basin_connector(basin: BasinName) -> opbox_core::app::s2::S2BasinConnector {
+    std::sync::Arc::new(move || Ok(sim_s2_client()?.basin(basin.clone())))
 }
 
 fn sim_s2_client() -> eyre::Result<S2> {

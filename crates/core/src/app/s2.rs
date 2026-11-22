@@ -9,6 +9,7 @@ use s2_sdk::types::{
 use s2_sdk::{S2, S2Basin};
 use std::num::NonZeroU32;
 use std::str::FromStr;
+use std::sync::Arc;
 use tracing::warn;
 
 use super::user_config::UserConfig;
@@ -64,6 +65,16 @@ impl S2ConnectionConfig {
             _ => (None, None),
         }
     }
+}
+
+/// Builds an [`S2Basin`] on a new S2 client, and so a new connection pool.
+///
+/// The log reader and writer call this on every (re)connect: a timed-out request
+/// only resets its HTTP/2 stream, so a dead pooled connection would be reused.
+pub type S2BasinConnector = Arc<dyn Fn() -> eyre::Result<S2Basin> + Send + Sync>;
+
+pub fn s2_basin_connector(connection: S2ConnectionConfig, basin: BasinName) -> S2BasinConnector {
+    Arc::new(move || Ok(s2_client_from_config(&connection)?.basin(basin.clone())))
 }
 
 pub fn s2_client_from_config(connection: &S2ConnectionConfig) -> eyre::Result<S2> {
@@ -220,7 +231,7 @@ pub async fn workspace_stream_retention_warning(
 }
 
 pub fn stream_config_retention_warning(config: &StreamConfig) -> Option<DaemonWarning> {
-    retention_warning_summary(config.retention_policy)
+    retention_warning_summary(config.retention_policy.as_ref())
         .map(|retention| DaemonWarning::OpsStreamRetentionNotInfinite { retention })
 }
 
@@ -236,19 +247,21 @@ pub fn basin_config_retention_warning(config: &BasinConfig) -> Option<DaemonWarn
     let retention_policy = config
         .default_stream_config
         .as_ref()
-        .and_then(|config| config.retention_policy);
+        .and_then(|config| config.retention_policy.as_ref());
 
     retention_warning_summary(retention_policy)
         .map(|retention| DaemonWarning::BasinDefaultStreamRetentionNotInfinite { retention })
 }
 
 fn retention_warning_summary(
-    retention_policy: Option<RetentionPolicy>,
+    retention_policy: Option<&RetentionPolicy>,
 ) -> Option<StreamRetentionSummary> {
     match retention_policy {
         Some(RetentionPolicy::Infinite) => None,
-        Some(RetentionPolicy::Age(seconds)) => Some(StreamRetentionSummary::Age { seconds }),
-        None => Some(StreamRetentionSummary::Unspecified),
+        Some(RetentionPolicy::Age(seconds)) => {
+            Some(StreamRetentionSummary::Age { seconds: *seconds })
+        }
+        Some(_) | None => Some(StreamRetentionSummary::Unspecified),
     }
 }
 

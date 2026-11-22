@@ -1,3 +1,4 @@
+use crate::app::s2::S2BasinConnector;
 use crate::app::s2::{
     read_error_is_connectivity, read_session_error_is_connectivity, request_error_is_connectivity,
 };
@@ -65,7 +66,7 @@ enum ReaderRunOutcome {
 }
 
 pub struct LogReaderActor {
-    basin: S2Basin,
+    connect_basin: S2BasinConnector,
     workspace: WorkspaceId,
     encryption_key: CipherKey,
     start_at: SequenceNumber,
@@ -76,7 +77,7 @@ pub struct LogReaderActor {
 
 impl LogReaderActor {
     pub fn new(
-        basin: S2Basin,
+        connect_basin: S2BasinConnector,
         workspace: WorkspaceId,
         encryption_key: CipherKey,
         start_at: SequenceNumber,
@@ -85,7 +86,7 @@ impl LogReaderActor {
         event_tx: mpsc::Sender<LogReaderEvent>,
     ) -> Self {
         Self {
-            basin,
+            connect_basin,
             workspace,
             encryption_key,
             start_at,
@@ -243,10 +244,11 @@ impl LogReaderActor {
     ) -> Result<ReaderRunOutcome, ReaderRunError> {
         let main_stream_name = StreamName::from_str(&format!("{}/ops", self.workspace.0.as_str()))
             .map_err(ReaderRunError::fatal)?;
-        Self::ensure_stream_exists(&self.basin, main_stream_name.clone())
+        let basin = (self.connect_basin)().map_err(ReaderRunError::fatal)?;
+        Self::ensure_stream_exists(&basin, main_stream_name.clone())
             .await
             .map_err(ReaderRunError::from_request)?;
-        let stream = self.basin.stream(main_stream_name);
+        let stream = basin.stream(main_stream_name);
 
         let mut read_input =
             ReadInput::new().with_start(ReadStart::new().with_from(ReadFrom::SeqNum(start_at)));
@@ -323,7 +325,7 @@ impl LogReaderActor {
                                 let object_pointer: ObjectPointer = serde_json::from_slice(pointer)
                                     .map_err(ReaderRunError::fatal)?;
                                 Self::read_full_multipart(
-                                    self.basin.clone(),
+                                    basin.clone(),
                                     self.workspace.clone(),
                                     self.encryption_key.clone(),
                                     record.headers,

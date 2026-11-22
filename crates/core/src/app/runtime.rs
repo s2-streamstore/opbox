@@ -1,3 +1,4 @@
+use crate::app::s2::S2BasinConnector;
 use crate::engine::actor::{
     Engine, EngineClients, EngineCommand, EngineConfig, EngineEvents, EngineStatusConfig,
 };
@@ -17,7 +18,6 @@ use crate::semantic::client::SemanticClient;
 use crate::semantic::service::SemanticService;
 use crate::semantic::table::daemon_state;
 use crate::spy::SpyEvent;
-use s2_sdk::S2Basin;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Duration, timeout};
@@ -41,7 +41,7 @@ pub struct AppRuntimeConfig<IO, NIO = ()> {
     pub notify_io: Option<NIO>,
     pub semantic_service: SemanticService,
     pub daemon_row: daemon_state::Row,
-    pub s2_basin: S2Basin,
+    pub s2_basin: S2BasinConnector,
     pub nonce_rng: NonceRng,
     pub clone_log_read_stop: Option<LogReadStop>,
     pub clone_clobber: bool,
