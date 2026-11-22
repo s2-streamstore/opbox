@@ -31,10 +31,13 @@ pub async fn run_s2_lite_server(seed: u64) -> Result<(), Box<dyn std::error::Err
     tracing::info!("s2-lite listening on turmoil port 80");
 
     loop {
-        let (stream, _addr) = listener.accept().await?;
+        let (stream, client_addr) = listener.accept().await?;
         let app = app.clone();
         tokio::spawn(async move {
-            let io = TokioIo::new(stream);
+            let io = TokioIo::new(crate::s2_connector::SimTcpStream::server(
+                stream,
+                client_addr,
+            ));
             let svc = hyper::service::service_fn(move |req| {
                 let app = app.clone();
                 async move {

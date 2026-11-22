@@ -220,7 +220,7 @@ pub async fn workspace_stream_retention_warning(
 }
 
 pub fn stream_config_retention_warning(config: &StreamConfig) -> Option<DaemonWarning> {
-    retention_warning_summary(config.retention_policy)
+    retention_warning_summary(config.retention_policy.as_ref())
         .map(|retention| DaemonWarning::OpsStreamRetentionNotInfinite { retention })
 }
 
@@ -236,19 +236,21 @@ pub fn basin_config_retention_warning(config: &BasinConfig) -> Option<DaemonWarn
     let retention_policy = config
         .default_stream_config
         .as_ref()
-        .and_then(|config| config.retention_policy);
+        .and_then(|config| config.retention_policy.as_ref());
 
     retention_warning_summary(retention_policy)
         .map(|retention| DaemonWarning::BasinDefaultStreamRetentionNotInfinite { retention })
 }
 
 fn retention_warning_summary(
-    retention_policy: Option<RetentionPolicy>,
+    retention_policy: Option<&RetentionPolicy>,
 ) -> Option<StreamRetentionSummary> {
     match retention_policy {
         Some(RetentionPolicy::Infinite) => None,
-        Some(RetentionPolicy::Age(seconds)) => Some(StreamRetentionSummary::Age { seconds }),
-        None => Some(StreamRetentionSummary::Unspecified),
+        Some(RetentionPolicy::Age(seconds)) => {
+            Some(StreamRetentionSummary::Age { seconds: *seconds })
+        }
+        Some(_) | None => Some(StreamRetentionSummary::Unspecified),
     }
 }
 

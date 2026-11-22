@@ -22,12 +22,12 @@ http = "1"
 hyper = "1.8"
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1", "http2"] }
 mad-turmoil = "0.2.0"
-object_store = "0.12"
+object_store = "0.14"
 opbox-core = { path = "../crates/core", features = ["sim"] }
 rand = "0.10.1"
-s2-lite = "0.33"
-s2-sdk = { version = "0.34.3", features = ["_hidden"] }
-slatedb = "0.12.1"
+s2-lite = "0.49"
+s2-sdk = { version = "0.49.0", features = ["_hidden"] }
+slatedb = "0.18.1"
 strum = { features = ["derive"], version = "0.28.0" }
 tokio = { version = "1.52.0", features = ["fs", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7.18"
