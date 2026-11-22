@@ -8,8 +8,7 @@ use opbox_core::app::ipc;
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::app::s2::{
     S2ConnectionConfig, basin_default_stream_retention_warning, create_workspace_stream,
-    ensure_workspace_stream_exists, s2_basin_connector, s2_client_from_config,
-    workspace_stream_retention_warning,
+    ensure_workspace_stream_exists, s2_client_from_config, workspace_stream_retention_warning,
 };
 use opbox_core::app::user_config::{
     UserConfig, UserConfigKey, load_user_config, load_user_config_from_path,
@@ -282,6 +281,7 @@ struct Bootstrap {
     sync_root: PathBuf,
     daemon_row: daemon_state::Row,
     s2_connection: S2ConnectionConfig,
+    s2_basin: S2Basin,
     clone_log_read_stop: Option<LogReadStop>,
     clone_clobber: bool,
 }
@@ -593,6 +593,7 @@ async fn bootstrap_init(
         sync_root,
         daemon_row,
         s2_connection,
+        s2_basin,
         clone_log_read_stop: None,
         clone_clobber: false,
     })
@@ -648,6 +649,7 @@ async fn bootstrap_clone(
         sync_root,
         daemon_row,
         s2_connection,
+        s2_basin,
         clone_log_read_stop,
         clone_clobber: clobber,
     })
@@ -1008,7 +1010,7 @@ async fn run_bootstrap(bootstrap: Bootstrap, progress: &BootstrapProgress) -> ey
         notify_io: None::<opbox_core::notify::nio::LocalNotifyIO>,
         semantic_service,
         daemon_row: bootstrap.daemon_row,
-        s2_basin: s2_basin_connector(s2_connection.clone(), basin.clone()),
+        s2_basin: bootstrap.s2_basin,
         nonce_rng: NonceRng::Os,
         clone_log_read_stop: bootstrap.clone_log_read_stop,
         clone_clobber: bootstrap.clone_clobber,

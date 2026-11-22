@@ -4,8 +4,7 @@ use opbox_core::app::ipc::{self, ControlServerConfig};
 use opbox_core::app::runtime::{AppRuntime, AppRuntimeConfig, RunMode};
 use opbox_core::app::s2::{
     S2ConnectionConfig, basin_default_stream_retention_warning, ensure_workspace_stream_exists,
-    report_is_s2_connectivity, s2_basin_connector, s2_client_from_config,
-    workspace_stream_retention_warning,
+    report_is_s2_connectivity, s2_client_from_config, workspace_stream_retention_warning,
 };
 use opbox_core::app::user_config::{
     UserConfig, load_user_config, load_user_config_from_path, skip_retention_checks,
@@ -181,7 +180,7 @@ async fn run(
         notify_io,
         semantic_service,
         daemon_row: daemon_row.clone(),
-        s2_basin: s2_basin_connector(s2_connection.clone(), daemon_row.s2_basin.clone()),
+        s2_basin,
         nonce_rng: NonceRng::Os,
         clone_log_read_stop: None,
         clone_clobber: false,

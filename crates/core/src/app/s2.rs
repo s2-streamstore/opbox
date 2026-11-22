@@ -9,7 +9,6 @@ use s2_sdk::types::{
 use s2_sdk::{S2, S2Basin};
 use std::num::NonZeroU32;
 use std::str::FromStr;
-use std::sync::Arc;
 use tracing::warn;
 
 use super::user_config::UserConfig;
@@ -65,16 +64,6 @@ impl S2ConnectionConfig {
             _ => (None, None),
         }
     }
-}
-
-/// Builds an [`S2Basin`] on a new S2 client, and so a new connection pool.
-///
-/// The log reader and writer call this on every (re)connect: a timed-out request
-/// only resets its HTTP/2 stream, so a dead pooled connection would be reused.
-pub type S2BasinConnector = Arc<dyn Fn() -> eyre::Result<S2Basin> + Send + Sync>;
-
-pub fn s2_basin_connector(connection: S2ConnectionConfig, basin: BasinName) -> S2BasinConnector {
-    Arc::new(move || Ok(s2_client_from_config(&connection)?.basin(basin.clone())))
 }
 
 pub fn s2_client_from_config(connection: &S2ConnectionConfig) -> eyre::Result<S2> {
